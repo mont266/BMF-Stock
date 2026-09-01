@@ -23,7 +23,8 @@ export const useStock = () => {
   
   const fetchStock = useCallback(async () => {
     try {
-        const { data: { user } } = await supabase.auth.getUser();
+        const { data: { session } } = await supabase.auth.getSession();
+    const user = session?.user;
         if (!user) throw new Error('User not authenticated');
 
         const cacheKey = `stock_items_${user.id}`;
@@ -47,7 +48,7 @@ export const useStock = () => {
         const { count, error: countError } = await supabase
             .from('stock_items')
             .select('*', { count: 'exact', head: true })
-            .eq('user_id', user.id);
+            ;
 
         if (countError) throw countError;
 
@@ -61,7 +62,7 @@ export const useStock = () => {
                 supabase
                     .from('stock_items')
                     .select('*')
-                    .eq('user_id', user.id)
+                    
                     .order('created_at', { ascending: false })
                     .range(i * pageSize, (i + 1) * pageSize - 1)
             );
@@ -102,7 +103,8 @@ export const useStock = () => {
 
   
   const performUpdateAssignment = useCallback(async (itemId, location, assigned_to, assignerName) => {
-    const { data: { user } } = await supabase.auth.getUser();
+    const { data: { session } } = await supabase.auth.getSession();
+    const user = session?.user;
     if (!user) throw new Error('User not authenticated');
 
     const { data: itemBeforeUpdate, error: fetchError } = await supabase
@@ -167,7 +169,8 @@ export const useStock = () => {
           const { item, assignerName } = task.payload;
           // We don't have performAddStockItem, we can just duplicate logic here, but it's cleaner to reuse.
           // For simplicity, let's just make the Supabase call here.
-          const { data: { user } } = await supabase.auth.getUser();
+          const { data: { session } } = await supabase.auth.getSession();
+    const user = session?.user;
           const newItem = { ...item, location: Location.LEADING_STORES, assigned_to: Team.UNASSIGNED, user_id: user.id };
           const { data: insertedData, error } = await supabase.from('stock_items').insert([newItem]).select().single();
           if (error) throw error;
@@ -209,7 +212,8 @@ export const useStock = () => {
   }, [processSyncQueue, syncQueue.length]);
 
   const addStockItem = useCallback(async (item, assignerName) => {
-    const { data: { user } } = await supabase.auth.getUser();
+    const { data: { session } } = await supabase.auth.getSession();
+    const user = session?.user;
     if (!user) throw new Error('User not authenticated');
     
     const newItem = {
@@ -270,7 +274,8 @@ export const useStock = () => {
   }, [fetchStock]);
 
   const bulkAddStockItems = useCallback(async (items, assignerName) => {
-    const { data: { user } } = await supabase.auth.getUser();
+    const { data: { session } } = await supabase.auth.getSession();
+    const user = session?.user;
     if (!user) throw new Error('User not authenticated');
 
     const newItems = items.map(item => ({
@@ -348,7 +353,8 @@ export const useStock = () => {
   }, [performUpdateAssignment]);
   
   const bulkUpdateAssignments = useCallback(async (itemIds, location, team, assignerName) => {
-    const { data: { user } } = await supabase.auth.getUser();
+    const { data: { session } } = await supabase.auth.getSession();
+    const user = session?.user;
     if (!user) throw new Error('User not authenticated');
 
     // For logging, fetch the items before updating
@@ -388,7 +394,8 @@ export const useStock = () => {
 }, []);
 
   const bulkDeleteStockItems = useCallback(async (itemIds, assignerName) => {
-    const { data: { user } } = await supabase.auth.getUser();
+    const { data: { session } } = await supabase.auth.getSession();
+    const user = session?.user;
     if (!user) throw new Error('User not authenticated');
 
     const { data: itemsToDelete, error: fetchError } = await supabase
@@ -425,7 +432,8 @@ export const useStock = () => {
   }, [fetchStock]);
 
   const deleteStockItem = useCallback(async (itemId, assignerName) => {
-    const { data: { user } } = await supabase.auth.getUser();
+    const { data: { session } } = await supabase.auth.getSession();
+    const user = session?.user;
     if (!user) throw new Error('User not authenticated');
 
     const { data: itemToDelete, error: fetchError } = await supabase
@@ -466,13 +474,14 @@ export const useStock = () => {
        return stock.filter(item => item.barcode === barcode);
     }
     try {
-        const { data: { user } } = await supabase.auth.getUser();
+        const { data: { session } } = await supabase.auth.getSession();
+    const user = session?.user;
         if (!user) throw new Error('User not authenticated');
         const { data, error } = await supabase
           .from('stock_items')
           .select('*')
           .eq('barcode', barcode)
-          .eq('user_id', user.id);
+          ;
         if (error) throw error;
         return data || [];
     } catch (err) {
@@ -484,13 +493,14 @@ export const useStock = () => {
   }, [stock]);
 
   const getExistingBarcodes = useCallback(async (barcodes) => {
-    const { data: { user } } = await supabase.auth.getUser();
+    const { data: { session } } = await supabase.auth.getSession();
+    const user = session?.user;
     if (!user) throw new Error('User not authenticated');
 
     const { data, error } = await supabase
         .from('stock_items')
         .select('barcode')
-        .eq('user_id', user.id)
+        
         .in('barcode', barcodes);
 
     if (error) throw error;

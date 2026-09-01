@@ -123,13 +123,14 @@ const ReportingPage = ({ filters, setFilters, reportData, setReportData, loading
     setLoading(true);
     setError(null);
     try {
-      const { data: { user } } = await supabase.auth.getUser();
+      const { data: { session } } = await supabase.auth.getSession();
+      const user = session?.user;
       if (!user) throw new Error('User not authenticated');
       
       let query = supabase
         .from('stock_movements')
         .select('*')
-        .eq('user_id', user.id)
+        
         .gte('created_at', new Date(filters.startDate).toISOString())
         .lte('created_at', new Date(`${filters.endDate}T23:59:59.999Z`).toISOString())
         .order('created_at', { ascending: false });
@@ -1185,10 +1186,11 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
   const fetchTeams = useCallback(async () => {
     setTeamsLoading(true);
     try {
-        const { data: { user } } = await supabase.auth.getUser();
+        const { data: { session } } = await supabase.auth.getSession();
+      const user = session?.user;
         if (!user) throw new Error('User not authenticated');
 
-        const { count, error: countError } = await supabase.from('teams').select('*', { count: 'exact', head: true }).eq('user_id', user.id);
+        const { count, error: countError } = await supabase.from('teams').select('*', { count: 'exact', head: true });
         if (countError) throw countError;
 
         if (count === 0) {
@@ -1203,7 +1205,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
             if (insertError) throw insertError;
         }
 
-        const { data, error } = await supabase.from('teams').select('*').eq('user_id', user.id).order('type').order('name');
+        const { data, error } = await supabase.from('teams').select('*').order('type').order('name');
         if (error) throw error;
         setTeams(data || []);
         setAssignmentContext(prev => ({ ...prev, team: data?.[0]?.name || '' }));
@@ -1217,9 +1219,10 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
   const fetchSuppliers = useCallback(async () => {
     setSuppliersLoading(true);
     try {
-        const { data: { user } } = await supabase.auth.getUser();
+        const { data: { session } } = await supabase.auth.getSession();
+      const user = session?.user;
         if (!user) throw new Error('User not authenticated');
-        const { data, error } = await supabase.from('suppliers').select('*').eq('user_id', user.id).order('name');
+        const { data, error } = await supabase.from('suppliers').select('*').order('name');
         if (error) throw error;
         setSuppliers(data || []);
     } catch (err) {
@@ -1511,6 +1514,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                 name,
                 description,
                 barcode,
+                purchase_price: parseFloat(selectedItemType.price) || 0,
             }));
 
         } else { // Not a unique item type
@@ -1528,6 +1532,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                 name,
                 description,
                 barcode: barcode.trim(),
+                purchase_price: parseFloat(selectedItemType.price) || 0,
             }));
         }
         
@@ -1602,6 +1607,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                 name: newScannedItemDetails.name,
                 description: newScannedItemDetails.description,
                 barcode,
+                purchase_price: parseFloat(selectedItemType.price) || 0,
             }));
             successCount = itemsToAdd.length;
 
@@ -1620,6 +1626,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                 name: newScannedItemDetails.name,
                 description: newScannedItemDetails.description,
                 barcode: newScannedItemDetails.barcode,
+                purchase_price: parseFloat(selectedItemType.price) || 0,
             }));
             successCount = itemsToAdd.length;
         }
@@ -1649,10 +1656,12 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
             throw new Error("Please enter a valid quantity.");
         }
         
+        const itemTypeDetails = itemTypes.find(it => it.name === itemForQuantityAdd.name);
         const itemsToAdd = Array.from({ length: quantity }, () => ({
             name: itemForQuantityAdd.name,
             description: itemForQuantityAdd.description,
             barcode: itemForQuantityAdd.barcode,
+            purchase_price: parseFloat(itemTypeDetails?.price) || 0,
         }));
 
         await bulkAddStockItems(itemsToAdd, selectedProfile.name);
@@ -1824,12 +1833,13 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
     if (!userProfile) return;
     setProfilesLoading(true);
     try {
-        const { data: { user } } = await supabase.auth.getUser();
+        const { data: { session } } = await supabase.auth.getSession();
+      const user = session?.user;
         if (!user) throw new Error('User not authenticated');
         const { data, error } = await supabase
             .from('profiles')
             .select('*')
-            .eq('user_id', user.id)
+            
             .order('name');
         if (error) throw error;
         setProfiles(data || []);
@@ -1858,7 +1868,8 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
     setIsAddingProfile(true);
     setError(null);
     try {
-        const { data: { user } } = await supabase.auth.getUser();
+        const { data: { session } } = await supabase.auth.getSession();
+      const user = session?.user;
         if (!user) throw new Error('User not authenticated');
 
         const profileData = { name, pin, user_id: user.id, role: newProfileInfo.role };
@@ -1966,7 +1977,8 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
     e.preventDefault();
     if (!newItemTypeInfo.name.trim()) return;
     try {
-      const { data: { user } } = await supabase.auth.getUser();
+      const { data: { session } } = await supabase.auth.getSession();
+      const user = session?.user;
       if (!user) throw new Error('User not authenticated');
       
       const subId = newItemTypeInfo.subcategory_id ? parseInt(newItemTypeInfo.subcategory_id) : null;
@@ -2099,7 +2111,8 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
     setError(null);
 
     try {
-      const { data: { user } } = await supabase.auth.getUser();
+      const { data: { session } } = await supabase.auth.getSession();
+      const user = session?.user;
       if (!user) throw new Error('User not authenticated');
       const { error } = await supabase.from('teams').insert([{ name: trimmedName, type: newTeamInfo.type, user_id: user.id }]);
       if (error) throw error;
@@ -2158,7 +2171,8 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
 
     setError(null);
     try {
-      const { data: { user } } = await supabase.auth.getUser();
+      const { data: { session } } = await supabase.auth.getSession();
+      const user = session?.user;
       if (!user) throw new Error('User not authenticated');
       
       const supplierData = { ...newSupplierInfo, name: trimmedName, user_id: user.id };
@@ -2407,7 +2421,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
     if (!currentStock || !isAdminProfile) return 0;
     return currentStock.reduce((total, item) => {
         const details = itemTypeDetailsMap[item.name];
-        const price = details ? details.price : 0;
+        const price = item.purchase_price != null ? item.purchase_price : (details ? details.price : 0);
         return total + parseFloat(price);
     }, 0);
   }, [currentStock, itemTypeDetailsMap, isAdminProfile]);
@@ -2416,8 +2430,12 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
     if (!isAdminProfile || !groupedStock || !itemTypeDetailsMap) return {};
     return Object.entries(groupedStock).reduce((acc, [name, items]) => {
         const details = itemTypeDetailsMap[name];
-        const price = details ? details.price : 0;
-        acc[name] = items.length * parseFloat(price);
+        // For groups, since items might have different historical prices, we need to sum them individually
+        const groupTotal = items.reduce((sum, item) => {
+             const p = item.purchase_price != null ? item.purchase_price : (details ? details.price : 0);
+             return sum + parseFloat(p);
+        }, 0);
+        acc[name] = groupTotal;
         return acc;
     }, {});
   }, [groupedStock, itemTypeDetailsMap, isAdminProfile]);

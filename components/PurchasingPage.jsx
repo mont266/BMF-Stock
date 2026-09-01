@@ -527,7 +527,8 @@ const ReceiveStockModal = ({ isOpen, onClose, po, userProfile, selectedProfile, 
         setIsSubmitting(true);
         setError(null);
         try {
-            const { data: { user } } = await supabase.auth.getUser();
+            const { data: { session } } = await supabase.auth.getSession();
+      const user = session?.user;
             if (!user) throw new Error('User not authenticated');
 
             const stockToAdd = [];
@@ -580,7 +581,8 @@ const ReceiveStockModal = ({ isOpen, onClose, po, userProfile, selectedProfile, 
                             barcode: barcodeToUse,
                             location: Location.LEADING_STORES,
                             assigned_to: Team.UNASSIGNED,
-                            user_id: user.id
+                            user_id: user.id,
+                            purchase_price: parseFloat(item.cost_per_item) || 0
                         });
                     }
                 }
@@ -713,13 +715,14 @@ const PurchasingPage = ({ userProfile, selectedProfile, setError, setSuccessMess
         if (userProfile?.role !== 'Admin') return;
         setPoLoading(true);
         try {
-            const { data: { user } } = await supabase.auth.getUser();
+            const { data: { session } } = await supabase.auth.getSession();
+      const user = session?.user;
             if (!user) throw new Error('User not authenticated');
 
             const { data: pos, error: poError } = await supabase
                 .from('purchase_orders')
                 .select('*, suppliers(name)')
-                .eq('user_id', user.id)
+                
                 .order('created_at', { ascending: false });
             if (poError) throw poError;
 
@@ -780,7 +783,8 @@ const PurchasingPage = ({ userProfile, selectedProfile, setError, setSuccessMess
         setIsSubmitting(true);
         setError(null);
         try {
-            const { data: { user } } = await supabase.auth.getUser();
+            const { data: { session } } = await supabase.auth.getSession();
+      const user = session?.user;
             if (!user) throw new Error('User not authenticated');
 
             // 1. Insert/Update Purchase Order Header
