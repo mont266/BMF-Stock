@@ -80,7 +80,8 @@ Deno.serve(async (req) => {
       // b. Calculate the new threshold (6 weeks of stock cover).
       // Logic correction: 6 weeks cover from 4 weeks usage is a 1.5x multiplier.
       // (Usage over 4 weeks / 4) * 6 = usage * 1.5
-      const newThreshold = Math.ceil(fourWeekUsage * 1.5);
+      const calculatedThreshold = Math.ceil(fourWeekUsage * 1.5);
+      const newThreshold = Math.max(calculatedThreshold, 5);
       const oldThreshold = itemType.stock_threshold || 0;
 
       // c. Update the threshold only if it has changed.

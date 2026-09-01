@@ -6,7 +6,7 @@ import { useDarkMode } from '../hooks/useDarkMode';
 import Scanner from './Scanner';
 import Modal from './Modal';
 import PurchasingPage from './PurchasingPage';
-import { BrandIcon, ScanIcon, AddIcon, ListIcon, ChevronDownIcon, LogoutIcon, AdminIcon, BoxIcon, TagIcon, UsersIcon, BuildingStoreIcon, SunIcon, MoonIcon, EditIcon, TrashIcon, CurrencyPoundIcon, ArchiveIcon, PlusCircleIcon, ArrowRightCircleIcon, CheckCircleIcon, XCircleIcon, SettingsIcon, XIcon, ChartBarIcon, PurchasingIcon, SwitchUserIcon, CalculatorIcon, DocumentArrowDownIcon, UploadIcon } from './Icons';
+import { BrandIcon, ScanIcon, InformationCircleIcon, AddIcon, ListIcon, ChevronDownIcon, LogoutIcon, AdminIcon, BoxIcon, TagIcon, UsersIcon, BuildingStoreIcon, SunIcon, MoonIcon, EditIcon, TrashIcon, CurrencyPoundIcon, ArchiveIcon, PlusCircleIcon, ArrowRightCircleIcon, CheckCircleIcon, XCircleIcon, SettingsIcon, XIcon, ChartBarIcon, PurchasingIcon, SwitchUserIcon, CalculatorIcon, DocumentArrowDownIcon, UploadIcon, RefreshIcon } from './Icons';
 import { supabase } from '../lib/supabaseClient';
 import { Capacitor } from '@capacitor/core';
 import { Haptics, ImpactStyle } from '@capacitor/haptics';
@@ -111,7 +111,60 @@ const expandRangeByQuantity = (start, quantity) => {
 };
 
 const ReportingPage = ({ filters, setFilters, reportData, setReportData, loading, setLoading, itemTypes, stock, setError, setIsPrintInfoModalOpen }) => {
+  
+  const [activeTab, setActiveTab] = useState('movements');
   const [pdfPreviewUrl, setPdfPreviewUrl] = useState(null);
+
+  const assignedStockData = useMemo(() => {
+    const assigned = stock.filter(item => item.assigned_to && item.assigned_to !== 'Unassigned');
+    const groups = {};
+    assigned.forEach(item => {
+      const team = item.assigned_to;
+      if (!groups[team]) groups[team] = {};
+      if (!groups[team][item.name]) groups[team][item.name] = { count: 0, barcodes: [] };
+      groups[team][item.name].count++;
+      groups[team][item.name].barcodes.push(item.barcode);
+    });
+    return groups;
+  }, [stock]);
+
+  const thresholdData = useMemo(() => {
+    const stockCounts = {};
+    stock.forEach(item => {
+        if (!item.assigned_to || item.assigned_to === 'Unassigned') {
+            if (!stockCounts[item.name]) stockCounts[item.name] = 0;
+            stockCounts[item.name]++;
+        }
+    });
+
+    const report = [];
+    itemTypes.forEach(type => {
+        const currentStock = stockCounts[type.name] || 0;
+        const threshold = parseInt(type.stock_threshold) || 0;
+        
+        let status = 'OK';
+        if (currentStock <= threshold) {
+            status = 'CRITICAL';
+        } else if (threshold > 0 && currentStock <= threshold * 1.5) {
+            status = 'WARNING';
+        }
+
+        if (status !== 'OK') {
+            report.push({
+                name: type.name,
+                currentStock,
+                threshold,
+                status
+            });
+        }
+    });
+    
+    return report.sort((a, b) => {
+        if (a.status === b.status) return a.currentStock - b.currentStock;
+        return a.status === 'CRITICAL' ? -1 : 1;
+    });
+  }, [stock, itemTypes]);
+
   const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
 
   const uniqueItemNames = useMemo(() => {
@@ -297,7 +350,18 @@ const ReportingPage = ({ filters, setFilters, reportData, setReportData, loading
 
   return (
     <Page title="Inventory Reports">
-      <div className="space-y-6">
+      
+      <div className="border-b border-zinc-200 dark:border-zinc-700 mb-6 no-print">
+          <nav className="-mb-px flex space-x-6 overflow-x-auto">
+              <button onClick={() => setActiveTab('movements')} className={`whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm ${activeTab === 'movements' ? 'border-blue-500 text-blue-600 dark:text-blue-400' : 'border-transparent text-zinc-500 hover:text-zinc-700 hover:border-zinc-300 dark:text-zinc-400 dark:hover:text-zinc-300'}`}>Movement History</button>
+              <button onClick={() => setActiveTab('assigned')} className={`whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm ${activeTab === 'assigned' ? 'border-blue-500 text-blue-600 dark:text-blue-400' : 'border-transparent text-zinc-500 hover:text-zinc-700 hover:border-zinc-300 dark:text-zinc-400 dark:hover:text-zinc-300'}`}>Assigned Stock</button>
+              <button onClick={() => setActiveTab('thresholds')} className={`whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm ${activeTab === 'thresholds' ? 'border-blue-500 text-blue-600 dark:text-blue-400' : 'border-transparent text-zinc-500 hover:text-zinc-700 hover:border-zinc-300 dark:text-zinc-400 dark:hover:text-zinc-300'}`}>Stock Thresholds</button>
+          </nav>
+      </div>
+
+      {activeTab === 'movements' && (
+        <div className="space-y-6">
+
         <div className="bg-white dark:bg-zinc-800/50 p-6 rounded-lg shadow-sm border border-zinc-200 dark:border-zinc-700 no-print">
           <h2 className="text-xl font-bold text-zinc-800 dark:text-white mb-4">Report Filters</h2>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4 items-end">
@@ -435,7 +499,80 @@ const ReportingPage = ({ filters, setFilters, reportData, setReportData, loading
             <p className="mt-2 text-sm text-zinc-500 dark:text-zinc-400">Select your filters above and click "Generate Report" to see stock movement history.</p>
           </div>
         )}
-      </div>
+      
+        </div>
+      )}
+
+      {activeTab === 'assigned' && (
+          <div className="bg-white dark:bg-zinc-800/50 rounded-lg shadow-sm border border-zinc-200 dark:border-zinc-700 overflow-hidden">
+              <div className="p-6 border-b border-zinc-200 dark:border-zinc-700">
+                  <h2 className="text-xl font-bold text-zinc-800 dark:text-white">Assigned Stock by Team</h2>
+                  <p className="text-sm text-zinc-500 dark:text-zinc-400 mt-1">Currently signed out inventory.</p>
+              </div>
+              <div className="p-0">
+                  {Object.keys(assignedStockData).length === 0 ? (
+                      <div className="p-6 text-center text-zinc-500 dark:text-zinc-400">No items are currently signed out to teams.</div>
+                  ) : (
+                      <div className="divide-y divide-zinc-200 dark:divide-zinc-700">
+                          {Object.entries(assignedStockData).map(([team, items]) => (
+                              <div key={team} className="p-6">
+                                  <h3 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100 mb-4">{team}</h3>
+                                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                                      {Object.entries(items).map(([itemName, data]) => (
+                                          <div key={itemName} className="bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded p-4">
+                                              <p className="font-medium text-zinc-900 dark:text-zinc-100">{itemName}</p>
+                                              <p className="text-2xl font-bold text-blue-600 dark:text-blue-400 mt-1">{data.count}</p>
+                                          </div>
+                                      ))}
+                                  </div>
+                              </div>
+                          ))}
+                      </div>
+                  )}
+              </div>
+          </div>
+      )}
+
+      {activeTab === 'thresholds' && (
+          <div className="bg-white dark:bg-zinc-800/50 rounded-lg shadow-sm border border-zinc-200 dark:border-zinc-700 overflow-hidden">
+              <div className="p-6 border-b border-zinc-200 dark:border-zinc-700">
+                  <h2 className="text-xl font-bold text-zinc-800 dark:text-white">Stock Threshold Alerts</h2>
+                  <p className="text-sm text-zinc-500 dark:text-zinc-400 mt-1">Items that are below or nearing their minimum stock thresholds.</p>
+              </div>
+              <div className="overflow-x-auto">
+                  {thresholdData.length === 0 ? (
+                      <div className="p-6 text-center text-zinc-500 dark:text-zinc-400">All stock levels are healthy!</div>
+                  ) : (
+                      <table className="min-w-full divide-y divide-zinc-200 dark:divide-zinc-700">
+                          <thead className="bg-zinc-50 dark:bg-zinc-800">
+                              <tr>
+                                  <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Status</th>
+                                  <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Item</th>
+                                  <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Current Stock</th>
+                                  <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Threshold</th>
+                              </tr>
+                          </thead>
+                          <tbody className="bg-white dark:bg-zinc-800/50 divide-y divide-zinc-200 dark:divide-zinc-700">
+                              {thresholdData.map((item, idx) => (
+                                  <tr key={idx}>
+                                      <td className="px-6 py-4 whitespace-nowrap">
+                                          {item.status === 'CRITICAL' ? (
+                                              <span className="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-300">Needs Order</span>
+                                          ) : (
+                                              <span className="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-300">Warning</span>
+                                          )}
+                                      </td>
+                                      <td className="px-6 py-4 font-medium text-zinc-900 dark:text-zinc-100">{item.name}</td>
+                                      <td className="px-6 py-4 whitespace-nowrap text-zinc-900 dark:text-zinc-100">{item.currentStock}</td>
+                                      <td className="px-6 py-4 whitespace-nowrap text-zinc-500 dark:text-zinc-400">{item.threshold}</td>
+                                  </tr>
+                              ))}
+                          </tbody>
+                      </table>
+                  )}
+              </div>
+          </div>
+      )}
 
       <Modal isOpen={!!pdfPreviewUrl} onClose={() => setPdfPreviewUrl(null)} title={pdfPreviewUrl === 'native-saved' ? 'Saved to Documents' : 'PDF Report Ready'}>
          <div className="flex flex-col items-center text-center space-y-4 py-4">
@@ -490,6 +627,7 @@ const ReportingPage = ({ filters, setFilters, reportData, setReportData, loading
     </Page>
   );
 };
+
 
 export const formInputStyle = "mt-1 block w-full px-3 py-2 border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 rounded-md shadow-sm placeholder-zinc-400 dark:placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 dark:focus:ring-offset-zinc-900 focus:border-transparent sm:text-sm";
 
@@ -620,9 +758,12 @@ const StatCard = ({ title, value, icon, colorClass }) => (
     </div>
 );
 
-export const Page = ({ title, children }) => (
+export const Page = ({ title, actions, children }) => (
   <div className="p-4 sm:p-6 lg:p-8">
-      <h1 className="text-2xl md:text-3xl font-bold text-zinc-900 dark:text-white mb-6">{title}</h1>
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-6 gap-4">
+          <h1 className="text-2xl md:text-3xl font-bold text-zinc-900 dark:text-white">{title}</h1>
+          {actions && <div className="flex items-center gap-2">{actions}</div>}
+      </div>
       {children}
   </div>
 );
@@ -762,13 +903,18 @@ const ExternalScannerPage = ({ onScanSuccess, onCancel }) => {
 
 const ITEMS_PER_PAGE = 25;
 
-const AdminActionCard = ({ icon, title, description, onClick, buttonText, disabled = false }) => (
+const AdminActionCard = ({ icon, title, description, onClick, buttonText, disabled = false, infoAction = null }) => (
     <div className="bg-white dark:bg-zinc-800/50 rounded-lg shadow-sm border border-zinc-200 dark:border-zinc-700 flex flex-col">
-        <div className="p-4 border-b border-zinc-200 dark:border-zinc-700">
+        <div className="p-4 border-b border-zinc-200 dark:border-zinc-700 flex justify-between items-center">
             <h2 className="text-lg font-semibold text-zinc-900 dark:text-white flex items-center">
                 {React.cloneElement(icon, { className: "w-5 h-5 mr-3 text-zinc-500" })}
                 <span>{title}</span>
             </h2>
+            {infoAction && (
+                <button onClick={infoAction} className="text-zinc-400 hover:text-blue-500 transition-colors" title="How is this calculated?">
+                    <InformationCircleIcon className="w-5 h-5" />
+                </button>
+            )}
         </div>
         <div className="p-6 flex-grow">
             <p className="text-sm text-zinc-600 dark:text-zinc-400">
@@ -827,6 +973,13 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
   const [isSerialsExpanded, setIsSerialsExpanded] = useState(true);
   const [users, setUsers] = useState([]);
   const [usersLoading, setUsersLoading] = useState(false);
+  const [dbLocations, setDbLocations] = useState([]);
+  const [locationsLoading, setLocationsLoading] = useState(true);
+  const [isAddLocationModalOpen, setIsAddLocationModalOpen] = useState(false);
+  const [newLocationInfo, setNewLocationInfo] = useState({ name: '' });
+  const [editingLocation, setEditingLocation] = useState(null);
+  
+  const displayLocations = dbLocations.length > 0 ? dbLocations.map(l => l.name) : LOCATIONS;
   const [isCreateUserModalOpen, setIsCreateUserModalOpen] = useState(false);
   const [newUserInfo, setNewUserInfo] = useState({ email: '', password: '', username: '', role: 'User' });
   const [createUserLoading, setCreateUserLoading] = useState(false);
@@ -939,6 +1092,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
   const [isCalculatingThresholds, setIsCalculatingThresholds] = useState(false);
   const [thresholdSummary, setThresholdSummary] = useState(null);
   const [isThresholdSummaryModalOpen, setIsThresholdSummaryModalOpen] = useState(false);
+  const [isThresholdInfoModalOpen, setIsThresholdInfoModalOpen] = useState(false);
 
   const isAdminProfile = selectedProfile?.role === 'Admin';
 
@@ -1216,6 +1370,22 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
     }
   }, []);
 
+  const fetchLocations = useCallback(async () => {
+    setLocationsLoading(true);
+    try {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (!session?.user) throw new Error('User not authenticated');
+        const { data, error } = await supabase.from('locations').select('*').order('name');
+        if (error) throw error;
+        setDbLocations(data || []);
+    } catch (err) {
+        console.warn("Could not fetch locations (table might not exist). Falling back to LOCATIONS.", err);
+        setDbLocations([]);
+    } finally {
+        setLocationsLoading(false);
+    }
+  }, []);
+
   const fetchSuppliers = useCallback(async () => {
     setSuppliersLoading(true);
     try {
@@ -1237,7 +1407,8 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
     fetchTeams();
     fetchCategories();
     fetchSuppliers();
-  }, [fetchItemTypes, fetchTeams, fetchCategories, fetchSuppliers]);
+    fetchLocations();
+  }, [fetchItemTypes, fetchTeams, fetchCategories, fetchSuppliers, fetchLocations]);
 
   const handleScanSuccess = useCallback(async (decodedText) => {
     setError(null);
@@ -1277,6 +1448,18 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
             (async () => {
                 try {
                     const items = await getStockItemsByBarcode(decodedText);
+                    
+                    // FIFO: Prioritize older items with the lowest purchase price
+                    items.sort((a, b) => {
+                        const priceA = parseFloat(a.purchase_price) || 0;
+                        const priceB = parseFloat(b.purchase_price) || 0;
+                        if (priceA !== priceB) return priceA - priceB;
+                        
+                        const dateA = a.created_at ? new Date(a.created_at).getTime() : 0;
+                        const dateB = b.created_at ? new Date(b.created_at).getTime() : 0;
+                        return dateA - dateB;
+                    });
+
                     const itemToAssign = items.find(i => i.assigned_to === Team.UNASSIGNED);
         
                     if (!itemToAssign) {
@@ -1315,6 +1498,18 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
             playBeep('success');
             handleSetView(View.LIST); // Stop scanner for quantity mode
             const items = await getStockItemsByBarcode(decodedText);
+            
+            // FIFO: Prioritize older items with the lowest purchase price
+            items.sort((a, b) => {
+                const priceA = parseFloat(a.purchase_price) || 0;
+                const priceB = parseFloat(b.purchase_price) || 0;
+                if (priceA !== priceB) return priceA - priceB;
+                
+                const dateA = a.created_at ? new Date(a.created_at).getTime() : 0;
+                const dateB = b.created_at ? new Date(b.created_at).getTime() : 0;
+                return dateA - dateB;
+            });
+
             const availableItems = items.filter(i => i.assigned_to === Team.UNASSIGNED);
             if (availableItems.length === 0) {
                 setError(`No available stock found for serial number "${decodedText}".`);
@@ -2024,6 +2219,10 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
              const { error } = await supabase.from('suppliers').delete().eq('id', item.id);
              if (error) throw error;
              await fetchSuppliers();
+        } else if (actionType === 'DELETE_LOCATION') {
+             const { error } = await supabase.from('locations').delete().eq('id', item.id);
+             if (error) throw error;
+             await fetchLocations();
         } else if (actionType === 'RETURN_TO_STOCK') {
              if (item.items && item.items.length > 1) {
                  const itemIds = item.items.map(i => i.id);
@@ -2164,6 +2363,46 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
     });
   };
   
+  const handleAddLocation = async (e) => {
+    e.preventDefault();
+    if (!newLocationInfo.name.trim()) return;
+    try {
+      const { error } = await supabase.from('locations').insert([{ name: newLocationInfo.name.trim() }]);
+      if (error) throw error;
+      setNewLocationInfo({ name: '' });
+      await fetchLocations();
+      setIsAddLocationModalOpen(false);
+    } catch (err) {
+      setError(`Failed to add location (Did you create the table?): ${err.message}`);
+    }
+  };
+
+  const handleUpdateLocation = async (e) => {
+    e.preventDefault();
+    if (!editingLocation.name.trim()) return;
+    try {
+        const { error } = await supabase
+            .from('locations')
+            .update({ name: editingLocation.name.trim() })
+            .eq('id', editingLocation.id);
+        if (error) throw error;
+        setEditingLocation(null);
+        await fetchLocations();
+    } catch (err) {
+      setError(`Failed to update location: ${err.message}`);
+    }
+  };
+
+  const handleDeleteLocation = async (location) => {
+      setConfirmDialog({
+          isOpen: true,
+          title: 'Delete Location',
+          message: `Are you sure you want to delete the location "${location.name}"? This will not affect existing historical stock movements but will remove it as a selectable option.`,
+          actionType: 'DELETE_LOCATION',
+          item: location
+      });
+  };
+
   const handleAddSupplier = async (e) => {
     e.preventDefault();
     const trimmedName = newSupplierInfo.name.trim();
@@ -2728,7 +2967,19 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                {currentView !== View.SCAN && (
                   <div key={currentView} className="container mx-auto animate-fade-in">
                     {currentView === View.LIST && (
-                      <Page title={viewConfig[currentView].title}>
+                      <Page 
+                        title={viewConfig[currentView].title}
+                        actions={
+                            <button 
+                                onClick={refetchStock} 
+                                className="flex items-center gap-2 px-3 py-2 bg-white dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-600 rounded-md shadow-sm hover:bg-zinc-50 dark:hover:bg-zinc-700 transition-colors text-sm font-medium text-zinc-700 dark:text-zinc-300"
+                                title="Refresh Dashboard"
+                            >
+                                <RefreshIcon className={`w-4 h-4 ${stockLoading ? 'animate-spin text-blue-500' : ''}`} />
+                                <span className="hidden sm:inline">Refresh</span>
+                            </button>
+                        }
+                      >
                         {stockLoading ? (
                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
                               <StatCardSkeleton />
@@ -2766,7 +3017,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                                           className={`${formInputStyle} mt-1 text-sm py-2`}
                                       >
                                           <option value="All">All Locations</option>
-                                          {LOCATIONS.map(loc => <option key={loc} value={loc}>{loc}</option>)}
+                                          {displayLocations.map(loc => <option key={loc} value={loc}>{loc}</option>)}
                                       </select>
                                   </div>
                                   <div className="flex justify-start sm:justify-end">
@@ -3360,6 +3611,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                                 onClick={handleCalculateThresholds}
                                 buttonText={isCalculatingThresholds ? 'Calculating...' : 'Calculate Thresholds'}
                                 disabled={isCalculatingThresholds}
+                                infoAction={() => setIsThresholdInfoModalOpen(true)}
                             />
 
                             <div className="md:col-span-2 xl:col-span-3 h-px bg-zinc-200 dark:bg-zinc-700 my-2"></div>
@@ -3466,6 +3718,41 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                                         )}
                                       </div>
                                     )) : <EmptyState icon={<TagIcon />} title="No Item Types" message="Create item types to categorize your stock." />}
+                                  </div>
+                                )}
+                            </div>
+
+                            <div className="bg-white dark:bg-zinc-800/50 rounded-lg shadow-sm border border-zinc-200 dark:border-zinc-700">
+                                <div className="p-4 border-b border-zinc-200 dark:border-zinc-700 flex justify-between items-center">
+                                    <h2 className="text-lg font-semibold text-zinc-900 dark:text-white">Manage Locations</h2>
+                                    <button onClick={() => setIsAddLocationModalOpen(true)} className="px-3 py-1.5 bg-blue-600 text-white text-sm font-medium rounded-md hover:bg-blue-700 transition-colors flex items-center space-x-2 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 dark:focus:ring-offset-zinc-800">
+                                      <AddIcon className="w-4 h-4" />
+                                      <span>Add Location</span>
+                                    </button>
+                                </div>
+                                {locationsLoading ? (
+                                    <ListItemSkeleton />
+                                ) : (
+                                  <div className="max-h-96 overflow-y-auto">
+                                    {dbLocations.length > 0 ? (
+                                      <ul className="divide-y divide-zinc-200 dark:divide-zinc-700">
+                                          {dbLocations.map(location => (
+                                              <li key={location.id} className="px-4 py-3 flex justify-between items-center">
+                                                  <div className="flex-1 min-w-0">
+                                                      <p className="text-sm font-medium text-zinc-900 dark:text-zinc-100 truncate">{location.name}</p>
+                                                  </div>
+                                                  <div className="flex space-x-2">
+                                                      <button onClick={() => setEditingLocation(location)} className="p-2 text-zinc-500 hover:text-blue-600 dark:hover:text-blue-400 transition-colors rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-700" aria-label="Edit Location">
+                                                          <EditIcon className="w-4 h-4" />
+                                                      </button>
+                                                      <button onClick={() => handleDeleteLocation(location)} className="p-2 text-zinc-500 hover:text-red-600 dark:hover:text-red-400 transition-colors rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-700" aria-label="Delete Location">
+                                                          <TrashIcon className="w-4 h-4" />
+                                                      </button>
+                                                  </div>
+                                              </li>
+                                          ))}
+                                      </ul>
+                                    ) : <div className="p-6 text-center text-zinc-500 dark:text-zinc-400 text-sm">No custom locations. Using hardcoded defaults.</div>}
                                   </div>
                                 )}
                             </div>
@@ -3626,7 +3913,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                <div>
                  <label htmlFor="location" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Location</label>
                  <select id="location" value={assignment.location} onChange={(e) => setAssignment(prev => ({ ...prev, location: e.target.value }))} className={`${formInputStyle} py-2.5`}>
-                   {LOCATIONS.map(loc => <option key={loc} value={loc}>{loc}</option>)}
+                   {displayLocations.map(loc => <option key={loc} value={loc}>{loc}</option>)}
                  </select>
                </div>
                <div>
@@ -3679,7 +3966,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
             <div>
                 <label htmlFor="assign-location" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Location</label>
                 <select id="assign-location" value={assignmentContext.location} onChange={(e) => setAssignmentContext(prev => ({ ...prev, location: e.target.value }))} className={`${formInputStyle} py-2.5`}>
-                    {LOCATIONS.map(loc => <option key={loc} value={loc}>{loc}</option>)}
+                    {displayLocations.map(loc => <option key={loc} value={loc}>{loc}</option>)}
                 </select>
             </div>
             <div>
@@ -4091,6 +4378,34 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
         )}
       </Modal>
       
+      <Modal isOpen={isAddLocationModalOpen} onClose={() => setIsAddLocationModalOpen(false)} title="Add New Location">
+        <form onSubmit={handleAddLocation} className="space-y-4">
+            <div>
+                <label htmlFor="new-location-name" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Location Name</label>
+                <input id="new-location-name" type="text" required value={newLocationInfo.name} onChange={(e) => setNewLocationInfo({ name: e.target.value })} className={formInputStyle} placeholder="e.g. Warehouse B" />
+            </div>
+            <div className="flex justify-end space-x-3 pt-4 border-t border-zinc-200 dark:border-zinc-700">
+                <button type="button" onClick={() => setIsAddLocationModalOpen(false)} className="px-4 py-2 text-sm font-medium text-zinc-700 dark:text-zinc-200 bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-500 rounded-md hover:bg-zinc-50 dark:hover:bg-zinc-600">Cancel</button>
+                <button type="submit" className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-md hover:bg-blue-700">Add Location</button>
+            </div>
+        </form>
+      </Modal>
+
+      <Modal isOpen={!!editingLocation} onClose={() => setEditingLocation(null)} title="Edit Location">
+        {editingLocation && (
+            <form onSubmit={handleUpdateLocation} className="space-y-4">
+                <div>
+                    <label htmlFor="edit-location-name" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Location Name</label>
+                    <input id="edit-location-name" type="text" required value={editingLocation.name} onChange={(e) => setEditingLocation(prev => ({...prev, name: e.target.value}))} className={formInputStyle} />
+                </div>
+                <div className="flex justify-end space-x-3 pt-4 border-t border-zinc-200 dark:border-zinc-700">
+                    <button type="button" onClick={() => setEditingLocation(null)} className="px-4 py-2 text-sm font-medium text-zinc-700 dark:text-zinc-200 bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-500 rounded-md hover:bg-zinc-50 dark:hover:bg-zinc-600">Cancel</button>
+                    <button type="submit" className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-md hover:bg-blue-700">Save Changes</button>
+                </div>
+            </form>
+        )}
+      </Modal>
+
       <Modal isOpen={isAddSupplierModalOpen} onClose={() => setIsAddSupplierModalOpen(false)} title="Add New Supplier">
         <form onSubmit={handleAddSupplier} className="space-y-4">
              <div>
@@ -4434,6 +4749,28 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
         )}
       </Modal>
 
+      <Modal isOpen={isThresholdInfoModalOpen} onClose={() => setIsThresholdInfoModalOpen(false)} title="How Thresholds Are Calculated">
+        <div className="space-y-4 text-sm text-zinc-700 dark:text-zinc-300">
+            <p>
+                When you run the <strong>Calculate Thresholds</strong> action, the system analyzes the past 4 weeks of "OUT" movements (items assigned to teams) to determine a safe reorder point for each item type.
+            </p>
+            <div className="bg-blue-50 dark:bg-blue-900/20 border border-blue-100 dark:border-blue-800 rounded-md p-4">
+                <h4 className="font-semibold text-blue-900 dark:text-blue-300 mb-2">The Formula</h4>
+                <ul className="list-disc pl-5 space-y-1">
+                    <li>We calculate the total usage over the last <strong>4 weeks</strong>.</li>
+                    <li>We target a <strong>6-week stock cover</strong> buffer, which means multiplying the 4-week usage by <strong>1.5</strong> (or 150%).</li>
+                    <li>Any calculated threshold below <strong>5</strong> is automatically rounded up to <strong>5</strong> to ensure low-usage items aren't caught off guard.</li>
+                </ul>
+            </div>
+            <p>
+                <em>Example: If you used 10 items in the last 4 weeks, the new threshold will be set to 15. If you only used 2, the threshold will be safely clamped to the minimum of 5.</em>
+            </p>
+            <div className="flex justify-end pt-4">
+                <button onClick={() => setIsThresholdInfoModalOpen(false)} className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-md hover:bg-blue-700">Understood</button>
+            </div>
+        </div>
+      </Modal>
+      
       <Modal isOpen={isThresholdSummaryModalOpen} onClose={() => setIsThresholdSummaryModalOpen(false)} title="Stock Threshold Update Summary">
         {thresholdSummary && (
             <div className="space-y-4">
