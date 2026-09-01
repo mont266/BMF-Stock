@@ -1,0 +1,36 @@
+                                    return (
+                                    <tr key={item.id}>
+                                        <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-zinc-900 dark:text-zinc-100">{item.item_types.name}</td>
+                                        <td className="px-6 py-4 whitespace-nowrap text-sm text-zinc-500 dark:text-zinc-400 text-right">{item.quantity_ordered}</td>
+                                        <td className="px-6 py-4 whitespace-nowrap text-sm text-right">
+                                            <span className={outstanding > 0 ? 'text-yellow-600 dark:text-yellow-400' : 'text-green-600 dark:text-green-400'}>
+                                                {item.quantity_received}
+                                            </span>
+                                        </td>
+                                        <td className="px-6 py-4 whitespace-nowrap text-sm text-zinc-500 dark:text-zinc-400 text-right">£{parseFloat(item.cost_per_item).toFixed(2)}</td>
+                                        <td className="px-6 py-4 whitespace-nowrap text-sm text-zinc-800 dark:text-zinc-200 font-medium text-right">£{(item.quantity_ordered * item.cost_per_item).toFixed(2)}</td>
+                                    </tr>
+                                )})}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                 <div className="bg-zinc-50 dark:bg-zinc-800 p-4 text-right">
+                     <span className="text-sm font-medium text-zinc-800 dark:text-zinc-200">Grand Total: </span>
+                     <span className="text-lg font-bold text-zinc-900 dark:text-white">
+                        {new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP' }).format(po.total_cost)}
+                    </span>
+                </div>
+             </div>
+
+            <Modal isOpen={!!pdfPreviewUrl} onClose={() => setPdfPreviewUrl(null)} title="PDF Report Ready">
+               <div className="flex flex-col items-center text-center space-y-4 py-4">
+                  <div className="p-4 bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 rounded-full flex items-center justify-center">
+                     <DocumentArrowDownIcon className="w-12 h-12" />
+                  </div>
+                  <p className="text-zinc-600 dark:text-zinc-300 font-medium">
+                     Your PDF has been generated successfully.
+                  </p>
+                  <div className="flex flex-col w-full gap-3 mt-4">
+                     <a 
+                       href={pdfPreviewUrl} 

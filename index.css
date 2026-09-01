@@ -1,0 +1,157 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html.dark {
+  color-scheme: dark;
+}
+
+@layer utilities {
+  @keyframes pulse-glow {
+    0%, 100% {
+      filter: drop-shadow(0 0 5px theme('colors.blue.500')) drop-shadow(0 0 10px theme('colors.blue.600'));
+    }
+    50% {
+      filter: drop-shadow(0 0 15px theme('colors.blue.400')) drop-shadow(0 0 25px theme('colors.blue.500'));
+    }
+  }
+
+  .logo-glow {
+    animation: pulse-glow 3s infinite ease-in-out;
+  }
+
+  /* When the barcode scanner is active, make the entire webview transparent to see the camera view */
+  html.barcode-scan-active,
+  body.barcode-scan-active {
+    background: transparent !important;
+  }
+  
+  /* 
+    To show the native camera view, we need to hide the web content without
+    fully removing it from the DOM (which display:none does).
+    `visibility: hidden` achieves this. It makes the app content invisible
+    but keeps it in the layout, which is more stable for Capacitor overlays.
+    We target the main div inside #root which is rendered by App.jsx.
+  */
+  body.barcode-scan-active #root > div {
+    visibility: hidden;
+  }
+
+  /* 
+    We then make the scanner's own UI (like the 'Cancel' button) visible again,
+    so the user isn't stuck. This targets the specific class added in Scanner.jsx.
+  */
+  body.barcode-scan-active .scanner-ui-container {
+    visibility: visible;
+  }
+
+  /* 
+    We also need to make sure the toast notifications are visible over the camera view.
+  */
+  body.barcode-scan-active .toast-notifications-container {
+    visibility: visible;
+  }
+
+  .text-shadow {
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+  }
+
+  .scanner-frame {
+    /* The "cutout" effect: a massive shadow makes everything outside the frame dark. */
+    box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.6);
+    /* A subtle border on the frame itself */
+    border: 2px solid rgba(255, 255, 255, 0.5);
+  }
+
+  .scanner-line {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+    background: linear-gradient(to right, transparent, rgba(0, 191, 255, 0.8), transparent);
+    box-shadow: 0 0 10px 2px rgba(0, 191, 255, 0.6);
+    animation: scan 2.5s infinite ease-in-out;
+    border-radius: 3px;
+  }
+  
+  @keyframes scan {
+    0% {
+      transform: translateY(10px);
+    }
+    50% {
+      transform: translateY(calc(100% - 13px));
+    }
+    100% {
+      transform: translateY(10px);
+    }
+  }
+
+  /* Toast Animations */
+  @keyframes toast-in-right {
+    from {
+      transform: translateX(100%);
+      opacity: 0;
+    }
+    to {
+      transform: translateX(0);
+      opacity: 1;
+    }
+  }
+  @keyframes toast-out {
+    from {
+      opacity: 1;
+    }
+    to {
+      opacity: 0;
+    }
+  }
+  .animate-toast-in-right {
+    animation: toast-in-right 0.3s ease-out forwards;
+  }
+  .animate-toast-out {
+    animation: toast-out 0.3s ease-in forwards;
+  }
+  
+  /* Page Transition Animation */
+  @keyframes fadeIn {
+    from {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  .animate-fade-in {
+    animation: fadeIn 0.3s ease-out forwards;
+  }
+  
+  /* Print Styles */
+  @media print {
+    body * {
+      visibility: hidden;
+    }
+    #report-content, #report-content * {
+      visibility: visible;
+    }
+    #report-content {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 100%;
+      padding: 1rem;
+    }
+    .no-print {
+      display: none;
+    }
+  }
+  
+  .shadow-top {
+    box-shadow: 0 -2px 5px rgba(0, 0, 0, 0.05), 0 -1px 2px rgba(0, 0, 0, 0.06);
+  }
+  .dark .shadow-top {
+    box-shadow: 0 -2px 5px rgba(0, 0, 0, 0.15), 0 -1px 2px rgba(0, 0, 0, 0.2);
+  }
+}

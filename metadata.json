@@ -1,0 +1,7 @@
+{
+  "name": "Bregan MainsFlow Stock",
+  "description": "A stock management application for tracking items, assigning them to locations and teams via barcode scanning. Designed for teams working with Bregan MainsFlow Ltd.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}

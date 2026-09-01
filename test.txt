@@ -1,0 +1,25 @@
+            const fileName = `PurchaseOrder_${poNumber}.pdf`;
+
+            if (Capacitor.isNativePlatform()) {
+                try {
+                    const pdfBase64 = doc.output('datauristring').split(',')[1];
+                    
+                    const savedFile = await Filesystem.writeFile({
+                        path: fileName,
+                        data: pdfBase64,
+                        directory: Directory.Cache
+                    });
+                    await Share.share({
+                        title: `Purchase Order ${poNumber}`,
+                        url: savedFile.uri,
+                        dialogTitle: 'Share or Save PDF'
+                    });
+                    return;
+                } catch (nativeErr) {
+                    console.warn("Native PDF share failed", nativeErr);
+                    if (nativeErr.message && nativeErr.message.toLowerCase().includes('not implemented')) {
+                        setError("PDF sharing requires an app update. Please download the latest APK from the settings menu.");
+                        return;
+                    }
+                }
+            }

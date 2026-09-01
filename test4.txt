@@ -1,0 +1,21 @@
+                       className="w-full flex items-center justify-center px-4 py-3 bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-600 text-zinc-800 dark:text-zinc-200 rounded-md font-medium hover:bg-zinc-50 dark:hover:bg-zinc-600 transition-colors shadow-sm"
+                     >
+                       Download PDF
+                     </a>
+                  </div>
+                  <p className="text-xs text-zinc-500 mt-4 leading-relaxed">
+                     Note: If downloading does not work, please use "Open & Print PDF".
+                  </p>
+               </div>
+            </Modal>
+
+        </Page>
+    );
+};
+
+const ReceiveStockModal = ({ isOpen, onClose, po, userProfile, selectedProfile, setError, setSuccessMessage, refetchStock, fetchPurchaseOrders }) => {
+    const outstandingItems = useMemo(() => 
+        po.items.filter(item => item.quantity_ordered > item.quantity_received)
+    , [po.items]);
+
+    const [receivedQuantities, setReceivedQuantities] = useState(() => 
