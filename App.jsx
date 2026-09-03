@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import StockManagerApp from './components/StockManagerApp';
 import Auth from './components/Auth';
+import UpdatePassword from './components/UpdatePassword';
 import { supabase } from './lib/supabaseClient';
 import { BrandIcon } from './components/Icons';
 import { App as CapacitorApp } from '@capacitor/app';
@@ -13,6 +14,7 @@ const App = () => {
     const [loading, setLoading] = useState(true);
     const [profileError, setProfileError] = useState(null);
     const [selectedProfile, setSelectedProfile] = useState(null);
+    const [recoveryMode, setRecoveryMode] = useState(false);
 
     const fetchUserProfile = useCallback(async (user) => {
         if (!user) {
@@ -65,6 +67,10 @@ const App = () => {
         });
     
         const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => {
+            if (_event === 'PASSWORD_RECOVERY') {
+                setRecoveryMode(true);
+            }
+            
             setSession(session);
             if (session?.user) {
                 fetchUserProfile(session.user);
@@ -92,6 +98,20 @@ const App = () => {
     // Add inactivity timeout hook. If a profile is selected, start the timer.
     // After 10 minutes of inactivity, it will call `handleSwitchProfile`, locking the app.
     useInactivityTimeout(handleSwitchProfile, 600000);
+
+    useEffect(() => {
+        // Also check hash on load just in case the event fired before we started listening
+        const hash = window.location.hash;
+        if (hash && hash.includes('type=recovery')) {
+            setRecoveryMode(true);
+        }
+    }, []);
+
+
+    
+    if (recoveryMode) {
+        return <UpdatePassword onPasswordUpdated={() => setRecoveryMode(false)} />;
+    }
 
     if (loading) {
         return (

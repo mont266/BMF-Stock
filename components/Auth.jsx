@@ -7,6 +7,25 @@ const Auth = () => {
   const [email, setEmail] = useState('');
   const [error, setError] = useState(null);
 
+    const handleResetPassword = async (e) => {
+    e.preventDefault();
+    setError(null);
+    if (!email) {
+      setError('Please enter your email address to reset password.');
+      return;
+    }
+    setLoading(true);
+    const { error } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: window.location.origin,
+    });
+    if (error) {
+      setError(error.message);
+    } else {
+      setError('Password reset email sent! Check your inbox.');
+    }
+    setLoading(false);
+  };
+
   const handleLogin = async (e) => {
     e.preventDefault();
     setError(null);
@@ -53,9 +72,16 @@ const Auth = () => {
                         </div>
                     </div>
                     <div>
-                        <label htmlFor="password" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">
-                        Password
-                        </label>
+                        <div className="flex items-center justify-between mt-2">
+                            <label htmlFor="password" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">
+                            Password
+                            </label>
+                            <div className="text-sm">
+                                <button type="button" onClick={handleResetPassword} className="font-medium text-blue-600 hover:text-blue-500">
+                                Forgot your password?
+                                </button>
+                            </div>
+                        </div>
                         <div className="mt-1">
                         <input id="password" name="password" type="password" autoComplete="current-password" required value={password} onChange={(e) => setPassword(e.target.value)} className={formInputStyle} />
                         </div>
