@@ -21,6 +21,7 @@ export const View = {
   ASSIGNMENTS: 'ASSIGNMENTS',
   REPORTING: 'REPORTING',
   PURCHASING: 'PURCHASING',
+  STOCK_TAKE: 'STOCK_TAKE',
 };
 
 export const StockCategory = {

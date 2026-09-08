@@ -3,6 +3,13 @@ import { supabase } from '../lib/supabaseClient';
 import { Location, Team } from '../types';
 import { get, set } from 'idb-keyval';
 
+
+const isOfflineError = (err) => {
+    if (!navigator.onLine) return true;
+    const msg = (err?.message || err?.toString() || '').toLowerCase();
+    return msg === 'failed to fetch' || msg.includes('fetch') || msg.includes('network');
+};
+
 export const useStock = () => {
   const [stock, setStock] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -149,12 +156,13 @@ export const useStock = () => {
     return updatedItem;
   }, []);
 
-  const processSyncQueue = useCallback(async () => {
+    const processSyncQueue = useCallback(async () => {
     if (isSyncing || syncQueue.length === 0 || !navigator.onLine) return;
     setIsSyncing(true);
     
     let currentQueue = [...syncQueue];
     let hasError = false;
+    let tempIdMap = {}; // Maps temp IDs to real Supabase UUIDs
 
     for (const task of currentQueue) {
       if (!navigator.onLine) {
@@ -163,28 +171,38 @@ export const useStock = () => {
       }
       try {
         if (task.action === 'UPDATE_ASSIGNMENT') {
-          const { itemId, location, assigned_to, assignerName } = task.payload;
+          let { itemId, location, assigned_to, assignerName } = task.payload;
+          if (tempIdMap[itemId]) {
+              itemId = tempIdMap[itemId]; // Map temp ID to real ID
+          }
           await performUpdateAssignment(itemId, location, assigned_to, assignerName);
         } else if (task.action === 'ADD_STOCK') {
-          const { item, assignerName } = task.payload;
-          // We don't have performAddStockItem, we can just duplicate logic here, but it's cleaner to reuse.
-          // For simplicity, let's just make the Supabase call here.
+          const { item, assignerName, tempId } = task.payload;
           const { data: { session } } = await supabase.auth.getSession();
-    const user = session?.user;
-          const newItem = { ...item, location: Location.LEADING_STORES, assigned_to: Team.UNASSIGNED, user_id: user.id };
+          const user = session?.user;
+          const newItem = { ...item, location: 'Leading Stores', assigned_to: 'Unassigned', user_id: user?.id };
           const { data: insertedData, error } = await supabase.from('stock_items').insert([newItem]).select().single();
           if (error) throw error;
-          const movement = { item_id: insertedData.id, item_barcode: insertedData.barcode, item_name: insertedData.name, movement_type: 'IN', location_from: 'New Stock', location_to: insertedData.location, user_id: user.id, username: assignerName };
+          
+          if (tempId) {
+              tempIdMap[tempId] = insertedData.id;
+          }
+          
+          const movement = { item_id: insertedData.id, item_barcode: insertedData.barcode, item_name: insertedData.name, movement_type: 'IN', location_from: 'New Stock', location_to: insertedData.location, user_id: user?.id, username: assignerName };
           await supabase.from('stock_movements').insert(movement);
         }
+        
         // Remove from currentQueue if successful
         currentQueue = currentQueue.filter(t => t.id !== task.id);
       } catch (err) {
         console.error("Failed to process queue task:", err);
-        if (err.message === 'Failed to fetch' || err.message.includes('fetch')) {
+        // If it's a conflict or foreign key error (like item not found), we should probably drop it or flag it
+        // but for now, network errors will break the loop, others will drop the task
+        if (isOfflineError(err)) {
           hasError = true;
           break;
         } else {
+           // Skip/Drop task if it's a hard error (e.g. invalid UUID) to prevent infinite sync loops
            currentQueue = currentQueue.filter(t => t.id !== task.id);
         }
       }
@@ -193,7 +211,7 @@ export const useStock = () => {
     setSyncQueue(currentQueue);
     setIsSyncing(false);
     if (!hasError && currentQueue.length < syncQueue.length) {
-      fetchStock(); // refresh if we uploaded anything
+      fetchStock(); 
     }
   }, [syncQueue, isSyncing, fetchStock, performUpdateAssignment]);
 
@@ -211,33 +229,38 @@ export const useStock = () => {
     };
   }, [processSyncQueue, syncQueue.length]);
 
-  const addStockItem = useCallback(async (item, assignerName) => {
-    const { data: { session } } = await supabase.auth.getSession();
-    const user = session?.user;
-    if (!user) throw new Error('User not authenticated');
-    
-    const newItem = {
-      ...item,
-      location: Location.LEADING_STORES,
-      assigned_to: Team.UNASSIGNED,
-      user_id: user.id,
-    };
-
-    if (!navigator.onLine) {
+    const addStockItem = useCallback(async (item, assignerName) => {
+    const handleOffline = () => {
+        const tempId = Math.random().toString(36).substr(2, 9);
         const task = {
             id: Math.random().toString(36).substr(2, 9),
             action: 'ADD_STOCK',
-            payload: { item, assignerName },
+            payload: { item, assignerName, tempId },
             timestamp: new Date().toISOString()
         };
         setSyncQueue(prev => [...prev, task]);
-        
-        const tempId = Math.random().toString(36).substr(2, 9);
+
+        const newItem = { ...item, location: 'Leading Stores', assigned_to: 'Unassigned', user_id: 'offline_user' };
         setStock(prev => [{ ...newItem, id: tempId }, ...prev]);
+    };
+
+    if (!navigator.onLine) {
+        handleOffline();
         return;
     }
 
     try {
+        const { data: { session } } = await supabase.auth.getSession();
+        const user = session?.user;
+        if (!user) throw new Error('User not authenticated');
+        
+        const newItem = {
+          ...item,
+          location: 'Leading Stores',
+          assigned_to: 'Unassigned',
+          user_id: user.id,
+        };
+
         const { data: insertedData, error } = await supabase.from('stock_items').insert([newItem]).select().single();
         if (error) throw error;
         
@@ -256,56 +279,84 @@ export const useStock = () => {
         
         await fetchStock();
     } catch (err) {
-        if (err.message === 'Failed to fetch' || err.message.includes('fetch')) {
-            const task = {
-                id: Math.random().toString(36).substr(2, 9),
-                action: 'ADD_STOCK',
-                payload: { item, assignerName },
-                timestamp: new Date().toISOString()
-            };
-            setSyncQueue(prev => [...prev, task]);
-            
-            const tempId = Math.random().toString(36).substr(2, 9);
-            setStock(prev => [{ ...newItem, id: tempId }, ...prev]);
+        if (isOfflineError(err)) {
+            handleOffline();
             return;
         }
         throw err;
     }
   }, [fetchStock]);
 
-  const bulkAddStockItems = useCallback(async (items, assignerName) => {
-    const { data: { session } } = await supabase.auth.getSession();
-    const user = session?.user;
-    if (!user) throw new Error('User not authenticated');
-
-    const newItems = items.map(item => ({
-      ...item,
-      location: Location.LEADING_STORES,
-      assigned_to: Team.UNASSIGNED,
-      user_id: user.id
-    }));
-    
-    const { data: insertedData, error } = await supabase.from('stock_items').insert(newItems).select();
-    if (error) throw error;
-
-    if (insertedData) {
-        const movements = insertedData.map(d => ({
-            item_id: d.id,
-            item_barcode: d.barcode,
-            item_name: d.name,
-            movement_type: 'IN',
-            location_from: 'New Stock',
-            location_to: d.location,
-            user_id: user.id,
-            username: assignerName,
-        }));
-        const { error: moveError } = await supabase.from('stock_movements').insert(movements);
-        if (moveError) {
-            console.error("Bulk movement log failed:", moveError.message);
+    const bulkAddStockItems = useCallback(async (items, assignerName) => {
+    const handleOffline = () => {
+        const offlineItems = [];
+        const newTasks = [];
+        for (const item of items) {
+            const tempId = Math.random().toString(36).substr(2, 9);
+            const task = {
+                id: Math.random().toString(36).substr(2, 9),
+                action: 'ADD_STOCK',
+                payload: { item, assignerName, tempId },
+                timestamp: new Date().toISOString()
+            };
+            newTasks.push(task);
+            
+            offlineItems.push({
+                ...item,
+                id: tempId,
+                location: Location.LEADING_STORES,
+                assigned_to: Team.UNASSIGNED,
+                user_id: 'offline_user'
+            });
         }
+        setSyncQueue(prev => [...prev, ...newTasks]);
+        setStock(prev => [...offlineItems, ...prev]);
+    };
+
+    if (!navigator.onLine) {
+        handleOffline();
+        return;
     }
 
-    await fetchStock();
+    try {
+        const { data: { session } } = await supabase.auth.getSession();
+        const user = session?.user;
+        if (!user) throw new Error('User not authenticated');
+
+        const newItems = items.map(item => ({
+          ...item,
+          location: Location.LEADING_STORES,
+          assigned_to: Team.UNASSIGNED,
+          user_id: user.id
+        }));
+        
+        const { data: insertedData, error } = await supabase.from('stock_items').insert(newItems).select();
+        if (error) throw error;
+        
+        if (insertedData) {
+            const movements = insertedData.map(d => ({
+                item_id: d.id,
+                item_barcode: d.barcode,
+                item_name: d.name,
+                movement_type: 'IN',
+                location_from: 'New Stock',
+                location_to: d.location,
+                user_id: user.id,
+                username: assignerName,
+            }));
+            const { error: moveError } = await supabase.from('stock_movements').insert(movements);
+            if (moveError) {
+                console.error("Bulk movement log failed:", moveError.message);
+            }
+        }
+        await fetchStock();
+    } catch (err) {
+        if (isOfflineError(err)) {
+            handleOffline();
+            return;
+        }
+        throw err;
+    }
   }, [fetchStock]);
 
   const updateStockItemAssignment = useCallback(async (itemId, location, assigned_to, assignerName) => {
@@ -332,7 +383,7 @@ export const useStock = () => {
         const result = await performUpdateAssignment(itemId, location, assigned_to, assignerName);
         return result;
     } catch (err) {
-        if (err.message === 'Failed to fetch' || err.message.includes('fetch')) {
+        if (isOfflineError(err)) {
            const task = {
                id: Math.random().toString(36).substr(2, 9),
                action: 'UPDATE_ASSIGNMENT',
@@ -485,27 +536,36 @@ export const useStock = () => {
         if (error) throw error;
         return data || [];
     } catch (err) {
-        if (err.message === 'Failed to fetch' || err.message.includes('fetch')) {
+        if (isOfflineError(err)) {
             return stock.filter(item => item.barcode === barcode);
         }
         throw err;
     }
   }, [stock]);
 
-  const getExistingBarcodes = useCallback(async (barcodes) => {
-    const { data: { session } } = await supabase.auth.getSession();
-    const user = session?.user;
-    if (!user) throw new Error('User not authenticated');
-
-    const { data, error } = await supabase
-        .from('stock_items')
-        .select('barcode')
+    const getExistingBarcodes = useCallback(async (barcodes) => {
+    if (!navigator.onLine) {
+       return new Set(stock.filter(item => barcodes.includes(item.barcode)).map(item => item.barcode));
+    }
+    try {
+        const { data: { session } } = await supabase.auth.getSession();
+        const user = session?.user;
+        if (!user) throw new Error('User not authenticated');
         
-        .in('barcode', barcodes);
+        const { data, error } = await supabase
+            .from('stock_items')
+            .select('barcode')
+            .in('barcode', barcodes);
 
-    if (error) throw error;
-    return new Set(data.map(item => item.barcode));
-  }, []);
+        if (error) throw error;
+        return new Set(data.map(item => item.barcode));
+    } catch (err) {
+        if (isOfflineError(err)) {
+            return new Set(stock.filter(item => barcodes.includes(item.barcode)).map(item => item.barcode));
+        }
+        throw err;
+    }
+  }, [stock]);
 
   return { stock, setStock, loading, addStockItem, bulkAddStockItems, updateStockItemAssignment, bulkUpdateAssignments, deleteStockItem, bulkDeleteStockItems, getStockItemsByBarcode, getExistingBarcodes, refetchStock: fetchStock, syncQueue, clearSyncQueue: () => { setSyncQueue([]); set("offline_sync_queue", []); } };
 };

@@ -6,7 +6,8 @@ import { useDarkMode } from '../hooks/useDarkMode';
 import Scanner from './Scanner';
 import Modal from './Modal';
 import PurchasingPage from './PurchasingPage';
-import { BrandIcon, ScanIcon, InformationCircleIcon, AddIcon, ListIcon, ChevronDownIcon, LogoutIcon, AdminIcon, BoxIcon, TagIcon, UsersIcon, BuildingStoreIcon, SunIcon, MoonIcon, EditIcon, TrashIcon, CurrencyPoundIcon, ArchiveIcon, PlusCircleIcon, ArrowRightCircleIcon, CheckCircleIcon, XCircleIcon, SettingsIcon, XIcon, ChartBarIcon, PurchasingIcon, SwitchUserIcon, CalculatorIcon, DocumentArrowDownIcon, UploadIcon, RefreshIcon } from './Icons';
+import StockTakePage from './StockTakePage';
+import { BrandIcon, ScanIcon, InformationCircleIcon, AddIcon, ListIcon, ChevronDownIcon, LogoutIcon, AdminIcon, BoxIcon, TagIcon, UsersIcon, BuildingStoreIcon, SunIcon, MoonIcon, EditIcon, TrashIcon, CurrencyPoundIcon, ArchiveIcon, PlusCircleIcon, ArrowRightCircleIcon, CheckCircleIcon, XCircleIcon, SettingsIcon, XIcon, ChartBarIcon, PurchasingIcon, SwitchUserIcon, CalculatorIcon, DocumentArrowDownIcon, UploadIcon, RefreshIcon, ClipboardCheckIcon, BellIcon } from './Icons';
 import { supabase } from '../lib/supabaseClient';
 import { Capacitor } from '@capacitor/core';
 import { Haptics, ImpactStyle } from '@capacitor/haptics';
@@ -961,6 +962,30 @@ const RapidScanSummary = ({ summary }) => {
 const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogout }) => {
   const { stock, setStock, loading: stockLoading, addStockItem, bulkAddStockItems, updateStockItemAssignment, bulkUpdateAssignments, deleteStockItem, bulkDeleteStockItems, getStockItemsByBarcode, getExistingBarcodes, refetchStock, syncQueue, clearSyncQueue } = useStock();
   const [currentView, setCurrentView] = useState(View.LIST);
+
+  const [isOffline, setIsOffline] = useState(!navigator.onLine);
+  const [showOnlineRestored, setShowOnlineRestored] = useState(false);
+
+  useEffect(() => {
+    const handleOffline = () => {
+        setIsOffline(true);
+        setShowOnlineRestored(false);
+    };
+    const handleOnline = () => {
+        setIsOffline(false);
+        setShowOnlineRestored(true);
+        setTimeout(() => setShowOnlineRestored(false), 3000);
+    };
+
+    window.addEventListener('offline', handleOffline);
+    window.addEventListener('online', handleOnline);
+
+    return () => {
+        window.removeEventListener('offline', handleOffline);
+        window.removeEventListener('online', handleOnline);
+    };
+  }, []);
+
   const [scannedItem, setScannedItem] = useState(null);
   const [assignment, setAssignment] = useState({ location: Location.UNASSIGNED, team: Team.UNASSIGNED });
   const [error, setError] = useState(null);
@@ -985,7 +1010,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
   const [createUserLoading, setCreateUserLoading] = useState(false);
   const [isDarkMode, toggleDarkMode] = useDarkMode();
   const [dashboardFilters, setDashboardFilters] = useState({ location: 'All' });
-  const [assignmentFilters, setAssignmentFilters] = useState({ team: 'All', itemType: 'All', assignedByMe: false });
+  const [assignmentFilters, setAssignmentFilters] = useState({ team: 'All', itemType: 'All', location: 'All', assignedByMe: false });
 
   const [itemTypes, setItemTypes] = useState([]);
   const [itemTypesLoading, setItemTypesLoading] = useState(true);
@@ -1061,7 +1086,19 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
 
   // --- App Settings State ---
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+
+  const [isDevMode, setIsDevMode] = useState(false);
+  const [isDevLoginModalOpen, setIsDevLoginModalOpen] = useState(false);
+  const [devPasswordInput, setDevPasswordInput] = useState('');
+  const [devLoginError, setDevLoginError] = useState('');
+  const [isDevPurgeModalOpen, setIsDevPurgeModalOpen] = useState(false);
+  const [devPurgeBarcode, setDevPurgeBarcode] = useState('');
+  const [devPurgeResults, setDevPurgeResults] = useState(null);
+  const [devPurgeLoading, setDevPurgeLoading] = useState(false);
+
   const [isQueueModalOpen, setIsQueueModalOpen] = useState(false);
+  const [unrecognizedScans, setUnrecognizedScans] = useState([]);
+  const [isUnrecognizedModalOpen, setIsUnrecognizedModalOpen] = useState(false);
   const [isBeepEnabled, setIsBeepEnabled] = useState(() => {
     const saved = localStorage.getItem('scannerBeepEnabled');
     return saved !== null ? JSON.parse(saved) : true;
@@ -1126,6 +1163,8 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
         if (isAssignmentSetupModalOpen) { setIsAssignmentSetupModalOpen(false); return; }
         if (isScanModeModalOpen) { setIsScanModeModalOpen(false); return; }
         if (isSettingsModalOpen) { setIsSettingsModalOpen(false); return; }
+        if (isDevLoginModalOpen) { setIsDevLoginModalOpen(false); return; }
+        if (isDevPurgeModalOpen) { setIsDevPurgeModalOpen(false); return; }
         if (isChangePinModalOpen) { setIsChangePinModalOpen(false); return; }
         if (isCreateUserModalOpen) { setIsCreateUserModalOpen(false); return; }
         if (editingItemType) { setEditingItemType(null); return; }
@@ -1169,6 +1208,8 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
     currentView,
     scannedItem,
     isSettingsModalOpen,
+    isDevLoginModalOpen,
+    isDevPurgeModalOpen,
     isChangePinModalOpen,
     isCreateUserModalOpen,
     isAddItemTypeModalOpen,
@@ -1402,13 +1443,53 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
     }
   }, []);
 
+  const fetchUnrecognizedScans = useCallback(async () => {
+    try {
+        const { data, error } = await supabase.from('unrecognized_scans').select('*').order('scanned_at', { ascending: false });
+        if (!error && data) {
+            setUnrecognizedScans(data);
+        }
+    } catch (err) {
+        console.error("Failed to fetch unrecognized scans", err);
+    }
+  }, []);
+
+  const logUnrecognizedBarcode = useCallback(async (barcode) => {
+      try {
+          const { data: { session } } = await supabase.auth.getSession();
+          const user = session?.user;
+          const { error } = await supabase.from('unrecognized_scans').insert({
+              barcode: barcode,
+              scanned_by: user?.id,
+              profile_name: selectedProfile?.name || 'Unknown'
+          });
+          if (!error) {
+              fetchUnrecognizedScans();
+          }
+      } catch (err) {
+          console.error("Failed to log unrecognized barcode", err);
+      }
+  }, [fetchUnrecognizedScans, selectedProfile]);
+
+  const deleteUnrecognizedScan = async (id) => {
+      try {
+          const { error } = await supabase.from('unrecognized_scans').delete().eq('id', id);
+          if (!error) {
+              setUnrecognizedScans(prev => prev.filter(scan => scan.id !== id));
+          }
+      } catch (err) {
+          console.error("Failed to delete unrecognized scan", err);
+      }
+  };
+
   useEffect(() => {
     fetchItemTypes();
     fetchTeams();
     fetchCategories();
     fetchSuppliers();
     fetchLocations();
-  }, [fetchItemTypes, fetchTeams, fetchCategories, fetchSuppliers, fetchLocations]);
+    fetchUnrecognizedScans();
+  }, [fetchItemTypes, fetchTeams, fetchCategories, fetchSuppliers, fetchLocations, fetchUnrecognizedScans]);
 
   const handleScanSuccess = useCallback(async (decodedText) => {
     setError(null);
@@ -1449,6 +1530,10 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                 try {
                     const items = await getStockItemsByBarcode(decodedText);
                     
+                    if (items.length === 0) {
+                        logUnrecognizedBarcode(decodedText);
+                    }
+
                     // FIFO: Prioritize older items with the lowest purchase price
                     items.sort((a, b) => {
                         const priceA = parseFloat(a.purchase_price) || 0;
@@ -1499,6 +1584,10 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
             handleSetView(View.LIST); // Stop scanner for quantity mode
             const items = await getStockItemsByBarcode(decodedText);
             
+            if (items.length === 0) {
+                logUnrecognizedBarcode(decodedText);
+            }
+
             // FIFO: Prioritize older items with the lowest purchase price
             items.sort((a, b) => {
                 const priceA = parseFloat(a.purchase_price) || 0;
@@ -1529,7 +1618,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
         setError(`Failed to process scan: ${e.message}`);
         handleSetView(View.LIST);
     }
-  }, [getStockItemsByBarcode, handleSetView, scanMode, itemTypes, assignmentContext, selectedProfile, playBeep, triggerScanFeedback, addToast, setStock, updateStockItemAssignment]);
+  }, [getStockItemsByBarcode, handleSetView, scanMode, itemTypes, assignmentContext, selectedProfile, playBeep, triggerScanFeedback, addToast, setStock, updateStockItemAssignment, logUnrecognizedBarcode]);
   
   const handleScanError = useCallback((err) => {
     handleSetView(View.LIST);
@@ -2200,6 +2289,19 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
   };
 
   const executeConfirmationAction = async () => {
+    if (confirmationModal.onConfirm) {
+        setIsConfirmingAction(true);
+        setError(null);
+        try {
+            await confirmationModal.onConfirm();
+            setConfirmationModal({ isOpen: false });
+        } catch (err) {
+            setError(err.message);
+        } finally {
+            setIsConfirmingAction(false);
+        }
+        return;
+    }
     const { actionType, item } = confirmationModal;
     if (!actionType) return;
     
@@ -2250,6 +2352,63 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
     } finally {
         setIsConfirmingAction(false);
     }
+  };
+
+  
+  const handleDevLogin = (e) => {
+      e.preventDefault();
+      if (devPasswordInput === '153501') {
+          setIsDevMode(true);
+          setIsDevLoginModalOpen(false);
+          setDevPasswordInput('');
+          setDevLoginError('');
+      } else {
+          setDevLoginError('Incorrect password');
+      }
+  };
+
+  const handleDevPurgeSearch = async (e) => {
+      e.preventDefault();
+      if (!devPurgeBarcode.trim()) return;
+      setDevPurgeLoading(true);
+      setDevPurgeResults(null);
+      setError(null);
+      try {
+          const items = await getStockItemsByBarcode(devPurgeBarcode);
+          const { data: itemType } = await supabase.from('item_types').select('*').eq('barcode', devPurgeBarcode).maybeSingle();
+          
+          setDevPurgeResults({
+              stockItems: items || [],
+              itemType: itemType || null
+          });
+      } catch (err) {
+          setError(`Search failed: ${err.message}`);
+      } finally {
+          setDevPurgeLoading(false);
+      }
+  };
+
+  const handleDevPurgeConfirm = async () => {
+      if (!devPurgeResults) return;
+      
+      const itemIds = devPurgeResults.stockItems.map(i => i.id);
+      
+      try {
+          if (itemIds.length > 0) {
+              await bulkDeleteStockItems(itemIds, selectedProfile.name);
+          }
+          if (devPurgeResults.itemType) {
+              await supabase.from('item_types').delete().eq('id', devPurgeResults.itemType.id);
+              await fetchItemTypes();
+          }
+          
+          setSuccessMessage(`Successfully purged ${itemIds.length} items${devPurgeResults.itemType ? ' and associated type data' : ''}.`);
+          setIsDevPurgeModalOpen(false);
+          setDevPurgeResults(null);
+          setDevPurgeBarcode('');
+      } catch (err) {
+          setError(`Purge failed: ${err.message}`);
+      }
   };
 
   const handleDeleteItemType = async (type) => {
@@ -2573,8 +2732,9 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
     return assignedStock.filter(item => {
         const teamMatch = assignmentFilters.team === 'All' || item.assigned_to === assignmentFilters.team;
         const itemTypeMatch = assignmentFilters.itemType === 'All' || item.name === assignmentFilters.itemType;
+        const locationMatch = assignmentFilters.location === 'All' || item.location === assignmentFilters.location;
         const assignedByMeMatch = !assignmentFilters.assignedByMe || item.assigned_by === selectedProfile.name;
-        return teamMatch && itemTypeMatch && assignedByMeMatch;
+        return teamMatch && itemTypeMatch && locationMatch && assignedByMeMatch;
     });
   }, [assignedStock, assignmentFilters, selectedProfile]);
 
@@ -2724,7 +2884,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
       [View.ADD_ITEM]: { title: 'Add New Stock' },
       [View.SCAN]: { title: 'Scan Serial Number' },
       [View.ADMIN]: { title: 'Admin' },
-      [View.ASSIGNMENTS]: { title: 'Assignment Log' },
+      [View.ASSIGNMENTS]: { title: 'Log' },
       [View.REPORTING]: { title: 'Inventory Reports' },
       [View.PURCHASING]: { title: 'Purchase Orders' },
   }), [selectedProfile]);
@@ -2782,6 +2942,9 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
 
   return (
     <>
+      
+      
+
       <div className="flex h-screen bg-zinc-100 dark:bg-zinc-900 text-zinc-800 dark:text-zinc-200">
         <aside className="hidden md:flex w-64 flex-col bg-white dark:bg-zinc-800 border-r border-zinc-200 dark:border-zinc-700">
           <div className="h-16 flex items-center px-4 border-b border-zinc-200 dark:border-zinc-700 flex-shrink-0">
@@ -2791,7 +2954,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
           <nav className="flex-1 p-4 space-y-1.5">
               <SidebarNavItem icon={<ListIcon />} label="Dashboard" isActive={currentView === View.LIST} onClick={() => navigateTo(View.LIST)} />
               {isAdminProfile && (
-                <SidebarNavItem icon={<ArchiveIcon />} label="Assignment Log" isActive={currentView === View.ASSIGNMENTS} onClick={() => navigateTo(View.ASSIGNMENTS)} />
+                <SidebarNavItem icon={<ArchiveIcon />} label="Log" isActive={currentView === View.ASSIGNMENTS} onClick={() => navigateTo(View.ASSIGNMENTS)} />
               )}
               {!Capacitor.isNativePlatform() && (
                 <SidebarNavItem icon={<AddIcon />} label="Add Stock" isActive={currentView === View.ADD_ITEM} onClick={() => navigateTo(View.ADD_ITEM)} />
@@ -2803,6 +2966,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                 <>
                   <SidebarNavItem icon={<PurchasingIcon />} label="Purchasing" isActive={currentView === View.PURCHASING} onClick={() => navigateTo(View.PURCHASING)} />
                   <SidebarNavItem icon={<ChartBarIcon />} label="Reporting" isActive={currentView === View.REPORTING} onClick={() => navigateTo(View.REPORTING)} />
+                  <SidebarNavItem icon={<ClipboardCheckIcon />} label="Stock Take" isActive={currentView === View.STOCK_TAKE} onClick={() => navigateTo(View.STOCK_TAKE)} />
                   <SidebarNavItem icon={<AdminIcon />} label="Admin Panel" isActive={currentView === View.ADMIN} onClick={handleAdminClick} />
                 </>
               )}
@@ -2822,6 +2986,14 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
         <span className="absolute top-0 right-0 inline-flex items-center justify-center px-1.5 py-0.5 text-[10px] font-bold leading-none text-white transform translate-x-1/4 -translate-y-1/4 bg-red-600 rounded-full">{syncQueue.length}</span>
       </button>
   )}
+                  {isAdminProfile && (
+                      <button onClick={() => setIsUnrecognizedModalOpen(true)} className="p-2 rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-700 transition-colors relative" aria-label="Notifications" title="Notifications">
+                          <BellIcon className="w-5 h-5 text-zinc-500" />
+                          {unrecognizedScans.length > 0 && (
+                              <span className="absolute top-0 right-0 inline-flex items-center justify-center px-1.5 py-0.5 text-[10px] font-bold leading-none text-white transform translate-x-1/4 -translate-y-1/4 bg-red-600 rounded-full">{unrecognizedScans.length}</span>
+                          )}
+                      </button>
+                  )}
   <button onClick={() => setIsSettingsModalOpen(true)} className="p-2 rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-700 transition-colors" aria-label="Settings" title="Settings">
                     <SettingsIcon className="w-5 h-5"/>
                   </button>
@@ -2831,6 +3003,9 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                   <button onClick={onLogout} className="p-2 rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-700 transition-colors" aria-label="Logout" title="Logout">
                       <LogoutIcon className="w-5 h-5"/>
                   </button>
+              </div>
+              <div className="mt-2 text-center">
+                  <span className="text-[10px] font-medium text-zinc-400 dark:text-zinc-500 tracking-wider">v0.07</span>
               </div>
           </div>
         </aside>
@@ -2850,6 +3025,14 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                   <h1 className="text-xl font-bold tracking-tight">{headerTitle}</h1>
               </div>
               <div className="flex items-center">
+                 {isAdminProfile && (
+                     <button onClick={() => setIsUnrecognizedModalOpen(true)} className="p-2 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-700 transition-colors relative mr-1" aria-label="Notifications" title="Notifications">
+                        <BellIcon className="w-6 h-6" />
+                        {unrecognizedScans.length > 0 && (
+                            <span className="absolute top-0 right-0 inline-flex items-center justify-center px-1.5 py-0.5 text-[10px] font-bold leading-none text-white transform translate-x-1/4 -translate-y-1/4 bg-red-600 rounded-full">{unrecognizedScans.length}</span>
+                        )}
+                     </button>
+                 )}
                  <button onClick={onSwitchProfile} className="p-2 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-700 transition-colors" aria-label="Switch Profile" title="Switch Profile">
                     <SwitchUserIcon className="w-6 h-6" />
                  </button>
@@ -2906,8 +3089,22 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
             </div>
           </div>
 
+          
+          {isOffline && (
+              <div className="bg-amber-500 text-white text-center py-2 px-4 text-sm font-semibold flex items-center justify-center gap-2 flex-shrink-0 shadow-sm z-40 relative w-full">
+                  <span className="w-2 h-2 rounded-full bg-white animate-pulse"></span>
+                  Offline Mode: Changes will be saved locally and synced when connection is restored.
+              </div>
+          )}
+          {showOnlineRestored && !isOffline && (
+              <div className="bg-emerald-500 text-white text-center py-2 px-4 text-sm font-semibold flex items-center justify-center gap-2 flex-shrink-0 shadow-sm transition-all duration-500 z-40 relative w-full">
+                  <CheckCircleIcon className="w-4 h-4" />
+                  Connection Restored: Syncing changes...
+              </div>
+          )}
+
           {/* --- MAIN CONTENT --- */}
-          <main className="flex-1 overflow-y-auto pb-24 md:pb-0">
+          <main className="flex-1 overflow-y-auto pb-32 md:pb-0 relative">
                {error && (
                  <div className="m-4 sm:m-6 lg:m-8 p-4 bg-red-100 dark:bg-red-900/20 border border-red-400 dark:border-red-500/50 text-red-700 dark:text-red-300 rounded-md relative" role="alert">
                    <strong className="font-bold">Error:</strong>
@@ -3202,6 +3399,19 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                                               {itemTypes.map(type => <option key={type.id} value={type.name}>{type.name}</option>)}
                                           </select>
                                       </div>
+                                      <div>
+                                          <label htmlFor="filter-location" className="block text-xs font-medium text-zinc-600 dark:text-zinc-400">Filter by Location</label>
+                                          <select 
+                                              id="filter-location" 
+                                              name="location"
+                                              value={assignmentFilters.location}
+                                              onChange={(e) => setAssignmentFilters(prev => ({...prev, location: e.target.value}))}
+                                              className={`${formInputStyle} mt-1 text-sm py-2`}
+                                          >
+                                              <option value="All">All Locations</option>
+                                              {displayLocations.map(loc => <option key={loc} value={loc}>{loc}</option>)}
+                                          </select>
+                                      </div>
                                       <div className="flex items-center pt-5">
                                         <label htmlFor="assigned-by-me-toggle" className="relative inline-flex items-center cursor-pointer">
                                             <input 
@@ -3209,7 +3419,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                                                 id="assigned-by-me-toggle" 
                                                 className="sr-only peer" 
                                                 checked={assignmentFilters.assignedByMe}
-                                                onChange={(e) => setAssignmentFilters(prev => ({...prev, assignedByMe: e.target.checked}))} 
+                                                onChange={(e) => setAssignmentFilters(prev => ({...prev, assignedByMe: e.target.checked}))}
                                             />
                                             <div className="w-11 h-6 bg-zinc-200 dark:bg-zinc-700 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 dark:peer-focus:ring-blue-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-zinc-300 dark:after:border-zinc-600 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
                                             <span className="ml-3 text-sm font-medium text-zinc-700 dark:text-zinc-300">Assigned by me</span>
@@ -3217,7 +3427,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                                       </div>
                                       <div className="flex justify-start lg:justify-end">
                                           <button 
-                                              onClick={() => setAssignmentFilters({ team: 'All', itemType: 'All', assignedByMe: false })}
+                                              onClick={() => setAssignmentFilters({ team: 'All', itemType: 'All', location: 'All', assignedByMe: false })}
                                               className="w-full lg:w-auto px-4 py-2 bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-600 text-zinc-800 dark:text-zinc-200 rounded-md hover:bg-zinc-50 dark:hover:bg-zinc-600 transition-colors text-sm font-medium"
                                           >
                                               Clear Filters
@@ -3580,6 +3790,15 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                       </Page>
                     )}
 
+                    {currentView === View.STOCK_TAKE && isAdminProfile && (
+                       <StockTakePage 
+                           stock={stock} 
+                           setStock={setStock} 
+                           setError={setError} 
+                           logUnrecognizedBarcode={logUnrecognizedBarcode}
+                       />
+                    )}
+
                     {currentView === View.ADMIN && isAdminProfile && (
                       <Page title={viewConfig[currentView].title}>
                         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
@@ -3596,6 +3815,13 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                               description="Generate and view stock movement reports."
                               onClick={() => navigateTo(View.REPORTING)}
                               buttonText="View Reports"
+                            />
+                            <AdminActionCard 
+                              icon={<ClipboardCheckIcon/>}
+                              title="Stock Takes"
+                              description="Perform full or rolling stock counts and manage historical reports."
+                              onClick={() => navigateTo(View.STOCK_TAKE)}
+                              buttonText="Manage Stock Takes"
                             />
                              <AdminActionCard 
                                 icon={<UsersIcon/>}
@@ -3881,7 +4107,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
             <nav className="flex">
                 <MobileNavItem icon={<ListIcon/>} label="Stock" isActive={currentView === View.LIST} onClick={() => navigateTo(View.LIST)} />
                 {isAdminProfile && (
-                  <MobileNavItem icon={<ArchiveIcon/>} label="Assigned" isActive={currentView === View.ASSIGNMENTS} onClick={() => navigateTo(View.ASSIGNMENTS)} />
+                  <MobileNavItem icon={<ArchiveIcon/>} label="Log" isActive={currentView === View.ASSIGNMENTS} onClick={() => navigateTo(View.ASSIGNMENTS)} />
                 )}
                 {Capacitor.isNativePlatform() && (
                   <MobileNavItem icon={<ScanIcon/>} label="Scan / Add" isActive={currentView === View.SCAN || currentView === View.ADD_ITEM} onClick={() => setIsScanModeModalOpen(true)} />
@@ -4477,7 +4703,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
             className="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 transition-colors text-sm font-medium disabled:bg-red-400 flex items-center justify-center min-w-[120px]"
           >
              {isConfirmingAction && <Spinner className="-ml-1 mr-3 h-5 w-5" />}
-             Confirm
+             {confirmationModal.confirmText || 'Confirm'}
           </button>
         </div>
       </Modal>
@@ -4586,7 +4812,132 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                   </div>
                 </div>
             )}
+            
+            
+            {isAdminProfile && (
+               <div>
+                  <h3 className="text-lg font-medium text-zinc-900 dark:text-zinc-100 mb-2">Developer Tools</h3>
+                  <div className="p-4 bg-zinc-50 dark:bg-zinc-700/50 rounded-lg">
+                      {!isDevMode ? (
+                          <button 
+                              onClick={() => {
+                                  setIsSettingsModalOpen(false);
+                                  setIsDevLoginModalOpen(true);
+                              }}
+                              className="w-full text-left font-medium text-zinc-700 dark:text-zinc-300"
+                          >
+                              <div className="flex justify-between items-center">
+                                  <span>Enable Developer Mode</span>
+                                  <span className="text-blue-600 dark:text-blue-400 text-sm font-semibold">Unlock &rarr;</span>
+                              </div>
+                          </button>
+                      ) : (
+                          <div className="space-y-3">
+                              <div className="flex items-center justify-between">
+                                  <span className="text-green-600 dark:text-green-400 font-bold text-sm uppercase tracking-wider">Dev Mode Active</span>
+                                  <button onClick={() => setIsDevMode(false)} className="text-xs text-red-600 hover:underline">Disable</button>
+                              </div>
+                              <button 
+                                  onClick={() => {
+                                      setIsSettingsModalOpen(false);
+                                      setIsDevPurgeModalOpen(true);
+                                  }}
+                                  className="w-full text-left font-medium text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 p-3 rounded-md border border-red-200 dark:border-red-800/30"
+                              >
+                                  <div className="flex justify-between items-center">
+                                      <span>Purge Barcode Items</span>
+                                      <span className="text-sm font-semibold">&rarr;</span>
+                                  </div>
+                              </button>
+                          </div>
+                      )}
+                  </div>
+                </div>
+            )}
+
+                        <div className="pt-6 mt-6 border-t border-zinc-200 dark:border-zinc-700 flex justify-center">
+                <span className="px-3 py-1 bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400 text-xs font-mono rounded-full font-medium tracking-wide">
+                    Version v0.07
+                </span>
+            </div>
         </div>
+      </Modal>
+
+      
+      <Modal isOpen={isDevLoginModalOpen} onClose={() => setIsDevLoginModalOpen(false)} title="Developer Mode">
+          <form onSubmit={handleDevLogin} className="space-y-4">
+              <p className="text-sm text-zinc-600 dark:text-zinc-400">Enter the developer password to access advanced tools.</p>
+              <div>
+                  <label htmlFor="dev-password" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Password</label>
+                  <input
+                      type="password"
+                      id="dev-password"
+                      value={devPasswordInput}
+                      onChange={(e) => setDevPasswordInput(e.target.value)}
+                      className={formInputStyle}
+                      autoFocus
+                  />
+                  {devLoginError && <p className="mt-1 text-sm text-red-600 dark:text-red-400">{devLoginError}</p>}
+              </div>
+              <div className="flex justify-end space-x-3 pt-4 border-t border-zinc-200 dark:border-zinc-700">
+                  <button type="button" onClick={() => setIsDevLoginModalOpen(false)} className="px-4 py-2 bg-zinc-200 dark:bg-zinc-700 text-zinc-800 dark:text-zinc-200 rounded-md hover:bg-zinc-300 dark:hover:bg-zinc-600 font-medium">Cancel</button>
+                  <button type="submit" className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 font-medium">Unlock</button>
+              </div>
+          </form>
+      </Modal>
+
+      <Modal isOpen={isDevPurgeModalOpen} onClose={() => setIsDevPurgeModalOpen(false)} title="Purge Barcode Items">
+          <div className="space-y-4">
+              <p className="text-sm text-zinc-600 dark:text-zinc-400">
+                  Search for a barcode to delete ALL associated stock items and its item type from the database. 
+                  <strong className="text-red-600 block mt-2">WARNING: This is a destructive action and cannot be undone.</strong>
+              </p>
+              
+              <form onSubmit={handleDevPurgeSearch} className="flex gap-2">
+                  <input
+                      type="text"
+                      placeholder="Scan or enter barcode"
+                      value={devPurgeBarcode}
+                      onChange={(e) => setDevPurgeBarcode(e.target.value)}
+                      className={formInputStyle}
+                  />
+                  <button type="submit" disabled={devPurgeLoading} className="px-4 py-2 bg-zinc-800 dark:bg-zinc-200 text-white dark:text-zinc-900 rounded-md whitespace-nowrap font-medium disabled:opacity-50">
+                      {devPurgeLoading ? 'Searching...' : 'Search'}
+                  </button>
+              </form>
+
+              {devPurgeResults && (
+                  <div className="mt-4 p-4 border border-red-200 dark:border-red-900/50 bg-red-50 dark:bg-red-900/10 rounded-lg">
+                      <h4 className="font-bold text-red-800 dark:text-red-300 mb-2">Search Results</h4>
+                      <ul className="list-disc pl-5 text-sm text-red-700 dark:text-red-400 space-y-1 mb-4">
+                          <li>Found <strong>{devPurgeResults.stockItems.length}</strong> physical stock items.</li>
+                          <li>Found <strong>{devPurgeResults.itemType ? '1' : '0'}</strong> registered item type.</li>
+                      </ul>
+                      
+                      {devPurgeResults.stockItems.length > 0 || devPurgeResults.itemType ? (
+                          <div className="flex justify-end gap-3 pt-3 border-t border-red-200 dark:border-red-800/30">
+                              <button onClick={() => setDevPurgeResults(null)} className="px-3 py-1.5 text-sm font-medium text-red-700 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-900/30 rounded-md">
+                                  Cancel
+                              </button>
+                              <button onClick={() => {
+                                  setConfirmationModal({
+                                      isOpen: true,
+                                      title: 'Confirm Total Purge',
+                                      message: `Are you absolutely sure you want to permanently delete ${devPurgeResults.stockItems.length} stock items${devPurgeResults.itemType ? ' and the item type' : ''} for barcode ${devPurgeBarcode}? This action cannot be reversed.`,
+                                      onConfirm: handleDevPurgeConfirm,
+                                      confirmText: 'Yes, Delete Everything',
+                                      isDestructive: true
+                                  });
+                              }} className="px-4 py-2 text-sm font-bold bg-red-600 text-white hover:bg-red-700 rounded-md shadow-sm">
+                                  Delete All
+                              </button>
+                          </div>
+                      ) : (
+                          <p className="text-sm font-medium text-zinc-600">No items or types found for this barcode.</p>
+                      )}
+                  </div>
+              )}
+          </div>
       </Modal>
 
       <Modal isOpen={isChangePinModalOpen} onClose={() => setIsChangePinModalOpen(false)} title="Change PIN">
@@ -4802,6 +5153,39 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
         )}
       </Modal>
 
+      <Modal isOpen={isUnrecognizedModalOpen} onClose={() => setIsUnrecognizedModalOpen(false)} title="Unrecognized Scans Log">
+          <div className="space-y-4">
+              <p className="text-sm text-zinc-600 dark:text-zinc-400">
+                  These barcodes were scanned but could not be found in the system's stock inventory.
+              </p>
+              {unrecognizedScans.length === 0 ? (
+                  <div className="p-8 text-center text-zinc-500 bg-zinc-50 dark:bg-zinc-800/50 rounded-lg border border-zinc-200 dark:border-zinc-700">
+                      No unrecognized scans found.
+                  </div>
+              ) : (
+                  <ul className="divide-y divide-zinc-200 dark:divide-zinc-700 border border-zinc-200 dark:border-zinc-700 rounded-lg overflow-hidden">
+                      {unrecognizedScans.map(scan => (
+                          <li key={scan.id} className="p-4 flex items-center justify-between bg-white dark:bg-zinc-800">
+                              <div>
+                                  <p className="font-mono font-bold text-zinc-900 dark:text-zinc-100">{scan.barcode}</p>
+                                  <p className="text-xs text-zinc-500 mt-1">
+                                      Scanned: {new Date(scan.scanned_at).toLocaleString()}
+                                      {scan.profile_name && ` by ${scan.profile_name}`}
+                                  </p>
+                              </div>
+                              <button 
+                                  onClick={() => deleteUnrecognizedScan(scan.id)}
+                                  className="p-2 text-zinc-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-md transition-colors"
+                                  title="Dismiss notification"
+                              >
+                                  <TrashIcon className="w-5 h-5" />
+                              </button>
+                          </li>
+                      ))}
+                  </ul>
+              )}
+          </div>
+      </Modal>
     </>
   );
 };

@@ -6,6 +6,7 @@ import { supabase } from './lib/supabaseClient';
 import { BrandIcon } from './components/Icons';
 import { App as CapacitorApp } from '@capacitor/app';
 import ProfileSelection from './components/ProfileSelection';
+import Modal from './components/Modal';
 import { useInactivityTimeout } from './hooks/useInactivityTimeout';
 
 const App = () => {
@@ -13,7 +14,23 @@ const App = () => {
     const [userProfile, setUserProfile] = useState(null);
     const [loading, setLoading] = useState(true);
     const [profileError, setProfileError] = useState(null);
-    const [selectedProfile, setSelectedProfile] = useState(null);
+    const [selectedProfile, _setSelectedProfile] = useState(() => {
+        try {
+            const saved = sessionStorage.getItem('selectedProfile');
+            return saved ? JSON.parse(saved) : null;
+        } catch (e) {
+            return null;
+        }
+    });
+
+    const setSelectedProfile = useCallback((profile) => {
+        if (profile) {
+            sessionStorage.setItem('selectedProfile', JSON.stringify(profile));
+        } else {
+            sessionStorage.removeItem('selectedProfile');
+        }
+        _setSelectedProfile(profile);
+    }, []);
     const [recoveryMode, setRecoveryMode] = useState(false);
 
     const fetchUserProfile = useCallback(async (user) => {
@@ -97,7 +114,7 @@ const App = () => {
 
     // Add inactivity timeout hook. If a profile is selected, start the timer.
     // After 10 minutes of inactivity, it will call `handleSwitchProfile`, locking the app.
-    useInactivityTimeout(handleSwitchProfile, 600000);
+    const { showWarning, countdown, resetTimer } = useInactivityTimeout(handleSwitchProfile, 300000, 60000, !!selectedProfile);
 
     useEffect(() => {
         // Also check hash on load just in case the event fired before we started listening
@@ -142,6 +159,24 @@ const App = () => {
 
     return (
         <div className="min-h-screen bg-zinc-100 dark:bg-zinc-900">
+            
+            <Modal isOpen={showWarning} onClose={resetTimer} title="Session Timeout Warning">
+                <div className="space-y-4 py-4 text-center">
+                    <p className="text-zinc-600 dark:text-zinc-300">
+                        You have been inactive for a while. For your security, your session will automatically lock in:
+                    </p>
+                    <div className="text-4xl font-mono font-bold text-red-600 dark:text-red-500 py-4">
+                        {Math.floor(countdown / 60)}:{(countdown % 60).toString().padStart(2, '0')}
+                    </div>
+                    <button 
+                        onClick={resetTimer} 
+                        className="w-full px-4 py-3 bg-blue-600 text-white rounded-md font-medium hover:bg-blue-700 transition-colors"
+                    >
+                        Continue Session
+                    </button>
+                </div>
+            </Modal>
+
             <StockManagerApp
                 key={session.user.id}
                 userProfile={userProfile}
