@@ -10,7 +10,7 @@ const isOfflineError = (err) => {
     return msg === 'failed to fetch' || msg.includes('fetch') || msg.includes('network');
 };
 
-export const useStock = () => {
+export const useStock = (isTrainingMode = false) => {
   const [stock, setStock] = useState([]);
   const [loading, setLoading] = useState(true);
   const [syncQueue, setSyncQueue] = useState([]);
@@ -25,10 +25,16 @@ export const useStock = () => {
   }, []);
 
   useEffect(() => {
-    set('offline_sync_queue', syncQueue);
-  }, [syncQueue]);
+    if (!isTrainingMode) {
+      set('offline_sync_queue', syncQueue);
+    }
+  }, [syncQueue, isTrainingMode]);
   
   const fetchStock = useCallback(async () => {
+    if (isTrainingMode) {
+      setLoading(false);
+      return;
+    }
     try {
         const { data: { session } } = await supabase.auth.getSession();
     const user = session?.user;
@@ -157,7 +163,7 @@ export const useStock = () => {
   }, []);
 
     const processSyncQueue = useCallback(async () => {
-    if (isSyncing || syncQueue.length === 0 || !navigator.onLine) return;
+    if (isTrainingMode || isSyncing || syncQueue.length === 0 || !navigator.onLine) return;
     setIsSyncing(true);
     
     let currentQueue = [...syncQueue];
@@ -196,13 +202,10 @@ export const useStock = () => {
         currentQueue = currentQueue.filter(t => t.id !== task.id);
       } catch (err) {
         console.error("Failed to process queue task:", err);
-        // If it's a conflict or foreign key error (like item not found), we should probably drop it or flag it
-        // but for now, network errors will break the loop, others will drop the task
         if (isOfflineError(err)) {
           hasError = true;
           break;
         } else {
-           // Skip/Drop task if it's a hard error (e.g. invalid UUID) to prevent infinite sync loops
            currentQueue = currentQueue.filter(t => t.id !== task.id);
         }
       }
@@ -213,9 +216,10 @@ export const useStock = () => {
     if (!hasError && currentQueue.length < syncQueue.length) {
       fetchStock(); 
     }
-  }, [syncQueue, isSyncing, fetchStock, performUpdateAssignment]);
+  }, [syncQueue, isSyncing, fetchStock, performUpdateAssignment, isTrainingMode]);
 
   useEffect(() => {
+    if (isTrainingMode) return;
     const handleOnline = () => processSyncQueue();
     window.addEventListener('online', handleOnline);
     const interval = setInterval(() => {
@@ -227,9 +231,23 @@ export const useStock = () => {
         window.removeEventListener('online', handleOnline);
         clearInterval(interval);
     };
-  }, [processSyncQueue, syncQueue.length]);
+  }, [processSyncQueue, syncQueue.length, isTrainingMode]);
 
     const addStockItem = useCallback(async (item, assignerName) => {
+    if (isTrainingMode) {
+        const tempId = 'train-' + Math.random().toString(36).substr(2, 9);
+        const newItem = {
+            ...item,
+            id: tempId,
+            location: item.location || Location.LEADING_STORES,
+            assigned_to: Team.UNASSIGNED,
+            user_id: 'training_user',
+            created_at: new Date().toISOString()
+        };
+        setStock(prev => [newItem, ...prev]);
+        return newItem;
+    }
+
     const handleOffline = () => {
         const tempId = Math.random().toString(36).substr(2, 9);
         const task = {
@@ -285,9 +303,22 @@ export const useStock = () => {
         }
         throw err;
     }
-  }, [fetchStock]);
+  }, [fetchStock, isTrainingMode]);
 
     const bulkAddStockItems = useCallback(async (items, assignerName) => {
+    if (isTrainingMode) {
+        const newItems = items.map(item => ({
+            ...item,
+            id: 'train-' + Math.random().toString(36).substr(2, 9),
+            location: item.location || Location.LEADING_STORES,
+            assigned_to: Team.UNASSIGNED,
+            user_id: 'training_user',
+            created_at: new Date().toISOString()
+        }));
+        setStock(prev => [...newItems, ...prev]);
+        return newItems;
+    }
+
     const handleOffline = () => {
         const offlineItems = [];
         const newTasks = [];
@@ -357,10 +388,21 @@ export const useStock = () => {
         }
         throw err;
     }
-  }, [fetchStock]);
+  }, [fetchStock, isTrainingMode]);
 
   const updateStockItemAssignment = useCallback(async (itemId, location, assigned_to, assignerName) => {
     const isAssigning = assigned_to !== Team.UNASSIGNED;
+    if (isTrainingMode) {
+       setStock(prev => prev.map(item => {
+           if (item.id === itemId) {
+               return { ...item, location, assigned_to, assigned_at: isAssigning ? new Date().toISOString() : null, assigned_by: isAssigning ? assignerName : null };
+           }
+           return item;
+       }));
+       const match = stock.find(i => i.id === itemId);
+       return match ? { ...match, location, assigned_to } : { id: itemId, location, assigned_to };
+    }
+
     if (!navigator.onLine) {
        const task = {
            id: Math.random().toString(36).substr(2, 9),
@@ -401,9 +443,26 @@ export const useStock = () => {
         }
         throw err;
     }
-  }, [performUpdateAssignment]);
+  }, [performUpdateAssignment, isTrainingMode, stock]);
   
   const bulkUpdateAssignments = useCallback(async (itemIds, location, team, assignerName) => {
+    const isAssigning = team !== Team.UNASSIGNED;
+    if (isTrainingMode) {
+      setStock(prev => prev.map(item => {
+        if (itemIds.includes(item.id)) {
+          return {
+            ...item,
+            location,
+            assigned_to: team,
+            assigned_at: isAssigning ? new Date().toISOString() : null,
+            assigned_by: isAssigning ? assignerName : null
+          };
+        }
+        return item;
+      }));
+      return;
+    }
+
     const { data: { session } } = await supabase.auth.getSession();
     const user = session?.user;
     if (!user) throw new Error('User not authenticated');
@@ -415,7 +474,6 @@ export const useStock = () => {
         .in('id', itemIds);
     if (fetchError) throw fetchError;
 
-    const isAssigning = team !== Team.UNASSIGNED;
     const { error } = await supabase
         .from('stock_items')
         .update({
@@ -442,9 +500,14 @@ export const useStock = () => {
     const { error: moveError } = await supabase.from('stock_movements').insert(movements);
     if (moveError) console.error("Bulk assignment movement log failed:", moveError.message);
     
-}, []);
+}, [isTrainingMode]);
 
   const bulkDeleteStockItems = useCallback(async (itemIds, assignerName) => {
+    if (isTrainingMode) {
+      setStock(prev => prev.filter(i => !itemIds.includes(i.id)));
+      return;
+    }
+
     const { data: { session } } = await supabase.auth.getSession();
     const user = session?.user;
     if (!user) throw new Error('User not authenticated');
@@ -480,9 +543,14 @@ export const useStock = () => {
     }
 
     await fetchStock();
-  }, [fetchStock]);
+  }, [fetchStock, isTrainingMode]);
 
   const deleteStockItem = useCallback(async (itemId, assignerName) => {
+    if (isTrainingMode) {
+      setStock(prev => prev.filter(i => i.id !== itemId));
+      return;
+    }
+
     const { data: { session } } = await supabase.auth.getSession();
     const user = session?.user;
     if (!user) throw new Error('User not authenticated');
@@ -518,10 +586,10 @@ export const useStock = () => {
     }
 
     await fetchStock();
-  }, [fetchStock]);
+  }, [fetchStock, isTrainingMode]);
 
   const getStockItemsByBarcode = useCallback(async (barcode, fallbackItemName = null) => {
-    if (!navigator.onLine) {
+    if (isTrainingMode || !navigator.onLine) {
        const direct = stock.filter(item => item.barcode === barcode);
        if (direct.length > 0 || !fallbackItemName) return direct;
        return stock.filter(item => item.name === fallbackItemName);
@@ -553,10 +621,10 @@ export const useStock = () => {
         }
         throw err;
     }
-  }, [stock]);
+  }, [stock, isTrainingMode]);
 
     const getExistingBarcodes = useCallback(async (barcodes) => {
-    if (!navigator.onLine) {
+    if (isTrainingMode || !navigator.onLine) {
        return new Set(stock.filter(item => barcodes.includes(item.barcode)).map(item => item.barcode));
     }
     try {
@@ -577,7 +645,7 @@ export const useStock = () => {
         }
         throw err;
     }
-  }, [stock]);
+  }, [stock, isTrainingMode]);
 
   return { stock, setStock, loading, addStockItem, bulkAddStockItems, updateStockItemAssignment, bulkUpdateAssignments, deleteStockItem, bulkDeleteStockItems, getStockItemsByBarcode, getExistingBarcodes, refetchStock: fetchStock, syncQueue, clearSyncQueue: () => { setSyncQueue([]); set("offline_sync_queue", []); } };
 };

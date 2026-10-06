@@ -146,13 +146,15 @@ const Scanner = ({ onScanSuccess, onScanError, onCancel, persistent = false }) =
           <div className="scanner-line"></div>
         </div>
 
-        <button 
-          onClick={() => onCancelRef.current()}
-          className="mt-8 px-8 py-3 bg-white/20 text-white rounded-lg backdrop-blur-md text-lg font-semibold"
-          aria-label="Cancel scanning"
-        >
-          Cancel
-        </button>
+        {!persistent && (
+          <button 
+            onClick={() => onCancelRef.current()}
+            className="mt-8 px-8 py-3 bg-white/20 text-white rounded-lg backdrop-blur-md text-lg font-semibold hover:bg-white/30 transition-colors"
+            aria-label="Cancel scanning"
+          >
+            Cancel
+          </button>
+        )}
       </div>
     </div>
   );
