@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "651494504369",
+    "project_id": "bregan-mainsflow-stock-control",
+    "storage_bucket": "bregan-mainsflow-stock-control.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:651494504369:android:eafefcc71608a7c23caf90",
+        "android_client_info": {
+          "package_name": "com.breganmf.stockmanager"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB9F8S5WSexbX6k9hbFuGQTUJsu6M9gTj4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

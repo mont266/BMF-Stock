@@ -23,7 +23,7 @@ const ProfileSelection = ({ onProfileSelect, session, onLogout }) => {
             const { data, error } = await supabase
                 .from('profiles')
                 .select('id, name, pin, role')
-                
+                .eq('user_id', session.user.id)
                 .order('name');
             if (error) throw error;
             setProfiles(data);

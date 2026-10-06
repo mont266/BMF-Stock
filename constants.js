@@ -1,6 +1,7 @@
 import { Location, StockCategory } from './types';
 
 export const LOCATIONS = [
+  Location.FLAMSTEAD,
   Location.LEADING_STORES,
   Location.SECONDARY_STORE,
   Location.UNASSIGNED,

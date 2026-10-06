@@ -456,7 +456,9 @@ const PurchaseOrderForm = ({ existingPO, onSave, onCancel, isSubmitting, supplie
     );
 };
 
-const ReceiveStockModal = ({ isOpen, onClose, po, userProfile, selectedProfile, setError, setSuccessMessage, refetchStock, fetchPurchaseOrders }) => {
+const ReceiveStockModal = ({ isOpen, onClose, po, userProfile, selectedProfile, setError, setSuccessMessage, refetchStock, fetchPurchaseOrders, dbLocations = [], activeLocation = 'All' }) => {
+    const locationsList = useMemo(() => dbLocations.length > 0 ? dbLocations.map(l => typeof l === 'string' ? l : l.name) : ['Leading Stores', 'Secondary Store'], [dbLocations]);
+    const [receiveLocation, setReceiveLocation] = useState(() => (activeLocation && activeLocation !== 'All') ? activeLocation : (locationsList[0] || Location.LEADING_STORES));
     const outstandingItems = useMemo(() => 
         po.items.filter(item => item.quantity_ordered > item.quantity_received)
     , [po.items]);
@@ -552,34 +554,40 @@ const ReceiveStockModal = ({ isOpen, onClose, po, userProfile, selectedProfile, 
                         stockToAdd.push({
                             name: item.item_types.name,
                             barcode: serial,
-                            location: Location.LEADING_STORES,
+                            location: receiveLocation,
                             assigned_to: Team.UNASSIGNED,
                             user_id: user.id
                         });
                     });
                 } else {
-                    const { data: existingItem, error: findError } = await supabase
-                        .from('stock_items')
-                        .select('barcode')
-                        .eq('name', item.item_types.name)
-                        .limit(1)
-                        .single();
+                    let barcodeToUse = item.item_types?.barcode;
 
-                    if (findError && findError.code !== 'PGRST116') { // PGRST116 = "exact one row not found"
-                        throw findError;
+                    if (!barcodeToUse) {
+                        const { data: existingItem, error: findError } = await supabase
+                            .from('stock_items')
+                            .select('barcode')
+                            .eq('name', item.item_types.name)
+                            .limit(1)
+                            .single();
+
+                        if (findError && findError.code !== 'PGRST116') { // PGRST116 = "exact one row not found"
+                            throw findError;
+                        }
+
+                        if (existingItem?.barcode) {
+                            barcodeToUse = existingItem.barcode;
+                        }
                     }
 
-                    if (!existingItem) {
-                        throw new Error(`Cannot receive stock for "${item.item_types.name}" because no existing item with a barcode could be found. Please add at least one item of this type manually first to establish its barcode.`);
+                    if (!barcodeToUse) {
+                        throw new Error(`Cannot receive stock for "${item.item_types.name}" because no barcode is defined on this item type or in existing stock. Please assign a barcode to this item type in Manage Item Types or add an item manually.`);
                     }
-
-                    const barcodeToUse = existingItem.barcode;
 
                     for (let i = 0; i < received.quantity; i++) {
                         stockToAdd.push({
                             name: item.item_types.name,
                             barcode: barcodeToUse,
-                            location: Location.LEADING_STORES,
+                            location: receiveLocation,
                             assigned_to: Team.UNASSIGNED,
                             user_id: user.id,
                             purchase_price: parseFloat(item.cost_per_item) || 0
@@ -605,7 +613,7 @@ const ReceiveStockModal = ({ isOpen, onClose, po, userProfile, selectedProfile, 
             // 2. Log stock movements
             const movements = insertedStock.map(d => ({
                 item_id: d.id, item_barcode: d.barcode, item_name: d.name, movement_type: 'IN',
-                location_from: `PO-${po.id}`, location_to: Location.LEADING_STORES,
+                location_from: `PO-${po.id}`, location_to: receiveLocation,
                 user_id: user.id, username: selectedProfile.name,
             }));
             const { error: moveError } = await supabase.from('stock_movements').insert(movements);
@@ -641,6 +649,21 @@ const ReceiveStockModal = ({ isOpen, onClose, po, userProfile, selectedProfile, 
     return (
         <Modal isOpen={isOpen} onClose={onClose} title={`Receive Stock for PO-${po.id}`}>
             <div className="space-y-4">
+                <div className="p-3 bg-zinc-50 dark:bg-zinc-700/40 rounded-lg border border-zinc-200 dark:border-zinc-700">
+                    <label htmlFor="po-receive-location" className="block text-xs font-semibold uppercase tracking-wider text-zinc-600 dark:text-zinc-400 mb-1">
+                        Receive Into Storehouse / Location
+                    </label>
+                    <select
+                        id="po-receive-location"
+                        value={receiveLocation}
+                        onChange={(e) => setReceiveLocation(e.target.value)}
+                        className={formInputStyle + " py-2 text-sm"}
+                    >
+                        {locationsList.map(loc => (
+                            <option key={loc} value={loc}>{loc}</option>
+                        ))}
+                    </select>
+                </div>
                 <p className="text-sm text-zinc-500 dark:text-zinc-400">Enter the quantities you are receiving for each item.</p>
                 {outstandingItems.map(item => {
                     const outstanding = item.quantity_ordered - item.quantity_received;
@@ -733,10 +756,18 @@ const PurchasingPage = ({ userProfile, selectedProfile, setError, setSuccessMess
             }
 
             const poIds = pos.map(p => p.id);
-            const { data: items, error: itemsError } = await supabase
+            let { data: items, error: itemsError } = await supabase
                 .from('purchase_order_items')
-                .select('*, item_types(id, name, is_unique)')
+                .select('*, item_types(id, name, is_unique, barcode)')
                 .in('po_id', poIds);
+            if (itemsError && (itemsError.code === '42703' || itemsError.message?.includes('barcode'))) {
+                const retry = await supabase
+                    .from('purchase_order_items')
+                    .select('*, item_types(id, name, is_unique)')
+                    .in('po_id', poIds);
+                items = retry.data;
+                itemsError = retry.error;
+            }
             if (itemsError) throw itemsError;
 
             const itemsByPoId = items.reduce((acc, item) => {
@@ -968,6 +999,8 @@ const PurchasingPage = ({ userProfile, selectedProfile, setError, setSuccessMess
                         setSuccessMessage={setSuccessMessage}
                         refetchStock={refetchStock}
                         fetchPurchaseOrders={fetchPurchaseOrders}
+                        dbLocations={dbLocations}
+                        activeLocation={activeLocation}
                     />
                 )}
             </>

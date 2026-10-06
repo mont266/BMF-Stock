@@ -6,12 +6,5 @@
   "android": {
     "backgroundColor": "#00000000"
   },
-  "plugins": {
-    "LiveUpdates": {
-      "appId": "28b44127",
-      "channel": "Production",
-      "autoUpdateMethod": "background",
-      "enabled": true
-    }
-  }
+  "plugins": {}
 }

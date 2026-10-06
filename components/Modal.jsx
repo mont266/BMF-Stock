@@ -1,12 +1,12 @@
 import React from 'react';
 import { createPortal } from 'react-dom';
 
-const Modal = ({ isOpen, onClose, title, children }) => {
+const Modal = ({ isOpen, onClose, title, children, maxWidth = 'max-w-md' }) => {
   if (!isOpen) return null;
 
   const modalContent = (
     <div className="fixed inset-0 bg-black/60 z-[10000] flex justify-center items-center p-4">
-      <div className="bg-white dark:bg-zinc-800 rounded-lg shadow-xl w-full max-w-md max-h-[90vh] flex flex-col">
+      <div className={`bg-white dark:bg-zinc-800 rounded-lg shadow-xl w-full ${maxWidth} max-h-[90vh] flex flex-col`}>
         <div className="p-4 border-b border-zinc-200 dark:border-zinc-700 flex justify-between items-center flex-shrink-0 sticky top-0 bg-white dark:bg-zinc-800 rounded-t-lg">
           <h2 className="text-xl font-semibold text-zinc-800 dark:text-zinc-100">{title}</h2>
           <button

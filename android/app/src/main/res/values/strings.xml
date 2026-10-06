@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Bregan MainsFlow Stock Manager</string>
+    <string name="title_activity_main">Bregan MainsFlow Stock Manager</string>
+    <string name="package_name">com.breganmf.stockmanager</string>
+    <string name="custom_url_scheme">com.breganmf.stockmanager</string>
+</resources>

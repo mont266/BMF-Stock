@@ -1,4 +1,5 @@
 export const Location = {
+  FLAMSTEAD: 'Flamstead',
   LEADING_STORES: 'Leading Stores',
   SECONDARY_STORE: 'Secondary Store',
   UNASSIGNED: 'Unassigned',

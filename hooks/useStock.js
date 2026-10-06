@@ -240,7 +240,7 @@ export const useStock = () => {
         };
         setSyncQueue(prev => [...prev, task]);
 
-        const newItem = { ...item, location: 'Leading Stores', assigned_to: 'Unassigned', user_id: 'offline_user' };
+        const newItem = { ...item, location: item.location || Location.LEADING_STORES, assigned_to: Team.UNASSIGNED, user_id: 'offline_user' };
         setStock(prev => [{ ...newItem, id: tempId }, ...prev]);
     };
 
@@ -256,8 +256,8 @@ export const useStock = () => {
         
         const newItem = {
           ...item,
-          location: 'Leading Stores',
-          assigned_to: 'Unassigned',
+          location: item.location || Location.LEADING_STORES,
+          assigned_to: Team.UNASSIGNED,
           user_id: user.id,
         };
 
@@ -304,7 +304,7 @@ export const useStock = () => {
             offlineItems.push({
                 ...item,
                 id: tempId,
-                location: Location.LEADING_STORES,
+                location: item.location || Location.LEADING_STORES,
                 assigned_to: Team.UNASSIGNED,
                 user_id: 'offline_user'
             });
@@ -325,7 +325,7 @@ export const useStock = () => {
 
         const newItems = items.map(item => ({
           ...item,
-          location: Location.LEADING_STORES,
+          location: item.location || Location.LEADING_STORES,
           assigned_to: Team.UNASSIGNED,
           user_id: user.id
         }));
@@ -520,24 +520,36 @@ export const useStock = () => {
     await fetchStock();
   }, [fetchStock]);
 
-  const getStockItemsByBarcode = useCallback(async (barcode) => {
+  const getStockItemsByBarcode = useCallback(async (barcode, fallbackItemName = null) => {
     if (!navigator.onLine) {
-       return stock.filter(item => item.barcode === barcode);
+       const direct = stock.filter(item => item.barcode === barcode);
+       if (direct.length > 0 || !fallbackItemName) return direct;
+       return stock.filter(item => item.name === fallbackItemName);
     }
     try {
         const { data: { session } } = await supabase.auth.getSession();
-    const user = session?.user;
+        const user = session?.user;
         if (!user) throw new Error('User not authenticated');
         const { data, error } = await supabase
           .from('stock_items')
           .select('*')
-          .eq('barcode', barcode)
-          ;
+          .eq('barcode', barcode);
         if (error) throw error;
-        return data || [];
+        if (data && data.length > 0) return data;
+        
+        if (fallbackItemName) {
+            const { data: nameData, error: nameError } = await supabase
+                .from('stock_items')
+                .select('*')
+                .eq('name', fallbackItemName);
+            if (!nameError && nameData) return nameData;
+        }
+        return [];
     } catch (err) {
         if (isOfflineError(err)) {
-            return stock.filter(item => item.barcode === barcode);
+            const direct = stock.filter(item => item.barcode === barcode);
+            if (direct.length > 0 || !fallbackItemName) return direct;
+            return stock.filter(item => item.name === fallbackItemName);
         }
         throw err;
     }
