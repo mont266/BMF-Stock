@@ -2,9 +2,79 @@ import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { supabase } from '../lib/supabaseClient';
 import { Page, Spinner, EmptyState, formInputStyle } from './StockManagerApp';
 import Modal from './Modal';
-import { PlusCircleIcon, ClipboardCheckIcon, ArchiveIcon, ChartBarIcon, TrashIcon, BuildingStoreIcon, ChevronDownIcon, TagIcon } from './Icons';
+import { PlusCircleIcon, ClipboardCheckIcon, ArchiveIcon, ChartBarIcon, TrashIcon, BuildingStoreIcon, ChevronDownIcon, TagIcon, BarcodeIcon } from './Icons';
+import { trainingManager } from '../lib/trainingEnvironment';
 
-const StockTakePage = ({ stock = [], setStock, setError, logUnrecognizedBarcode, dbLocations = [], activeLocation = 'All', itemTypes = [], supplierPartNumbers = [], refetchStock }) => {
+// --- Helper functions for serial number range expansion in Stock Take ---
+const parseSerial = (serial) => {
+    let lastDigitIndex = -1;
+    for (let i = serial.length - 1; i >= 0; i--) {
+        if (!isNaN(parseInt(serial[i], 10))) {
+            lastDigitIndex = i;
+            break;
+        }
+    }
+    if (lastDigitIndex === -1) return null;
+
+    let firstDigitIndex = lastDigitIndex;
+    while (firstDigitIndex > 0 && !isNaN(parseInt(serial[firstDigitIndex - 1], 10))) {
+        firstDigitIndex--;
+    }
+
+    const prefix = serial.substring(0, firstDigitIndex);
+    const numStr = serial.substring(firstDigitIndex, lastDigitIndex + 1);
+    const suffix = serial.substring(lastDigitIndex + 1);
+    return { prefix, numStr, suffix };
+};
+
+const expandRange = (start, end) => {
+    const startParts = parseSerial(start);
+    const endParts = parseSerial(end);
+
+    if (!startParts || !endParts) {
+        return { error: "Invalid format. Serials must contain a number part for range expansion." };
+    }
+    
+    const { prefix: startPrefix, numStr: startNumStr, suffix: startSuffix } = startParts;
+    const { prefix: endPrefix, numStr: endNumStr, suffix: endSuffix } = endParts;
+
+    if (startPrefix !== endPrefix || startSuffix !== endSuffix) {
+        return { error: "The text parts (prefix/suffix) of the serial numbers do not match." };
+    }
+    
+    const startNum = parseInt(startNumStr, 10);
+    const endNum = parseInt(endNumStr, 10);
+
+    if (startNum > endNum) {
+        return { error: "The start number cannot be greater than the end number." };
+    }
+
+    const results = [];
+    const padLength = Math.max(startNumStr.length, endNumStr.length);
+
+    for (let i = startNum; i <= endNum; i++) {
+        const paddedNum = String(i).padStart(padLength, '0');
+        results.push(`${startPrefix}${paddedNum}${startSuffix}`);
+    }
+
+    return { result: results };
+};
+
+const StockTakePage = ({ 
+    stock = [], 
+    setStock, 
+    setError, 
+    logUnrecognizedBarcode, 
+    dbLocations = [], 
+    activeLocation = 'All', 
+    itemTypes = [], 
+    supplierPartNumbers = [], 
+    refetchStock,
+    userProfile,
+    selectedProfile,
+    profiles = [],
+    isTrainingMode = false
+}) => {
     const locationsList = useMemo(() => {
         const list = dbLocations.length > 0 
             ? dbLocations.map(l => typeof l === 'string' ? l : l.name) 
@@ -40,6 +110,12 @@ const StockTakePage = ({ stock = [], setStock, setError, logUnrecognizedBarcode,
     const [isQuantityModalOpen, setIsQuantityModalOpen] = useState(false);
     const [quantityItem, setQuantityItem] = useState(null);
     const [quantityInput, setQuantityInput] = useState('1');
+
+    // --- Range Count State ---
+    const [isRangeCountModalOpen, setIsRangeCountModalOpen] = useState(false);
+    const [rangeCountDetails, setRangeCountDetails] = useState({ firstSerial: '', lastSerial: '', selectedItemType: '' });
+    const [rangeCountSubmitting, setRangeCountSubmitting] = useState(false);
+    const [rangeCountError, setRangeCountError] = useState('');
     
     const [historicalTakes, setHistoricalTakes] = useState([]);
     const [historyLoading, setHistoryLoading] = useState(false);
@@ -118,6 +194,17 @@ const StockTakePage = ({ stock = [], setStock, setError, logUnrecognizedBarcode,
     }, [supplierPartNumbers, itemTypes]);
     
     const fetchActiveStockTake = useCallback(async () => {
+        if (isTrainingMode) {
+            const active = trainingManager.getActiveStockTake();
+            if (active) {
+                setActiveStockTake(active);
+                setStockTakeItems(trainingManager.getStockTakeItems(active.id));
+            } else {
+                setActiveStockTake(null);
+                setStockTakeItems([]);
+            }
+            return;
+        }
         try {
             const { data, error } = await supabase
                 .from('stock_takes')
@@ -144,7 +231,7 @@ const StockTakePage = ({ stock = [], setStock, setError, logUnrecognizedBarcode,
         } catch (err) {
             console.error("Error fetching active stock take", err);
         }
-    }, []);
+    }, [isTrainingMode]);
 
     // Robust grouping by Item Type with full fallbacks
     const groupStockTakeByItemType = useCallback((items) => {
@@ -249,6 +336,11 @@ const StockTakePage = ({ stock = [], setStock, setError, logUnrecognizedBarcode,
     };
 
     const fetchHistory = useCallback(async () => {
+        if (isTrainingMode) {
+            setHistoryLoading(false);
+            setHistoricalTakes(trainingManager.getCompletedStockTakes());
+            return;
+        }
         setHistoryLoading(true);
         try {
             const { data, error } = await supabase
@@ -263,9 +355,15 @@ const StockTakePage = ({ stock = [], setStock, setError, logUnrecognizedBarcode,
         } finally {
             setHistoryLoading(false);
         }
-    }, []);
+    }, [isTrainingMode]);
 
     const fetchHistoryReport = async (st) => {
+        if (isTrainingMode) {
+            setSelectedHistoryReport(st);
+            setSelectedHistoryItems(st.items || []);
+            setHistoryLoading(false);
+            return;
+        }
         setHistoryLoading(true);
         try {
             setSelectedHistoryReport(st);
@@ -354,6 +452,32 @@ const StockTakePage = ({ stock = [], setStock, setError, logUnrecognizedBarcode,
     const handleInitiateStockTake = async () => {
         setIsInitiateModalOpen(false);
         setLoading(true);
+        if (isTrainingMode) {
+            try {
+                const targetLocation = (stockTakeLocation && stockTakeLocation !== 'All') 
+                    ? stockTakeLocation 
+                    : ((activeLocation && activeLocation !== 'All' && locationsList.includes(activeLocation)) ? activeLocation : (locationsList[0] || 'Flamstead'));
+
+                if (!targetLocation || targetLocation === 'All') {
+                    throw new Error("Please select a specific storehouse location. Company-wide stock take is not permitted.");
+                }
+
+                const { stockTake, items } = trainingManager.startStockTake({
+                    type: stockTakeType,
+                    location: targetLocation,
+                    userId: selectedProfile?.id || 'training_user'
+                });
+                setActiveStockTake(stockTake);
+                setStockTakeItems(items);
+                if (typeof refetchStock === 'function') refetchStock();
+            } catch (err) {
+                console.error(err);
+                setError(err.message);
+            } finally {
+                setLoading(false);
+            }
+            return;
+        }
         try {
             const { data: { session } } = await supabase.auth.getSession();
             const user = session?.user;
@@ -428,11 +552,32 @@ const StockTakePage = ({ stock = [], setStock, setError, logUnrecognizedBarcode,
         if (!activeStockTake) return;
         setIsFinaliseModalOpen(false);
         setLoading(true);
+        if (isTrainingMode) {
+            try {
+                const auditorName = selectedProfile?.name || userProfile?.full_name || 'Trainee Auditor';
+                trainingManager.finaliseStockTake(auditorName);
+                setActiveStockTake(null);
+                setStockTakeItems([]);
+                if (typeof refetchStock === 'function') refetchStock();
+                setLastScanned({
+                    success: true,
+                    message: "Training Stock Take completed successfully! Inventory & audit movements updated in sandbox."
+                });
+                setTimeout(() => setLastScanned(null), 5000);
+            } catch (err) {
+                console.error("Error finalising training stock take:", err);
+                setError(`Error finalising training stock take: ${err.message}`);
+            } finally {
+                setLoading(false);
+            }
+            return;
+        }
         try {
             const { data: { session } } = await supabase.auth.getSession();
             const user = session?.user;
             const targetLocation = activeStockTake.location || 'Flamstead';
             const completedAt = new Date().toISOString();
+            const auditorName = selectedProfile?.name || userProfile?.full_name || 'Stock Auditor';
 
             // 1. Mark stock take as COMPLETED (permanently saving audit history)
             const { error: completeError } = await supabase
@@ -550,7 +695,7 @@ const StockTakePage = ({ stock = [], setStock, setError, logUnrecognizedBarcode,
                             location_from: 'Stock Take Reconciliation',
                             location_to: groupLoc,
                             user_id: user?.id || null,
-                            username: user?.email || 'Stock Auditor'
+                            username: auditorName
                         }));
                         await supabase.from('stock_movements').insert(movements);
                     }
@@ -582,7 +727,7 @@ const StockTakePage = ({ stock = [], setStock, setError, logUnrecognizedBarcode,
                             assigned_to: 'Stock Take Discrepancy (Missing)',
                             location: 'Discrepancy',
                             assigned_at: completedAt,
-                            assigned_by: user?.email || 'Stock Auditor'
+                            assigned_by: auditorName
                         })
                         .in('id', idsToRemove);
 
@@ -599,7 +744,7 @@ const StockTakePage = ({ stock = [], setStock, setError, logUnrecognizedBarcode,
                                     assigned_to: 'Stock Take Discrepancy (Missing)',
                                     location: 'Discrepancy',
                                     assigned_at: completedAt,
-                                    assigned_by: user?.email || 'Stock Auditor'
+                                    assigned_by: auditorName
                                 };
                             }
                             return item;
@@ -615,7 +760,7 @@ const StockTakePage = ({ stock = [], setStock, setError, logUnrecognizedBarcode,
                         location_from: item.location || groupLoc,
                         location_to: 'Stock Take Discrepancy (Missing)',
                         user_id: user?.id || null,
-                        username: user?.email || 'Stock Auditor'
+                        username: auditorName
                     }));
                     await supabase.from('stock_movements').insert(movements);
                     reconciledCount++;
@@ -657,6 +802,13 @@ const StockTakePage = ({ stock = [], setStock, setError, logUnrecognizedBarcode,
         if (!activeStockTake) return;
         setIsCancelModalOpen(false);
         setLoading(true);
+        if (isTrainingMode) {
+            trainingManager.cancelStockTake();
+            setActiveStockTake(null);
+            setStockTakeItems([]);
+            setLoading(false);
+            return;
+        }
         try {
             const { error } = await supabase
                 .from('stock_takes')
@@ -682,6 +834,16 @@ const StockTakePage = ({ stock = [], setStock, setError, logUnrecognizedBarcode,
         if (!historyToDelete) return;
         setIsDeleteHistoryModalOpen(false);
         setHistoryLoading(true);
+        if (isTrainingMode) {
+            trainingManager.completedStockTakes = trainingManager.completedStockTakes.filter(t => t.id !== historyToDelete.id);
+            trainingManager.notify();
+            setHistoricalTakes(trainingManager.getCompletedStockTakes());
+            if (selectedHistoryReport && selectedHistoryReport.id === historyToDelete.id) {
+                setSelectedHistoryReport(null);
+            }
+            setHistoryLoading(false);
+            return;
+        }
         try {
             // Because of foreign keys, we might need to delete items first, or ON DELETE CASCADE handles it. 
             // Assuming Supabase takes care of it or we do it explicitly:
@@ -719,6 +881,50 @@ const StockTakePage = ({ stock = [], setStock, setError, logUnrecognizedBarcode,
         const rawBarcode = String(barcode).trim();
         const lowerScan = rawBarcode.toLowerCase();
         
+        if (isTrainingMode) {
+            try {
+                const currentTargetLocation = activeStockTakeRef.current?.location || 'Flamstead';
+                const partLookup = partNumberLookupMap[lowerScan];
+                let matchedItemType = partLookup
+                    ? (itemTypes.find(it => it.id === partLookup.itemTypeId || it.name === partLookup.itemTypeName) || { name: partLookup.itemTypeName, barcode: partLookup.barcode || rawBarcode })
+                    : itemTypes.find(it => it.barcode && String(it.barcode).trim().toLowerCase() === lowerScan);
+
+                if (!matchedItemType) {
+                    const stockMatch = stock.find(s => String(s.barcode).trim().toLowerCase() === lowerScan);
+                    if (stockMatch) {
+                        matchedItemType = { name: stockMatch.name, barcode: stockMatch.barcode, price: stockMatch.purchase_price };
+                    }
+                }
+
+                if (!matchedItemType) {
+                    if (logUnrecognizedBarcode) logUnrecognizedBarcode(rawBarcode);
+                    setLastScanned({ success: false, message: `Barcode/Part # ${rawBarcode} not found in system.` });
+                    return;
+                }
+
+                const res = trainingManager.scanStockTakeItem({
+                    barcode: rawBarcode,
+                    location: currentTargetLocation,
+                    matchedItemType
+                });
+
+                setStockTakeItems([...trainingManager.getStockTakeItems(activeStockTakeRef.current.id)]);
+                if (typeof refetchStock === 'function') refetchStock();
+
+                setLastScanned({
+                    success: true,
+                    message: `Counted 1x ${res.item.stock_items?.name || matchedItemType.name} (Count: ${res.item.counted_quantity})`
+                });
+                setTimeout(() => setLastScanned(null), 3000);
+            } catch (err) {
+                console.error(err);
+                setLastScanned({ success: false, message: "Scan error: " + err.message });
+            } finally {
+                setLoading(false);
+            }
+            return;
+        }
+
         try {
             const currentTargetLocation = activeStockTakeRef.current?.location || 'Flamstead';
             const { data: { session } } = await supabase.auth.getSession();
@@ -917,6 +1123,27 @@ const StockTakePage = ({ stock = [], setStock, setError, logUnrecognizedBarcode,
         if (isNaN(addedQty) || addedQty < 1 || !quantityItem) return;
 
         setLoading(true);
+        if (isTrainingMode) {
+            const newQuantity = (quantityItem.counted_quantity || 0) + addedQty;
+            setStockTakeItems(prev => prev.map(i => 
+                i.id === quantityItem.id
+                    ? { ...i, counted_quantity: newQuantity, status: 'COUNTED' }
+                    : i
+            ));
+            const stockFallback = stockMap.get(quantityItem.item_id);
+            const itemName = quantityItem.stock_items?.name || stockFallback?.name || 'item';
+            setLastScanned({ 
+                success: true, 
+                message: `Added +${addedQty} to ${itemName}` 
+            });
+            setTimeout(() => {
+                setLastScanned(null);
+            }, 3000);
+            setIsQuantityModalOpen(false);
+            setQuantityItem(null);
+            setLoading(false);
+            return;
+        }
         try {
             const newQuantity = (quantityItem.counted_quantity || 0) + addedQty;
             
@@ -953,6 +1180,280 @@ const StockTakePage = ({ stock = [], setStock, setError, logUnrecognizedBarcode,
             setLastScanned({ success: false, message: "Error updating quantity: " + err.message });
         } finally {
             setLoading(false);
+        }
+    };
+
+    // Range Count Calculation Memo
+    const rangeCountProcessingResult = useMemo(() => {
+        const { firstSerial, lastSerial } = rangeCountDetails;
+        const start = firstSerial?.trim();
+        const end = lastSerial?.trim();
+
+        if (!start || !end) return { serials: [], error: null };
+
+        const expansion = expandRange(start, end);
+        if (expansion.error) {
+            return { serials: [], error: expansion.error };
+        }
+
+        const expanded = expansion.result;
+        if (expanded.length > 1000) {
+            return { serials: [], error: `Range is too large. A maximum of 1000 items can be counted at once, but this range contains ${expanded.length}.` };
+        }
+
+        return { serials: expanded, error: null };
+    }, [rangeCountDetails.firstSerial, rangeCountDetails.lastSerial]);
+
+    // Handle Range Count Submission
+    const handleRangeCountSubmit = async (e) => {
+        if (e && e.preventDefault) e.preventDefault();
+        setRangeCountError('');
+
+        const { serials, error: expError } = rangeCountProcessingResult;
+        if (expError) {
+            setRangeCountError(expError);
+            return;
+        }
+        if (!serials || serials.length === 0) {
+            setRangeCountError("Please provide a valid first and last serial number.");
+            return;
+        }
+
+        if (!activeStockTakeRef.current) {
+            setRangeCountError("No active stock take in progress.");
+            return;
+        }
+
+        setRangeCountSubmitting(true);
+        if (isTrainingMode) {
+            try {
+                const currentTargetLocation = activeStockTakeRef.current?.location || 'Flamstead';
+                let targetTypeName = rangeCountDetails.selectedItemType;
+                if (!targetTypeName) {
+                    const firstLower = serials[0].toLowerCase();
+                    const partLookup = partNumberLookupMap[firstLower];
+                    if (partLookup) {
+                        targetTypeName = partLookup.itemTypeName;
+                    } else {
+                        const matchedType = itemTypes.find(it => it.barcode && String(it.barcode).trim().toLowerCase() === firstLower);
+                        if (matchedType) targetTypeName = matchedType.name;
+                        else {
+                            const stockMatch = stock.find(s => String(s.barcode).trim().toLowerCase() === firstLower);
+                            if (stockMatch) targetTypeName = stockMatch.name;
+                        }
+                    }
+                }
+                if (!targetTypeName) {
+                    const meterType = itemTypes.find(it => (it.category && it.category.toLowerCase().includes('meter')) || it.is_unique || (it.name && it.name.toLowerCase().includes('meter')));
+                    if (meterType) targetTypeName = meterType.name;
+                }
+                if (!targetTypeName) {
+                    setRangeCountError("Please select the product type for this serial number range.");
+                    setRangeCountSubmitting(false);
+                    return;
+                }
+
+                const meta = itemTypesMap[targetTypeName] || (Array.isArray(itemTypes) ? itemTypes.find(it => it.name === targetTypeName) : null) || { name: targetTypeName };
+
+                const res = trainingManager.rangeCountStockTake({
+                    itemType: meta,
+                    firstSerial: rangeCountDetails.firstSerial.trim(),
+                    lastSerial: rangeCountDetails.lastSerial.trim(),
+                    location: currentTargetLocation
+                });
+
+                setStockTakeItems([...trainingManager.getStockTakeItems(activeStockTakeRef.current.id)]);
+                if (typeof refetchStock === 'function') refetchStock();
+
+                setLastScanned({
+                    success: true,
+                    message: `Counted range of ${res.count} items (${serials[0]} - ${serials[serials.length - 1]}) for ${targetTypeName}`
+                });
+                setTimeout(() => setLastScanned(null), 4000);
+
+                setIsRangeCountModalOpen(false);
+                setRangeCountDetails({ firstSerial: '', lastSerial: '', selectedItemType: '' });
+            } catch (rangeErr) {
+                console.error(rangeErr);
+                setRangeCountError(rangeErr.message);
+            } finally {
+                setRangeCountSubmitting(false);
+            }
+            return;
+        }
+
+        try {
+            const currentTargetLocation = activeStockTakeRef.current?.location || 'Flamstead';
+            const { data: { session } } = await supabase.auth.getSession();
+            const user = session?.user;
+
+            // Determine item type for this range
+            let targetTypeName = rangeCountDetails.selectedItemType;
+            
+            // If not selected, try to infer from first serial
+            if (!targetTypeName) {
+                const firstLower = serials[0].toLowerCase();
+                const partLookup = partNumberLookupMap[firstLower];
+                if (partLookup) {
+                    targetTypeName = partLookup.itemTypeName;
+                } else {
+                    const matchedType = itemTypes.find(it => it.barcode && String(it.barcode).trim().toLowerCase() === firstLower);
+                    if (matchedType) {
+                        targetTypeName = matchedType.name;
+                    } else {
+                        const stockMatch = stock.find(s => String(s.barcode).trim().toLowerCase() === firstLower);
+                        if (stockMatch) {
+                            targetTypeName = stockMatch.name;
+                        }
+                    }
+                }
+            }
+
+            // Fallback: check if any serialized meter item type exists
+            if (!targetTypeName) {
+                const meterType = itemTypes.find(it => 
+                    (it.category && it.category.toLowerCase().includes('meter')) || 
+                    it.is_unique || 
+                    (it.name && it.name.toLowerCase().includes('meter'))
+                );
+                if (meterType) {
+                    targetTypeName = meterType.name;
+                }
+            }
+
+            if (!targetTypeName) {
+                setRangeCountError("Please select the product type for this serial number range.");
+                setRangeCountSubmitting(false);
+                return;
+            }
+
+            const meta = itemTypesMap[targetTypeName] || (Array.isArray(itemTypes) ? itemTypes.find(it => it.name === targetTypeName) : null) || {};
+            const itemPrice = parseFloat(meta.price ?? 0) || 0;
+
+            // Look up existing stock items in database matching these serials
+            const { data: dbMatchedStock, error: dbStockError } = await supabase
+                .from('stock_items')
+                .select('*')
+                .in('barcode', serials);
+
+            if (dbStockError) throw dbStockError;
+
+            const existingByBarcode = new Map();
+            (dbMatchedStock || []).forEach(item => {
+                if (item.barcode) existingByBarcode.set(item.barcode, item);
+            });
+
+            // For each serial in the range, find or create the physical stock_item
+            const resolvedStockItems = [];
+            const newStockItemsToCreate = [];
+
+            for (const serial of serials) {
+                const existing = existingByBarcode.get(serial);
+                if (existing) {
+                    resolvedStockItems.push(existing);
+                } else {
+                    newStockItemsToCreate.push({
+                        name: targetTypeName,
+                        barcode: serial,
+                        purchase_price: itemPrice,
+                        description: meta.description || null,
+                        location: currentTargetLocation,
+                        assigned_to: 'Unassigned',
+                        user_id: user?.id || null
+                    });
+                }
+            }
+
+            // Insert new stock items in batch if any were missing from stock_items
+            if (newStockItemsToCreate.length > 0) {
+                const { data: createdItems, error: createError } = await supabase
+                    .from('stock_items')
+                    .insert(newStockItemsToCreate)
+                    .select();
+
+                if (createError) throw createError;
+                if (createdItems) {
+                    resolvedStockItems.push(...createdItems);
+                    if (typeof setStock === 'function') {
+                        setStock(prev => [...prev, ...createdItems]);
+                    }
+                }
+            }
+
+            // Fetch or match stock_take_items for these stock item IDs
+            const stockItemIds = resolvedStockItems.map(i => i.id);
+            const currentStockTakeItems = stockTakeItemsRef.current;
+            const existingTakeItemsMap = new Map();
+            currentStockTakeItems.forEach(sti => {
+                if (sti.item_id) existingTakeItemsMap.set(sti.item_id, sti);
+            });
+
+            const takeItemsToInsert = [];
+            const takeItemIdsToUpdate = [];
+
+            for (const sItem of resolvedStockItems) {
+                const existingTakeItem = existingTakeItemsMap.get(sItem.id);
+                if (existingTakeItem) {
+                    takeItemIdsToUpdate.push(existingTakeItem.id);
+                } else {
+                    takeItemsToInsert.push({
+                        stock_take_id: activeStockTakeRef.current.id,
+                        item_id: sItem.id,
+                        expected_quantity: 1,
+                        counted_quantity: 1,
+                        status: 'COUNTED'
+                    });
+                }
+            }
+
+            // Insert new stock_take_items
+            let insertedTakeItems = [];
+            if (takeItemsToInsert.length > 0) {
+                const { data: inserted, error: takeInsertError } = await supabase
+                    .from('stock_take_items')
+                    .insert(takeItemsToInsert)
+                    .select('*, stock_items(id, name, barcode, purchase_price, description, location, assigned_to)');
+
+                if (takeInsertError) throw takeInsertError;
+                insertedTakeItems = inserted || [];
+            }
+
+            // Update existing stock_take_items to counted_quantity = 1, status = 'COUNTED'
+            if (takeItemIdsToUpdate.length > 0) {
+                const { error: takeUpdateError } = await supabase
+                    .from('stock_take_items')
+                    .update({ counted_quantity: 1, status: 'COUNTED' })
+                    .in('id', takeItemIdsToUpdate);
+
+                if (takeUpdateError) throw takeUpdateError;
+            }
+
+            // Update local stockTakeItems state
+            const updatedIdsSet = new Set(takeItemIdsToUpdate);
+            setStockTakeItems(prev => {
+                const updatedList = prev.map(item => {
+                    if (updatedIdsSet.has(item.id)) {
+                        return { ...item, counted_quantity: 1, status: 'COUNTED' };
+                    }
+                    return item;
+                });
+                return [...updatedList, ...insertedTakeItems];
+            });
+
+            setLastScanned({
+                success: true,
+                message: `Successfully counted serial range (${serials.length} units of ${targetTypeName})`
+            });
+            setTimeout(() => setLastScanned(null), 5000);
+
+            setIsRangeCountModalOpen(false);
+            setRangeCountDetails({ firstSerial: '', lastSerial: '', selectedItemType: '' });
+
+        } catch (err) {
+            console.error("Error in handleRangeCountSubmit:", err);
+            setRangeCountError(`Failed to process range count: ${err.message}`);
+        } finally {
+            setRangeCountSubmitting(false);
         }
     };
 
@@ -1076,6 +1577,18 @@ const StockTakePage = ({ stock = [], setStock, setError, logUnrecognizedBarcode,
                                         className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${scanMode === 'QUANTITY' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/50 dark:text-blue-300' : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100'}`}
                                     >
                                         Quantity Mode
+                                    </button>
+                                    <button
+                                        onClick={() => {
+                                            setRangeCountError('');
+                                            setRangeCountDetails({ firstSerial: '', lastSerial: '', selectedItemType: '' });
+                                            setIsRangeCountModalOpen(true);
+                                        }}
+                                        className="px-3 py-1.5 text-xs font-medium rounded-md transition-colors text-blue-700 dark:text-blue-300 hover:bg-blue-50 dark:hover:bg-blue-900/40 flex items-center gap-1 border-l border-zinc-200 dark:border-zinc-700 ml-1 pl-2"
+                                        title="Count a continuous serial number range (e.g. boxed meters)"
+                                    >
+                                        <BarcodeIcon className="w-3.5 h-3.5" />
+                                        <span>Range Count</span>
                                     </button>
                                 </div>
 
@@ -1251,17 +1764,39 @@ const StockTakePage = ({ stock = [], setStock, setError, logUnrecognizedBarcode,
                                                                         {group.value_variance > 0 ? '+' : ''}{group.value_variance < 0 ? '-' : ''}£{Math.abs(group.value_variance).toFixed(2)}
                                                                     </td>
                                                                     <td className="px-4 py-3 whitespace-nowrap text-sm text-right" onClick={(e) => e.stopPropagation()}>
-                                                                        <button
-                                                                            type="button"
-                                                                            onClick={() => {
-                                                                                setQuantityItem(group.rawItems[0]);
-                                                                                setQuantityInput('1');
-                                                                                setIsQuantityModalOpen(true);
-                                                                            }}
-                                                                            className="text-xs font-semibold px-2.5 py-1 bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 rounded hover:bg-blue-100 dark:hover:bg-blue-800 transition-colors"
-                                                                        >
-                                                                            + Add Quantity
-                                                                        </button>
+                                                                        <div className="flex items-center justify-end gap-1.5">
+                                                                            {(group.is_unique || (group.category && group.category.toLowerCase().includes('meter')) || group.name.toLowerCase().includes('meter')) && (
+                                                                                <button
+                                                                                    type="button"
+                                                                                    onClick={() => {
+                                                                                        setRangeCountError('');
+                                                                                        const firstSerial = group.rawItems?.find(r => r.stock_items?.barcode)?.stock_items?.barcode || '';
+                                                                                        setRangeCountDetails({
+                                                                                            firstSerial: firstSerial,
+                                                                                            lastSerial: firstSerial,
+                                                                                            selectedItemType: group.name
+                                                                                        });
+                                                                                        setIsRangeCountModalOpen(true);
+                                                                                    }}
+                                                                                    className="text-xs font-semibold px-2.5 py-1 bg-purple-50 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 rounded hover:bg-purple-100 dark:hover:bg-purple-800 transition-colors flex items-center gap-1"
+                                                                                    title="Count a range of serial numbers for this product"
+                                                                                >
+                                                                                    <BarcodeIcon className="w-3 h-3" />
+                                                                                    <span>Range</span>
+                                                                                </button>
+                                                                            )}
+                                                                            <button
+                                                                                type="button"
+                                                                                onClick={() => {
+                                                                                    setQuantityItem(group.rawItems[0]);
+                                                                                    setQuantityInput('1');
+                                                                                    setIsQuantityModalOpen(true);
+                                                                                }}
+                                                                                className="text-xs font-semibold px-2.5 py-1 bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 rounded hover:bg-blue-100 dark:hover:bg-blue-800 transition-colors"
+                                                                            >
+                                                                                + Add Qty
+                                                                            </button>
+                                                                        </div>
                                                                     </td>
                                                                 </tr>
                                                                 {isExpanded && (
@@ -1334,7 +1869,14 @@ const StockTakePage = ({ stock = [], setStock, setError, logUnrecognizedBarcode,
                                             📍 Scope: {selectedHistoryReport.location || 'All Locations (Company-Wide)'}
                                         </span>
                                     </div>
-                                    <p className="text-zinc-500 dark:text-zinc-400 text-sm mt-1">Completed on {new Date(selectedHistoryReport.completed_at).toLocaleString()}</p>
+                                    <p className="text-zinc-500 dark:text-zinc-400 text-sm mt-1">
+                                        Completed on {new Date(selectedHistoryReport.completed_at).toLocaleString()}
+                                        {selectedProfile?.name && (
+                                            <span className="ml-2 font-medium text-zinc-700 dark:text-zinc-300">
+                                                &bull; Auditor: {selectedProfile.name}
+                                            </span>
+                                        )}
+                                    </p>
                                 </div>
                                 <button onClick={() => setSelectedHistoryReport(null)} className="px-4 py-2 bg-zinc-100 dark:bg-zinc-700 text-zinc-700 dark:text-zinc-300 rounded-md hover:bg-zinc-200 dark:hover:bg-zinc-600 text-sm font-medium transition-colors">
                                     &larr; Back to History
@@ -1753,6 +2295,114 @@ const StockTakePage = ({ stock = [], setStock, setError, logUnrecognizedBarcode,
                         </div>
                     </form>
                 )}
+            </Modal>
+
+            {/* Serial Number Range Count Modal */}
+            <Modal 
+                isOpen={isRangeCountModalOpen} 
+                onClose={() => { 
+                    setIsRangeCountModalOpen(false); 
+                    setRangeCountError(''); 
+                }} 
+                title="Count Serial Number Range"
+            >
+                <form onSubmit={handleRangeCountSubmit} className="space-y-4">
+                    <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                        Quickly count an entire boxed set of serialized meters by entering the first and last serial number.
+                    </p>
+
+                    <div>
+                        <label htmlFor="range-item-type" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">
+                            Product Type
+                        </label>
+                        <select
+                            id="range-item-type"
+                            value={rangeCountDetails.selectedItemType}
+                            onChange={(e) => setRangeCountDetails(prev => ({ ...prev, selectedItemType: e.target.value }))}
+                            className={formInputStyle}
+                        >
+                            <option value="">-- Auto-detect from serial / Select product --</option>
+                            {itemTypes.map(it => (
+                                <option key={it.id || it.name} value={it.name}>
+                                    {it.name} {it.category ? `(${it.category})` : ''}
+                                </option>
+                            ))}
+                        </select>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        <div>
+                            <label htmlFor="range-first-serial" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">
+                                First Serial Number
+                            </label>
+                            <input
+                                type="text"
+                                id="range-first-serial"
+                                value={rangeCountDetails.firstSerial}
+                                onChange={(e) => setRangeCountDetails(prev => ({ ...prev, firstSerial: e.target.value }))}
+                                placeholder="e.g. MTR-2024-001"
+                                className={`${formInputStyle} font-mono`}
+                                required
+                                autoFocus
+                            />
+                        </div>
+                        <div>
+                            <label htmlFor="range-last-serial" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">
+                                Last Serial Number
+                            </label>
+                            <input
+                                type="text"
+                                id="range-last-serial"
+                                value={rangeCountDetails.lastSerial}
+                                onChange={(e) => setRangeCountDetails(prev => ({ ...prev, lastSerial: e.target.value }))}
+                                placeholder="e.g. MTR-2024-050"
+                                className={`${formInputStyle} font-mono`}
+                                required
+                            />
+                        </div>
+                    </div>
+
+                    {/* Preview or Error Box */}
+                    {rangeCountError ? (
+                        <div className="p-3 bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300 rounded-md text-xs border border-red-200 dark:border-red-800">
+                            {rangeCountError}
+                        </div>
+                    ) : rangeCountProcessingResult.error ? (
+                        <div className="p-3 bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300 rounded-md text-xs border border-red-200 dark:border-red-800">
+                            {rangeCountProcessingResult.error}
+                        </div>
+                    ) : rangeCountProcessingResult.serials.length > 0 ? (
+                        <div className="p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-md text-xs text-blue-800 dark:text-blue-200">
+                            <p className="font-semibold">
+                                ✓ Valid Range: {rangeCountProcessingResult.serials.length} serial numbers will be counted
+                            </p>
+                            <p className="mt-1 text-[11px] font-mono text-zinc-600 dark:text-zinc-400 truncate">
+                                Range: {rangeCountProcessingResult.serials[0]} &rarr; {rangeCountProcessingResult.serials[rangeCountProcessingResult.serials.length - 1]}
+                            </p>
+                        </div>
+                    ) : null}
+
+                    <div className="flex justify-end space-x-3 pt-4 border-t border-zinc-200 dark:border-zinc-700">
+                        <button
+                            type="button"
+                            onClick={() => {
+                                setIsRangeCountModalOpen(false);
+                                setRangeCountError('');
+                            }}
+                            className="px-4 py-2 bg-zinc-200 dark:bg-zinc-700 text-zinc-800 dark:text-zinc-200 rounded-md text-sm font-medium hover:bg-zinc-300 dark:hover:bg-zinc-600"
+                        >
+                            Cancel
+                        </button>
+                        <button
+                            type="submit"
+                            disabled={rangeCountSubmitting || !!rangeCountProcessingResult.error || rangeCountProcessingResult.serials.length === 0}
+                            className="px-4 py-2 bg-blue-600 text-white rounded-md text-sm font-medium hover:bg-blue-700 disabled:bg-blue-400 dark:disabled:bg-blue-800 disabled:cursor-not-allowed flex items-center justify-center min-w-[140px]"
+                        >
+                            {rangeCountSubmitting ? <Spinner className="w-4 h-4 mr-2" /> : null}
+                            {rangeCountSubmitting ? 'Counting...' : `Count ${rangeCountProcessingResult.serials.length || 0} Units`}
+                        </button>
+                    </div>
+                </form>
             </Modal>
         </Page>
     );

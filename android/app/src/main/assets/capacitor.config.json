@@ -1,0 +1,10 @@
+{
+	"appId": "com.breganmf.stockmanager",
+	"appName": "Bregan MainsFlow Stock Manager",
+	"webDir": "dist",
+	"bundledWebRuntime": false,
+	"android": {
+		"backgroundColor": "#00000000"
+	},
+	"plugins": {}
+}

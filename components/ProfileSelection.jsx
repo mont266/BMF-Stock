@@ -1,10 +1,12 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { supabase } from '../lib/supabaseClient';
 import { BrandIcon, UsersIcon, LogoutIcon } from './Icons';
+import AnimatedLogo from './AnimatedLogo';
 import { Spinner } from './StockManagerApp';
 import Modal from './Modal';
+import ScannerStatusIndicator from './ScannerStatusIndicator';
 
-const ProfileSelection = ({ onProfileSelect, session, onLogout }) => {
+const ProfileSelection = ({ onProfileSelect, session, onLogout, onEnterTrainingMode }) => {
     const [profiles, setProfiles] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
@@ -23,10 +25,9 @@ const ProfileSelection = ({ onProfileSelect, session, onLogout }) => {
             const { data, error } = await supabase
                 .from('profiles')
                 .select('id, name, pin, role')
-                .eq('user_id', session.user.id)
                 .order('name');
             if (error) throw error;
-            setProfiles(data);
+            setProfiles(data || []);
         } catch (err) {
             setError('Could not load profiles. Please try again.');
             console.error(err);
@@ -112,8 +113,16 @@ const ProfileSelection = ({ onProfileSelect, session, onLogout }) => {
     return (
         <>
         <div className="relative flex flex-col items-center justify-center min-h-screen bg-zinc-100 dark:bg-zinc-900 p-4">
+            {/* Top Bar with Scanner Status and Log Out */}
             <div 
-                className="absolute right-4"
+                className="absolute left-4 top-4 flex items-center space-x-2 z-10"
+                style={{ top: 'max(1rem, env(safe-area-inset-top, 0px))' }}
+            >
+                <ScannerStatusIndicator />
+            </div>
+
+            <div 
+                className="absolute right-4 top-4 flex items-center space-x-2 z-10"
                 style={{ top: 'max(1rem, env(safe-area-inset-top, 0px))' }}
             >
                 <button
@@ -127,7 +136,9 @@ const ProfileSelection = ({ onProfileSelect, session, onLogout }) => {
             </div>
             
             <div className="w-full max-w-4xl mx-auto text-center mt-12 md:mt-0">
-                <BrandIcon className="w-20 h-20 mx-auto text-blue-600 mb-4" />
+                <div className="flex justify-center mb-5">
+                    <AnimatedLogo className="w-20 h-20" />
+                </div>
                 <h1 className="text-3xl font-bold text-zinc-900 dark:text-white">Who's using the app?</h1>
                 <p className="mt-2 text-zinc-600 dark:text-zinc-400">Select your profile to continue.</p>
 

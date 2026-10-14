@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { supabase } from '../lib/supabaseClient';
 import { Location, Team } from '../types';
 import { get, set } from 'idb-keyval';
+import { trainingManager } from '../lib/trainingEnvironment';
 
 
 const isOfflineError = (err) => {
@@ -11,18 +12,42 @@ const isOfflineError = (err) => {
 };
 
 export const useStock = (isTrainingMode = false) => {
-  const [stock, setStock] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [stock, setStockState] = useState(() => {
+    return isTrainingMode ? trainingManager.getStock() : [];
+  });
+  const [loading, setLoading] = useState(!isTrainingMode);
   const [syncQueue, setSyncQueue] = useState([]);
   const [isSyncing, setIsSyncing] = useState(false);
 
   useEffect(() => {
-    get('offline_sync_queue').then(queue => {
-      if (queue && Array.isArray(queue)) {
-        setSyncQueue(queue);
-      }
-    });
-  }, []);
+    if (isTrainingMode) {
+      setStockState(trainingManager.getStock());
+      setLoading(false);
+      const unsubscribe = trainingManager.subscribe(() => {
+        setStockState(trainingManager.getStock());
+      });
+      return unsubscribe;
+    }
+  }, [isTrainingMode]);
+
+  const setStock = useCallback((newStock) => {
+    if (isTrainingMode) {
+      trainingManager.setStock(newStock);
+      setStockState(trainingManager.getStock());
+    } else {
+      setStockState(newStock);
+    }
+  }, [isTrainingMode]);
+
+  useEffect(() => {
+    if (!isTrainingMode) {
+      get('offline_sync_queue').then(queue => {
+        if (queue && Array.isArray(queue)) {
+          setSyncQueue(queue);
+        }
+      });
+    }
+  }, [isTrainingMode]);
 
   useEffect(() => {
     if (!isTrainingMode) {
@@ -32,6 +57,7 @@ export const useStock = (isTrainingMode = false) => {
   
   const fetchStock = useCallback(async () => {
     if (isTrainingMode) {
+      setStockState(trainingManager.getStock());
       setLoading(false);
       return;
     }
@@ -162,7 +188,97 @@ export const useStock = (isTrainingMode = false) => {
     return updatedItem;
   }, []);
 
-    const processSyncQueue = useCallback(async () => {
+  const performBulkUpdateAssignment = useCallback(async (itemIds, location, team, assignerName) => {
+    if (!itemIds || itemIds.length === 0) return;
+    const { data: { session } } = await supabase.auth.getSession();
+    const user = session?.user;
+    if (!user) throw new Error('User not authenticated');
+
+    const isAssigning = team !== Team.UNASSIGNED;
+    const chunkSize = 100;
+    const allItemsBefore = [];
+
+    // 1. Fetch current items before update
+    for (let i = 0; i < itemIds.length; i += chunkSize) {
+      const chunk = itemIds.slice(i, i + chunkSize);
+      const { data, error: fetchErr } = await supabase
+        .from('stock_items')
+        .select('*')
+        .in('id', chunk);
+      if (fetchErr) throw fetchErr;
+      if (data) allItemsBefore.push(...data);
+    }
+
+    // 2. Update stock items in database
+    for (let i = 0; i < itemIds.length; i += chunkSize) {
+      const chunk = itemIds.slice(i, i + chunkSize);
+      const { error: updateErr } = await supabase
+        .from('stock_items')
+        .update({
+          location,
+          assigned_to: team,
+          assigned_at: isAssigning ? new Date().toISOString() : null,
+          assigned_by: isAssigning ? assignerName : null,
+        })
+        .in('id', chunk);
+      if (updateErr) throw updateErr;
+    }
+
+    // 3. Construct accurate movement records for each item
+    const movements = allItemsBefore.map(item => {
+      const oldAssignedTo = item.assigned_to;
+      const oldLocation = item.location;
+      let movType = 'OUT';
+      let locFrom = oldLocation;
+      let locTo = team;
+
+      if (oldAssignedTo === Team.UNASSIGNED && team !== Team.UNASSIGNED) {
+        // Signing OUT to team or surveyor
+        movType = 'OUT';
+        locFrom = oldLocation || location;
+        locTo = team;
+      } else if (oldAssignedTo !== Team.UNASSIGNED && team === Team.UNASSIGNED) {
+        // Signing IN / Returning to stock location
+        movType = 'IN';
+        locFrom = oldAssignedTo;
+        locTo = location;
+      } else if (oldAssignedTo !== Team.UNASSIGNED && team !== Team.UNASSIGNED && oldAssignedTo !== team) {
+        // Transfer between teams
+        movType = 'OUT';
+        locFrom = oldAssignedTo;
+        locTo = team;
+      } else if (oldLocation !== location) {
+        // Storehouse transfer
+        movType = 'IN';
+        locFrom = oldLocation;
+        locTo = location;
+      } else {
+        movType = isAssigning ? 'OUT' : 'IN';
+        locFrom = isAssigning ? (oldLocation || location) : (oldAssignedTo || 'Assigned');
+        locTo = isAssigning ? team : location;
+      }
+
+      return {
+        item_id: item.id,
+        item_barcode: item.barcode,
+        item_name: item.name,
+        movement_type: movType,
+        location_from: locFrom,
+        location_to: locTo,
+        user_id: user.id,
+        username: assignerName
+      };
+    });
+
+    // 4. Insert movements in chunks so no query payload cap is exceeded
+    for (let i = 0; i < movements.length; i += chunkSize) {
+      const chunk = movements.slice(i, i + chunkSize);
+      const { error: moveErr } = await supabase.from('stock_movements').insert(chunk);
+      if (moveErr) console.error("Bulk assignment movement log failed:", moveErr.message);
+    }
+  }, []);
+
+  const processSyncQueue = useCallback(async () => {
     if (isTrainingMode || isSyncing || syncQueue.length === 0 || !navigator.onLine) return;
     setIsSyncing(true);
     
@@ -182,6 +298,10 @@ export const useStock = (isTrainingMode = false) => {
               itemId = tempIdMap[itemId]; // Map temp ID to real ID
           }
           await performUpdateAssignment(itemId, location, assigned_to, assignerName);
+        } else if (task.action === 'BULK_UPDATE_ASSIGNMENT') {
+          let { itemIds, location, team, assignerName } = task.payload;
+          itemIds = (itemIds || []).map(id => tempIdMap[id] || id);
+          await performBulkUpdateAssignment(itemIds, location, team, assignerName);
         } else if (task.action === 'ADD_STOCK') {
           const { item, assignerName, tempId } = task.payload;
           const { data: { session } } = await supabase.auth.getSession();
@@ -216,7 +336,7 @@ export const useStock = (isTrainingMode = false) => {
     if (!hasError && currentQueue.length < syncQueue.length) {
       fetchStock(); 
     }
-  }, [syncQueue, isSyncing, fetchStock, performUpdateAssignment, isTrainingMode]);
+  }, [syncQueue, isSyncing, fetchStock, performUpdateAssignment, performBulkUpdateAssignment, isTrainingMode]);
 
   useEffect(() => {
     if (isTrainingMode) return;
@@ -235,17 +355,7 @@ export const useStock = (isTrainingMode = false) => {
 
     const addStockItem = useCallback(async (item, assignerName) => {
     if (isTrainingMode) {
-        const tempId = 'train-' + Math.random().toString(36).substr(2, 9);
-        const newItem = {
-            ...item,
-            id: tempId,
-            location: item.location || Location.LEADING_STORES,
-            assigned_to: Team.UNASSIGNED,
-            user_id: 'training_user',
-            created_at: new Date().toISOString()
-        };
-        setStock(prev => [newItem, ...prev]);
-        return newItem;
+        return trainingManager.addStockItem(item, assignerName);
     }
 
     const handleOffline = () => {
@@ -307,16 +417,7 @@ export const useStock = (isTrainingMode = false) => {
 
     const bulkAddStockItems = useCallback(async (items, assignerName) => {
     if (isTrainingMode) {
-        const newItems = items.map(item => ({
-            ...item,
-            id: 'train-' + Math.random().toString(36).substr(2, 9),
-            location: item.location || Location.LEADING_STORES,
-            assigned_to: Team.UNASSIGNED,
-            user_id: 'training_user',
-            created_at: new Date().toISOString()
-        }));
-        setStock(prev => [...newItems, ...prev]);
-        return newItems;
+        return trainingManager.bulkAddStockItems(items, assignerName);
     }
 
     const handleOffline = () => {
@@ -391,16 +492,8 @@ export const useStock = (isTrainingMode = false) => {
   }, [fetchStock, isTrainingMode]);
 
   const updateStockItemAssignment = useCallback(async (itemId, location, assigned_to, assignerName) => {
-    const isAssigning = assigned_to !== Team.UNASSIGNED;
     if (isTrainingMode) {
-       setStock(prev => prev.map(item => {
-           if (item.id === itemId) {
-               return { ...item, location, assigned_to, assigned_at: isAssigning ? new Date().toISOString() : null, assigned_by: isAssigning ? assignerName : null };
-           }
-           return item;
-       }));
-       const match = stock.find(i => i.id === itemId);
-       return match ? { ...match, location, assigned_to } : { id: itemId, location, assigned_to };
+       return trainingManager.updateStockItemAssignment(itemId, location, assigned_to, assignerName);
     }
 
     if (!navigator.onLine) {
@@ -414,7 +507,7 @@ export const useStock = (isTrainingMode = false) => {
        
        setStock(prev => prev.map(item => {
            if (item.id === itemId) {
-               return { ...item, location, assigned_to, assigned_at: isAssigning ? new Date().toISOString() : null, assigned_by: isAssigning ? assignerName : null };
+               return { ...item, location, assigned_to, assigned_at: assigned_to !== Team.UNASSIGNED ? new Date().toISOString() : null, assigned_by: assigned_to !== Team.UNASSIGNED ? assignerName : null };
            }
            return item;
        }));
@@ -435,7 +528,7 @@ export const useStock = (isTrainingMode = false) => {
            setSyncQueue(prev => [...prev, task]);
            setStock(prev => prev.map(item => {
                if (item.id === itemId) {
-                   return { ...item, location, assigned_to, assigned_at: isAssigning ? new Date().toISOString() : null, assigned_by: isAssigning ? assignerName : null };
+                   return { ...item, location, assigned_to, assigned_at: assigned_to !== Team.UNASSIGNED ? new Date().toISOString() : null, assigned_by: assigned_to !== Team.UNASSIGNED ? assignerName : null };
                }
                return item;
            }));
@@ -446,65 +539,54 @@ export const useStock = (isTrainingMode = false) => {
   }, [performUpdateAssignment, isTrainingMode, stock]);
   
   const bulkUpdateAssignments = useCallback(async (itemIds, location, team, assignerName) => {
-    const isAssigning = team !== Team.UNASSIGNED;
+    if (!itemIds || itemIds.length === 0) return;
     if (isTrainingMode) {
+      trainingManager.bulkUpdateAssignments(itemIds, location, team, assignerName);
+      return;
+    }
+
+    const handleOffline = () => {
+      const task = {
+        id: Math.random().toString(36).substr(2, 9),
+        action: 'BULK_UPDATE_ASSIGNMENT',
+        payload: { itemIds, location, team, assignerName },
+        timestamp: new Date().toISOString()
+      };
+      setSyncQueue(prev => [...prev, task]);
       setStock(prev => prev.map(item => {
         if (itemIds.includes(item.id)) {
           return {
             ...item,
             location,
             assigned_to: team,
-            assigned_at: isAssigning ? new Date().toISOString() : null,
-            assigned_by: isAssigning ? assignerName : null
+            assigned_at: team !== Team.UNASSIGNED ? new Date().toISOString() : null,
+            assigned_by: team !== Team.UNASSIGNED ? assignerName : null
           };
         }
         return item;
       }));
+    };
+
+    if (!navigator.onLine) {
+      handleOffline();
       return;
     }
 
-    const { data: { session } } = await supabase.auth.getSession();
-    const user = session?.user;
-    if (!user) throw new Error('User not authenticated');
-
-    // For logging, fetch the items before updating
-    const { data: itemsBeforeUpdate, error: fetchError } = await supabase
-        .from('stock_items')
-        .select('*')
-        .in('id', itemIds);
-    if (fetchError) throw fetchError;
-
-    const { error } = await supabase
-        .from('stock_items')
-        .update({
-            location,
-            assigned_to: team,
-            assigned_at: isAssigning ? new Date().toISOString() : null,
-            assigned_by: isAssigning ? assignerName : null,
-        })
-        .in('id', itemIds);
-    if (error) throw error;
-
-    // Create movement logs
-    const movements = itemsBeforeUpdate.map(item => ({
-        item_id: item.id,
-        item_barcode: item.barcode,
-        item_name: item.name,
-        movement_type: 'OUT',
-        location_from: item.location,
-        location_to: team,
-        user_id: user.id,
-        username: assignerName
-    }));
-
-    const { error: moveError } = await supabase.from('stock_movements').insert(movements);
-    if (moveError) console.error("Bulk assignment movement log failed:", moveError.message);
-    
-}, [isTrainingMode]);
+    try {
+      await performBulkUpdateAssignment(itemIds, location, team, assignerName);
+      await fetchStock();
+    } catch (err) {
+      if (isOfflineError(err)) {
+        handleOffline();
+        return;
+      }
+      throw err;
+    }
+  }, [performBulkUpdateAssignment, fetchStock, isTrainingMode]);
 
   const bulkDeleteStockItems = useCallback(async (itemIds, assignerName) => {
     if (isTrainingMode) {
-      setStock(prev => prev.filter(i => !itemIds.includes(i.id)));
+      trainingManager.bulkDeleteStockItems(itemIds, assignerName);
       return;
     }
 
@@ -547,7 +629,7 @@ export const useStock = (isTrainingMode = false) => {
 
   const deleteStockItem = useCallback(async (itemId, assignerName) => {
     if (isTrainingMode) {
-      setStock(prev => prev.filter(i => i.id !== itemId));
+      trainingManager.deleteStockItem(itemId, assignerName);
       return;
     }
 

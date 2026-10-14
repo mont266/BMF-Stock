@@ -35,6 +35,8 @@ dependencies {
     implementation project(':capacitor-app')
     implementation project(':capacitor-haptics')
     implementation project(':capacitor-mlkit-barcode-scanning')
+    implementation project(':capacitor-filesystem')
+    implementation project(':capacitor-share')
 
     // Firebase Dependencies for App Distribution
     // Import the Firebase BoM (Bill of Materials)

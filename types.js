@@ -23,6 +23,7 @@ export const View = {
   REPORTING: 'REPORTING',
   PURCHASING: 'PURCHASING',
   STOCK_TAKE: 'STOCK_TAKE',
+  SETTINGS: 'SETTINGS',
 };
 
 export const StockCategory = {

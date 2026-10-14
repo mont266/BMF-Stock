@@ -7,8 +7,12 @@ import Scanner from './Scanner';
 import Modal from './Modal';
 import PurchasingPage from './PurchasingPage';
 import StockTakePage from './StockTakePage';
+import ReportingPage from './ReportingPage';
+import SettingsView from './SettingsView';
+import ScannerStatusIndicator from './ScannerStatusIndicator';
 import { BrandIcon, ScanIcon, InformationCircleIcon, AddIcon, ListIcon, ChevronDownIcon, LogoutIcon, AdminIcon, BoxIcon, TagIcon, UsersIcon, BuildingStoreIcon, SunIcon, MoonIcon, EditIcon, TrashIcon, CurrencyPoundIcon, ArchiveIcon, PlusCircleIcon, ArrowRightCircleIcon, CheckCircleIcon, XCircleIcon, SettingsIcon, XIcon, ChartBarIcon, PurchasingIcon, SwitchUserIcon, CalculatorIcon, DocumentArrowDownIcon, UploadIcon, RefreshIcon, ClipboardCheckIcon, BellIcon, SearchIcon, BarcodeIcon, AlertTriangleIcon } from './Icons';
 import { supabase } from '../lib/supabaseClient';
+import { trainingManager } from '../lib/trainingEnvironment';
 import { Capacitor } from '@capacitor/core';
 import { Haptics, ImpactStyle } from '@capacitor/haptics';
 import { App as CapacitorApp } from '@capacitor/app';
@@ -111,562 +115,6 @@ const expandRangeByQuantity = (start, quantity) => {
     return { result: results };
 };
 
-const ReportingPage = ({ teams, dbLocations, filters, setFilters, reportData, setReportData, loading, setLoading, itemTypes, stock, setError, setIsPrintInfoModalOpen }) => {
-  
-  const [activeTab, setActiveTab] = useState('movements');
-  const [pdfPreviewUrl, setPdfPreviewUrl] = useState(null);
-
-  const assignedStockData = useMemo(() => {
-    const assigned = stock.filter(item => item.assigned_to && item.assigned_to !== 'Unassigned');
-    const groups = {};
-    assigned.forEach(item => {
-      const team = item.assigned_to;
-      if (!groups[team]) groups[team] = {};
-      if (!groups[team][item.name]) groups[team][item.name] = { count: 0, barcodes: [] };
-      groups[team][item.name].count++;
-      groups[team][item.name].barcodes.push(item.barcode);
-    });
-    return groups;
-  }, [stock]);
-
-      const thresholdData = useMemo(() => {
-    const stockCounts = {};
-    stock.forEach(item => {
-        if (!item.assigned_to || item.assigned_to === 'Unassigned') {
-            if (!stockCounts[item.name]) stockCounts[item.name] = 0;
-            stockCounts[item.name]++;
-        }
-    });
-
-    const report = [];
-    itemTypes.forEach(type => {
-        const currentStock = stockCounts[type.name] || 0;
-        // The stock_threshold on the item type is already the 6-week calculated buffer
-        const threshold = parseInt(type.stock_threshold) || 0;
-        
-        let status = 'OK';
-        if (currentStock <= threshold) {
-            status = 'CRITICAL';
-        } else if (threshold > 0 && currentStock <= threshold * 1.5) {
-            status = 'WARNING';
-        }
-
-        if (status !== 'OK') {
-            // Replenish stock back up to the 6-week threshold
-            const suggestedOrder = Math.max(0, threshold - currentStock);
-            
-            report.push({
-                name: type.name,
-                currentStock,
-                threshold,
-                suggestedOrder,
-                status
-            });
-        }
-    });
-    
-    return report.sort((a, b) => {
-        if (a.status === b.status) return a.currentStock - b.currentStock;
-        return a.status === 'CRITICAL' ? -1 : 1;
-    });
-  }, [stock, itemTypes]);
-
-  const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
-
-  const uniqueItemNames = useMemo(() => {
-    const names = new Set(stock.map(item => item.name));
-    return ['All', ...Array.from(names).sort()];
-  }, [stock]);
-
-  const handleGenerateReport = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const { data: { session } } = await supabase.auth.getSession();
-      const user = session?.user;
-      if (!user) throw new Error('User not authenticated');
-      
-      let query = supabase
-        .from('stock_movements')
-        .select('*')
-        
-        .gte('created_at', new Date(filters.startDate).toISOString())
-        .lte('created_at', new Date(`${filters.endDate}T23:59:59.999Z`).toISOString())
-        .order('created_at', { ascending: false });
-
-            if (filters.itemName !== 'All') {
-        query = query.eq('item_name', filters.itemName);
-      }
-      if (filters.team && filters.team !== 'All') {
-        query = query.or(`location_from.eq."${filters.team}",location_to.eq."${filters.team}"`);
-      }
-      if (filters.location && filters.location !== 'All') {
-        query = query.or(`location_from.eq."${filters.location}",location_to.eq."${filters.location}"`);
-      }
-      if (filters.partNumber && filters.partNumber.trim() !== '') {
-        query = query.eq('item_barcode', filters.partNumber.trim());
-      }
-
-      const { data, error } = await query;
-      if (error) throw error;
-      
-      setReportData(data);
-    } catch (err) {
-      setError(`Failed to generate report: ${err.message}`);
-      setReportData(null);
-    } finally {
-      setLoading(false);
-    }
-  }, [filters, setLoading, setError, setReportData]);
-
-  const reportSummary = useMemo(() => {
-    if (!reportData) return { totalIn: 0, totalOut: 0, netChange: 0 };
-    const summary = reportData.reduce((acc, move) => {
-        if (move.movement_type === 'IN') acc.totalIn += 1;
-        if (move.movement_type === 'OUT') acc.totalOut += 1;
-        return acc;
-    }, { totalIn: 0, totalOut: 0 });
-    summary.netChange = summary.totalIn - summary.totalOut;
-    return summary;
-  }, [reportData]);
-  
-  const groupedReportData = useMemo(() => {
-    if (!reportData) return null;
-    
-    const groups = {};
-    
-    reportData.forEach(move => {
-      // Group by minute to catch bulk inserts and rapid scans
-      const timeKey = new Date(move.created_at).toISOString().slice(0, 16); 
-      const key = `${move.item_name}|${move.movement_type}|${move.location_from}|${move.location_to}|${move.username}|${timeKey}`;
-      
-      if (!groups[key]) {
-        groups[key] = {
-          id: move.id, // use first id as key
-          created_at: move.created_at,
-          item_name: move.item_name,
-          movement_type: move.movement_type,
-          location_from: move.location_from,
-          location_to: move.location_to,
-          username: move.username,
-          quantity: 0,
-          barcodes: []
-        };
-      }
-      
-      groups[key].quantity += 1;
-      if (move.item_barcode) {
-        groups[key].barcodes.push(move.item_barcode);
-      }
-    });
-    
-    // Convert back to array and sort by created_at descending
-    return Object.values(groups).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-  }, [reportData]);
-  
-  const handlePrint = async () => {
-    setIsGeneratingPdf(true);
-    try {
-        const doc = new jsPDF();
-        
-                doc.setFontSize(20);
-        doc.text(`Inventory Report`, 14, 22);
-        doc.setFontSize(12);
-        let headerText = `Period: ${new Date(filters.startDate).toLocaleDateString()} to ${new Date(filters.endDate).toLocaleDateString()}`;
-        if (filters.team && filters.team !== 'All') {
-            headerText += ` | Team: ${filters.team}`;
-        }
-        if (filters.location && filters.location !== 'All') {
-            headerText += ` | Location: ${filters.location}`;
-        }
-        if (filters.itemName && filters.itemName !== 'All') {
-            headerText += ` | Item: ${filters.itemName}`;
-        }
-        doc.text(headerText, 14, 32);
-        
-        doc.text(`Total Items In: ${reportSummary.totalIn}`, 14, 42);
-        doc.text(`Total Items Out: ${reportSummary.totalOut}`, 80, 42);
-        doc.text(`Net Change: ${reportSummary.netChange > 0 ? '+' : ''}${reportSummary.netChange}`, 140, 42);
-
-        const tableColumn = ["Date", "Item", "Qty", "Type", "From", "To", "User"];
-        const tableRows = [];
-
-        groupedReportData.forEach(move => {
-            const itemDetails = move.quantity === 1 && move.barcodes.length > 0 
-                ? `${move.item_name}\n(${move.barcodes[0]})` 
-                : `${move.item_name}`;
-
-            const itemData = [
-                new Date(move.created_at).toLocaleString(),
-                itemDetails,
-                move.quantity.toString(),
-                move.movement_type,
-                move.location_from,
-                move.location_to,
-                move.username
-            ];
-            tableRows.push(itemData);
-        });
-
-        autoTable(doc, {
-            head: [tableColumn],
-            body: tableRows,
-            startY: 50,
-            styles: { fontSize: 8 },
-            headStyles: { fillColor: [71, 85, 105] }
-        });
-
-        const fileName = `inventory_report_${new Date().getTime()}.pdf`;
-
-        if (Capacitor.isNativePlatform()) {
-            try {
-                const pdfBase64 = doc.output('datauristring').split(',')[1];
-                const savedFile = await Filesystem.writeFile({
-                    path: fileName,
-                    data: pdfBase64,
-                    directory: Directory.Documents
-                });
-                
-                try {
-                    await Share.share({
-                        title: 'Inventory Report',
-                        url: savedFile.uri,
-                    });
-                } catch (shareErr) {
-                    console.warn("Native PDF share failed, but file is saved", shareErr);
-                    setPdfPreviewUrl('native-saved');
-                }
-                return;
-            } catch (nativeErr) {
-                console.error("Native file save failed", nativeErr);
-                setError("Failed to save PDF on device: " + nativeErr.message);
-                return;
-            }
-        }
-        
-        const blob = doc.output('blob');
-        const file = new File([blob], fileName, { type: 'application/pdf' });
-        
-        if (navigator.canShare && navigator.canShare({ files: [file] })) {
-            try {
-                await navigator.share({
-                    title: 'Inventory Report',
-                    files: [file]
-                });
-                return;
-            } catch (shareErr) {
-                console.warn("Web share failed or was cancelled", shareErr);
-            }
-        }
-
-        const url = URL.createObjectURL(blob);
-        setPdfPreviewUrl(url);
-    } catch (err) {
-        console.error("Failed to generate PDF:", err);
-        setError("Failed to generate PDF report: " + err.message);
-    } finally {
-        setIsGeneratingPdf(false);
-    }
-  };
-
-  return (
-    <Page title="Inventory Reports">
-      
-      <div className="border-b border-zinc-200 dark:border-zinc-700 mb-6 no-print">
-          <nav className="-mb-px flex space-x-6 overflow-x-auto">
-              <button onClick={() => setActiveTab('movements')} className={`whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm ${activeTab === 'movements' ? 'border-blue-500 text-blue-600 dark:text-blue-400' : 'border-transparent text-zinc-500 hover:text-zinc-700 hover:border-zinc-300 dark:text-zinc-400 dark:hover:text-zinc-300'}`}>Movement History</button>
-              <button onClick={() => setActiveTab('assigned')} className={`whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm ${activeTab === 'assigned' ? 'border-blue-500 text-blue-600 dark:text-blue-400' : 'border-transparent text-zinc-500 hover:text-zinc-700 hover:border-zinc-300 dark:text-zinc-400 dark:hover:text-zinc-300'}`}>Assigned Stock</button>
-              <button onClick={() => setActiveTab('thresholds')} className={`whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm ${activeTab === 'thresholds' ? 'border-blue-500 text-blue-600 dark:text-blue-400' : 'border-transparent text-zinc-500 hover:text-zinc-700 hover:border-zinc-300 dark:text-zinc-400 dark:hover:text-zinc-300'}`}>Stock Thresholds</button>
-          </nav>
-      </div>
-
-      {activeTab === 'movements' && (
-        <div className="space-y-6">
-
-        <div className="bg-white dark:bg-zinc-800/50 p-6 rounded-lg shadow-sm border border-zinc-200 dark:border-zinc-700 no-print">
-          <h2 className="text-xl font-bold text-zinc-800 dark:text-white mb-4">Report Filters</h2>
-                    <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-7 gap-4 items-end">
-            <div>
-              <label htmlFor="start-date" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Start Date</label>
-              <input type="date" id="start-date" value={filters.startDate} onChange={e => setFilters(prev => ({...prev, startDate: e.target.value}))} className={formInputStyle} />
-            </div>
-            <div>
-              <label htmlFor="end-date" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">End Date</label>
-              <input type="date" id="end-date" value={filters.endDate} onChange={e => setFilters(prev => ({...prev, endDate: e.target.value}))} className={formInputStyle} />
-            </div>
-            <div>
-              <label htmlFor="team-filter" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Team</label>
-              <select id="team-filter" value={filters.team || 'All'} onChange={e => setFilters(prev => ({...prev, team: e.target.value}))} className={formInputStyle}>
-                <option value="All">All Teams</option>
-                {teams && teams.map(team => <option key={team.id} value={team.name}>{team.name}</option>)}
-              </select>
-            </div>
-            <div>
-              <label htmlFor="location-filter" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Location</label>
-              <select id="location-filter" value={filters.location || 'All'} onChange={e => setFilters(prev => ({...prev, location: e.target.value}))} className={formInputStyle}>
-                <option value="All">All Locations</option>
-                {dbLocations && dbLocations.map(loc => <option key={loc.id} value={loc.name}>{loc.name}</option>)}
-              </select>
-            </div>
-            <div>
-              <label htmlFor="item-name-filter" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Item Name</label>
-              <select id="item-name-filter" value={filters.itemName} onChange={e => setFilters(prev => ({...prev, itemName: e.target.value}))} className={formInputStyle}>
-                {uniqueItemNames.map(name => <option key={name} value={name}>{name}</option>)}
-              </select>
-            </div>
-            <div>
-              <label htmlFor="part-number-filter" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Part Number</label>
-              <input 
-                type="text" 
-                id="part-number-filter"
-                placeholder="Enter barcode..."
-                value={filters.partNumber} 
-                onChange={e => setFilters(prev => ({...prev, partNumber: e.target.value}))} 
-                className={formInputStyle} 
-              />
-            </div>
-            <button onClick={handleGenerateReport} disabled={loading} className="w-full px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors text-sm font-medium disabled:bg-blue-400 dark:disabled:bg-blue-800 disabled:cursor-not-allowed flex items-center justify-center h-10">
-              {loading && <Spinner className="w-5 h-5 mr-2" />}
-              {loading ? 'Generating...' : 'Generate Report'}
-            </button>
-          </div>
-        </div>
-
-        {reportData ? (
-          <div id="report-content" className="bg-white dark:bg-zinc-800/50 rounded-lg shadow-sm border border-zinc-200 dark:border-zinc-700">
-             <div className="p-6 border-b border-zinc-200 dark:border-zinc-700">
-                <div className="flex justify-between items-center">
-                    <div>
-                                                <h2 className="text-xl font-bold text-zinc-800 dark:text-white">Report Results</h2>
-                        <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                            For period {new Date(filters.startDate).toLocaleDateString()} to {new Date(filters.endDate).toLocaleDateString()}
-                            {filters.team && filters.team !== 'All' && <span className="ml-2 font-medium text-blue-600 dark:text-blue-400">&bull; Team: {filters.team}</span>}
-                            {filters.location && filters.location !== 'All' && <span className="ml-2 font-medium text-blue-600 dark:text-blue-400">&bull; Location: {filters.location}</span>}
-                            {filters.itemName && filters.itemName !== 'All' && <span className="ml-2 font-medium text-blue-600 dark:text-blue-400">&bull; Item: {filters.itemName}</span>}
-                        </p>
-                    </div>
-                    <button onClick={handlePrint} disabled={isGeneratingPdf} className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors text-sm font-medium flex items-center no-print disabled:bg-blue-400">
-                      {isGeneratingPdf && <Spinner className="w-4 h-4 mr-2" />}
-                      {isGeneratingPdf ? 'Generating...' : 'Save PDF'}
-                    </button>
-                </div>
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-6">
-                    <StatCard title="Total Items In" value={reportSummary.totalIn} icon={<PlusCircleIcon className="w-6 h-6 text-white"/>} colorClass="bg-green-500" />
-                    <StatCard title="Total Items Out" value={reportSummary.totalOut} icon={<ArrowRightCircleIcon className="w-6 h-6 text-white"/>} colorClass="bg-red-500" />
-                    <StatCard title="Net Change" value={reportSummary.netChange > 0 ? `+${reportSummary.netChange}` : reportSummary.netChange} icon={<ChartBarIcon className="w-6 h-6 text-white"/>} colorClass="bg-indigo-500" />
-                </div>
-            </div>
-            <div>
-              {/* --- Mobile View: Cards --- */}
-              <div className="md:hidden divide-y divide-zinc-200 dark:divide-zinc-700">
-                {groupedReportData.map(move => (
-                  <div key={move.id} className="p-4">
-                    <div className="flex justify-between items-start">
-                      <div>
-                        <p className="font-semibold text-zinc-900 dark:text-zinc-100">{move.item_name}</p>
-                        {move.quantity > 1 ? (
-                          <p className="text-sm font-mono text-zinc-500 dark:text-zinc-400">
-                            {move.quantity} items
-                          </p>
-                        ) : (
-                          <p className="text-sm font-mono text-zinc-500 dark:text-zinc-400">{move.barcodes[0]}</p>
-                        )}
-                      </div>
-                      <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${move.movement_type === 'IN' ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300' : 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-300'}`}>
-                          {move.movement_type}
-                      </span>
-                    </div>
-                    <div className="mt-3 space-y-1 text-sm text-zinc-600 dark:text-zinc-300">
-                        <p><span className="font-medium text-zinc-500 dark:text-zinc-400">Date:</span> {new Date(move.created_at).toLocaleString()}</p>
-                        <p><span className="font-medium text-zinc-500 dark:text-zinc-400">From:</span> {move.location_from}</p>
-                        <p><span className="font-medium text-zinc-500 dark:text-zinc-400">To:</span> {move.location_to}</p>
-                        <p><span className="font-medium text-zinc-500 dark:text-zinc-400">User:</span> {move.username}</p>
-                        {move.quantity > 1 && (
-                          <p className="text-xs text-zinc-400 mt-2">Barcodes: {move.barcodes.slice(0, 5).join(', ')}{move.barcodes.length > 5 ? '...' : ''}</p>
-                        )}
-                    </div>
-                  </div>
-                ))}
-              </div>
-
-              {/* --- Desktop View: Table --- */}
-              <div className="hidden md:block overflow-x-auto">
-                  <table className="min-w-full divide-y divide-zinc-200 dark:divide-zinc-700">
-                      <thead className="bg-zinc-50 dark:bg-zinc-800">
-                          <tr>
-                              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Date</th>
-                              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Item</th>
-                              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Qty</th>
-                              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Type</th>
-                              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">From</th>
-                              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">To</th>
-                              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">User</th>
-                          </tr>
-                      </thead>
-                      <tbody className="bg-white dark:bg-zinc-800/50 divide-y divide-zinc-200 dark:divide-zinc-700">
-                          {groupedReportData.map(move => (
-                              <tr key={move.id}>
-                                  <td className="px-6 py-4 whitespace-nowrap text-sm text-zinc-500 dark:text-zinc-400">{new Date(move.created_at).toLocaleString()}</td>
-                                  <td className="px-6 py-4">
-                                      <div className="text-sm font-medium text-zinc-900 dark:text-zinc-100">{move.item_name}</div>
-                                      <div className="text-sm text-zinc-500 dark:text-zinc-400 font-mono" title={move.barcodes.join(', ')}>
-                                        {move.quantity === 1 ? move.barcodes[0] : `${move.barcodes.slice(0, 3).join(', ')}${move.barcodes.length > 3 ? '...' : ''}`}
-                                      </div>
-                                  </td>
-                                  <td className="px-6 py-4 whitespace-nowrap text-sm text-zinc-900 dark:text-zinc-100 font-medium">
-                                      {move.quantity}
-                                  </td>
-                                  <td className="px-6 py-4 whitespace-nowrap">
-                                      <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${move.movement_type === 'IN' ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300' : 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-300'}`}>
-                                          {move.movement_type}
-                                      </span>
-                                  </td>
-                                  <td className="px-6 py-4 whitespace-nowrap text-sm text-zinc-500 dark:text-zinc-400">{move.location_from}</td>
-                                  <td className="px-6 py-4 whitespace-nowrap text-sm text-zinc-500 dark:text-zinc-400">{move.location_to}</td>
-                                  <td className="px-6 py-4 whitespace-nowrap text-sm text-zinc-500 dark:text-zinc-400">{move.username}</td>
-                              </tr>
-                          ))}
-                      </tbody>
-                  </table>
-              </div>
-            </div>
-          </div>
-        ) : (
-          <div className="text-center py-16 px-6 bg-white dark:bg-zinc-800/50 rounded-lg shadow-sm border border-zinc-200 dark:border-zinc-700">
-            <h3 className="text-lg font-semibold text-zinc-900 dark:text-white">Generate a report</h3>
-            <p className="mt-2 text-sm text-zinc-500 dark:text-zinc-400">Select your filters above and click "Generate Report" to see stock movement history.</p>
-          </div>
-        )}
-      
-        </div>
-      )}
-
-      {activeTab === 'assigned' && (
-          <div className="bg-white dark:bg-zinc-800/50 rounded-lg shadow-sm border border-zinc-200 dark:border-zinc-700 overflow-hidden">
-              <div className="p-6 border-b border-zinc-200 dark:border-zinc-700">
-                  <h2 className="text-xl font-bold text-zinc-800 dark:text-white">Assigned Stock by Team</h2>
-                  <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">Currently signed out inventory.</p>
-              </div>
-              <div className="p-0">
-                  {Object.keys(assignedStockData).length === 0 ? (
-                      <div className="p-6 text-center text-zinc-500 dark:text-zinc-400">No items are currently signed out to teams.</div>
-                  ) : (
-                      <div className="divide-y divide-zinc-200 dark:divide-zinc-700">
-                          {Object.entries(assignedStockData).map(([team, items]) => (
-                              <div key={team} className="p-6">
-                                  <h3 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100 mb-4">{team}</h3>
-                                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                                      {Object.entries(items).map(([itemName, data]) => (
-                                          <div key={itemName} className="bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded p-4">
-                                              <p className="font-medium text-zinc-900 dark:text-zinc-100">{itemName}</p>
-                                              <p className="text-2xl font-bold text-blue-600 dark:text-blue-400 mt-1">{data.count}</p>
-                                          </div>
-                                      ))}
-                                  </div>
-                              </div>
-                          ))}
-                      </div>
-                  )}
-              </div>
-          </div>
-      )}
-
-      {activeTab === 'thresholds' && (
-          <div className="bg-white dark:bg-zinc-800/50 rounded-lg shadow-sm border border-zinc-200 dark:border-zinc-700 overflow-hidden">
-              <div className="p-6 border-b border-zinc-200 dark:border-zinc-700">
-                  <h2 className="text-xl font-bold text-zinc-800 dark:text-white">Stock Threshold Alerts</h2>
-                  <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">Items falling below their 6-week stock threshold, along with the order quantity required to replenish them.</p>
-              </div>
-              <div className="overflow-x-auto">
-                  {thresholdData.length === 0 ? (
-                      <div className="p-6 text-center text-zinc-500 dark:text-zinc-400">All stock levels are healthy!</div>
-                  ) : (
-                      <table className="min-w-full divide-y divide-zinc-200 dark:divide-zinc-700">
-                          <thead className="bg-zinc-50 dark:bg-zinc-800">
-                              <tr>
-                                  <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Status</th>
-                                  <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Item</th>
-                                  <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Current Stock</th>
-                                  <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Threshold (6-Weeks)</th>
-                                  <th className="px-6 py-3 text-left text-xs font-medium text-blue-600 dark:text-blue-400 uppercase tracking-wider">Order to Replenish</th>
-                              </tr>
-                          </thead>
-                          <tbody className="bg-white dark:bg-zinc-800/50 divide-y divide-zinc-200 dark:divide-zinc-700">
-                              {thresholdData.map((item, idx) => (
-                                  <tr key={idx}>
-                                      <td className="px-6 py-4 whitespace-nowrap">
-                                          {item.status === 'CRITICAL' ? (
-                                              <span className="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-300">Needs Order</span>
-                                          ) : (
-                                              <span className="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-300">Warning</span>
-                                          )}
-                                      </td>
-                                      <td className="px-6 py-4 font-medium text-zinc-900 dark:text-zinc-100">{item.name}</td>
-                                      <td className="px-6 py-4 whitespace-nowrap text-zinc-900 dark:text-zinc-100">{item.currentStock}</td>
-                                      <td className="px-6 py-4 whitespace-nowrap text-zinc-500 dark:text-zinc-400">{item.threshold}</td>
-                                      <td className="px-6 py-4 whitespace-nowrap font-bold text-blue-600 dark:text-blue-400">{item.suggestedOrder || 0}</td>
-                                  </tr>
-                              ))}
-                          </tbody>
-                      </table>
-                  )}
-              </div>
-          </div>
-      )}
-
-      <Modal isOpen={!!pdfPreviewUrl} onClose={() => setPdfPreviewUrl(null)} title={pdfPreviewUrl === 'native-saved' ? 'Saved to Documents' : 'PDF Report Ready'}>
-         <div className="flex flex-col items-center text-center space-y-4 py-4">
-            <div className="p-4 bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 rounded-full flex items-center justify-center">
-               <DocumentArrowDownIcon className="w-12 h-12" />
-            </div>
-            {pdfPreviewUrl === 'native-saved' ? (
-                <>
-                    <p className="text-zinc-600 dark:text-zinc-300 font-medium">
-                       Your PDF has been saved to your Documents folder.
-                    </p>
-                    <p className="text-xs text-zinc-500 mt-2">
-                       You can find it in your phone's File Manager under Documents. From there, you can open it and print it.
-                    </p>
-                    <button 
-                       onClick={() => setPdfPreviewUrl(null)} 
-                       className="w-full mt-4 flex items-center justify-center px-4 py-3 bg-blue-600 text-white rounded-md font-medium hover:bg-blue-700 transition-colors shadow-sm"
-                    >
-                       Done
-                    </button>
-                </>
-            ) : (
-                <>
-                    <p className="text-zinc-600 dark:text-zinc-300 font-medium">
-                       Your PDF has been generated successfully.
-                    </p>
-                    <div className="flex flex-col w-full gap-3 mt-4">
-                       <a 
-                         href={pdfPreviewUrl} 
-                         target="_blank" 
-                         rel="noreferrer" 
-                         className="w-full flex items-center justify-center px-4 py-3 bg-blue-600 text-white rounded-md font-medium hover:bg-blue-700 transition-colors shadow-sm"
-                       >
-                         Open & Print PDF
-                       </a>
-                       <a 
-                         href={pdfPreviewUrl} 
-                         download={`inventory_report_${new Date().getTime()}.pdf`}
-                         className="w-full flex items-center justify-center px-4 py-3 bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-600 text-zinc-800 dark:text-zinc-200 rounded-md font-medium hover:bg-zinc-50 dark:hover:bg-zinc-600 transition-colors shadow-sm"
-                       >
-                         Download PDF
-                       </a>
-                    </div>
-                    <p className="text-xs text-zinc-500 mt-4 leading-relaxed">
-                       Note: If downloading does not work, please use "Open & Print PDF".
-                    </p>
-                </>
-            )}
-         </div>
-      </Modal>
-
-    </Page>
-  );
-};
 
 
 export const formInputStyle = "mt-1 block w-full px-3 py-2 border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 rounded-md shadow-sm placeholder-zinc-400 dark:placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 dark:focus:ring-offset-zinc-900 focus:border-transparent sm:text-sm";
@@ -837,9 +285,9 @@ const SidebarNavItem = ({ icon, label, isActive, onClick }) => (
 );
 
 const MobileNavItem = ({ icon, label, isActive, onClick }) => (
-  <button onClick={onClick} className={`flex-1 flex flex-col items-center justify-center p-3 rounded-lg transition-colors ${isActive ? 'text-blue-600' : 'text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800'}`}>
-      {React.cloneElement(icon, { className: 'w-6 h-6' })}
-      <span className="text-xs font-medium mt-1.5">{label}</span>
+  <button onClick={onClick} className={`flex-1 flex flex-col items-center justify-center py-2 px-1 rounded-lg transition-colors min-w-0 ${isActive ? 'text-blue-600 dark:text-blue-400 font-semibold' : 'text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800'}`}>
+      {React.cloneElement(icon, { className: 'w-5 h-5 sm:w-6 sm:h-6 shrink-0' })}
+      <span className="text-[10px] sm:text-xs font-medium mt-1 truncate max-w-full text-center leading-tight">{label}</span>
   </button>
 );
 
@@ -1028,9 +476,19 @@ const RapidScanSummary = ({ summary, className = '' }) => {
     );
 };
 
-const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogout }) => {
-  const { stock, setStock, loading: stockLoading, addStockItem, bulkAddStockItems, updateStockItemAssignment, bulkUpdateAssignments, deleteStockItem, bulkDeleteStockItems, getStockItemsByBarcode, getExistingBarcodes, refetchStock, syncQueue, clearSyncQueue } = useStock();
+const StockManagerApp = ({ 
+  userProfile, 
+  selectedProfile, 
+  onSwitchProfile, 
+  onLogout,
+  isTrainingMode = false,
+  onEnterTrainingMode,
+  onExitTrainingMode
+}) => {
+  const { stock, setStock, loading: stockLoading, addStockItem, bulkAddStockItems, updateStockItemAssignment, bulkUpdateAssignments, deleteStockItem, bulkDeleteStockItems, getStockItemsByBarcode, getExistingBarcodes, refetchStock, syncQueue, clearSyncQueue } = useStock(isTrainingMode);
   const [currentView, setCurrentView] = useState(View.LIST);
+  const [isExitTrainingModalOpen, setIsExitTrainingModalOpen] = useState(false);
+  const [isResetTrainingModalOpen, setIsResetTrainingModalOpen] = useState(false);
 
   const [isOffline, setIsOffline] = useState(!navigator.onLine);
   const [showOnlineRestored, setShowOnlineRestored] = useState(false);
@@ -1282,6 +740,8 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
   const [isThresholdInfoModalOpen, setIsThresholdInfoModalOpen] = useState(false);
 
   const isAdminProfile = selectedProfile?.role === 'Admin';
+  // Hide Stock Take in mobile bottom nav bar for admins on both native app and mobile webapp, but show for normal users
+  const showStockTakeInMobileNav = !isAdminProfile;
 
   const setScannerPreference = useCallback((preference) => {
     localStorage.setItem('scannerPreference', preference);
@@ -1348,6 +808,8 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
         if (isProfilesModalOpen) { setIsProfilesModalOpen(false); return; }
         if (editingProfile) { setEditingProfile(null); return; }
         if (isThresholdSummaryModalOpen) { setIsThresholdSummaryModalOpen(false); return; }
+        if (isExitTrainingModalOpen) { setIsExitTrainingModalOpen(false); return; }
+        if (isResetTrainingModalOpen) { setIsResetTrainingModalOpen(false); return; }
         
         // Priority 2: Cancel the scanner if it's active
         if (currentView === View.SCAN) {
@@ -1639,6 +1101,10 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
   }, []);
 
   const fetchUnrecognizedScans = useCallback(async () => {
+    if (isTrainingMode) {
+        setUnrecognizedScans(trainingManager.getUnrecognizedScans());
+        return;
+    }
     try {
         const { data, error } = await supabase.from('unrecognized_scans').select('*').order('scanned_at', { ascending: false });
         if (!error && data) {
@@ -1647,9 +1113,14 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
     } catch (err) {
         console.error("Failed to fetch unrecognized scans", err);
     }
-  }, []);
+  }, [isTrainingMode]);
 
   const logUnrecognizedBarcode = useCallback(async (barcode) => {
+      if (isTrainingMode) {
+          trainingManager.logUnrecognizedScan(barcode, selectedProfile?.name || 'Trainee');
+          setUnrecognizedScans(trainingManager.getUnrecognizedScans());
+          return;
+      }
       try {
           const { data: { session } } = await supabase.auth.getSession();
           const user = session?.user;
@@ -1664,7 +1135,25 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
       } catch (err) {
           console.error("Failed to log unrecognized barcode", err);
       }
-  }, [fetchUnrecognizedScans, selectedProfile]);
+  }, [fetchUnrecognizedScans, selectedProfile, isTrainingMode]);
+
+  const resolveScanProfileName = useCallback((scan) => {
+    if (!scan) return 'Auditor';
+    const raw = scan.profile_name;
+    if (raw && !raw.includes('@') && raw !== 'Unknown') {
+      return raw;
+    }
+    if (raw && userProfile?.email && raw.toLowerCase() === userProfile.email.toLowerCase()) {
+      return selectedProfile?.name || userProfile?.full_name || raw.split('@')[0];
+    }
+    if (profiles && profiles.length > 0 && raw) {
+      const match = profiles.find(p => (p.email && p.email.toLowerCase() === raw.toLowerCase()) || p.id === scan.scanned_by);
+      if (match) return match.name;
+    }
+    if (selectedProfile?.name) return selectedProfile.name;
+    if (userProfile?.full_name) return userProfile.full_name;
+    return raw ? raw.split('@')[0] : 'Auditor';
+  }, [userProfile, selectedProfile, profiles]);
 
   const fetchSupplierPartNumbers = useCallback(async () => {
     setSupplierPartNumbersLoading(true);
@@ -1692,6 +1181,11 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
   }, []);
 
   const deleteUnrecognizedScan = async (id) => {
+      if (isTrainingMode) {
+          trainingManager.removeUnrecognizedScan(id);
+          setUnrecognizedScans(trainingManager.getUnrecognizedScans());
+          return;
+      }
       try {
           const { error } = await supabase.from('unrecognized_scans').delete().eq('id', id);
           if (!error) {
@@ -2132,6 +1626,12 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
             const itemTypeDetails = items.length > 0 ? itemTypes.find(it => it.name === items[0].name) : (matchedItemType || null);
             
             if (items.length === 0) {
+                if (!isAdminProfile) {
+                    logUnrecognizedBarcode(decodedText);
+                    triggerScanFeedback('error');
+                    addToast(`Unrecognised barcode: ${decodedText}. Logged for admin review.`, 'error', decodedText);
+                    return;
+                }
                 const defaultItemType = matchedItemType?.name || '';
                 setNewScannedItemDetails({ 
                     barcode: partLookup ? (matchedItemType?.barcode || decodedText) : decodedText, 
@@ -2477,6 +1977,12 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                 setScannedItem(items[0]);
                 setAssignment({ location: items[0].location, team: items[0].assigned_to });
             } else {
+                if (!isAdminProfile) {
+                    logUnrecognizedBarcode(decodedText);
+                    triggerScanFeedback('error');
+                    addToast(`Unrecognised barcode: ${decodedText}. Logged for admin review.`, 'error', decodedText);
+                    return;
+                }
                 const defaultItemType = matchedItemType?.name || '';
                 setNewScannedItemDetails({ 
                     barcode: partLookup ? (matchedItemType?.barcode || decodedText) : decodedText, 
@@ -2497,7 +2003,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
         setError(`Failed to process scan: ${e.message}`);
         handleSetView(View.LIST);
     }
-  }, [getStockItemsByBarcode, handleSetView, scanMode, itemTypes, itemTypeBarcodesMap, partNumberLookupMap, teamBarcodeLookup, assignmentContext, returnContext, selectedProfile, playBeep, triggerScanFeedback, addToast, setStock, updateStockItemAssignment, logUnrecognizedBarcode, activeLocation, displayLocations]);
+  }, [getStockItemsByBarcode, handleSetView, scanMode, itemTypes, itemTypeBarcodesMap, partNumberLookupMap, teamBarcodeLookup, assignmentContext, returnContext, selectedProfile, isAdminProfile, playBeep, triggerScanFeedback, addToast, setStock, updateStockItemAssignment, logUnrecognizedBarcode, activeLocation, displayLocations]);
   
   const handleScanError = useCallback((err) => {
     handleSetView(View.LIST);
@@ -2660,9 +2166,10 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
             throw new Error("Please select an item type from the dropdown.");
         }
 
-        let itemsToAdd = [];
+        const isMeterCategory = (selectedItemType?.category || '').toLowerCase() === 'meters' || selectedItemType?.category === StockCategory.METERS;
+        const isTypeUnique = Boolean(selectedItemType?.is_unique || isMeterCategory);
 
-        if (selectedItemType.is_unique) {
+        if (isTypeUnique) {
             const barcodes = serialsProcessingResult.serials; 
             const currentProcessingError = serialsProcessingResult.error;
 
@@ -2699,6 +2206,19 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                 throw new Error("Please enter a valid quantity.");
             }
 
+            // Ensure this barcode isn't already assigned to a unique item or meter in stock
+            const existingBarcodes = await getExistingBarcodes([barcode.trim()]);
+            if (existingBarcodes.size > 0) {
+                const existingMatches = stock.filter(s => s.barcode === barcode.trim());
+                const isExistingMeterOrUnique = existingMatches.some(s => {
+                    const matchType = itemTypes.find(it => it.name === s.name);
+                    return Boolean(matchType?.is_unique || (matchType?.category || '').toLowerCase() === 'meters');
+                });
+                if (isExistingMeterOrUnique) {
+                    throw new Error(`The serial number / barcode "${barcode.trim()}" is already assigned to an existing unique meter in stock. Duplicate unique serial numbers cannot be added.`);
+                }
+            }
+
             const itemLocation = newItem.location || (dashboardFilters.location !== 'All' ? dashboardFilters.location : (displayLocations[0] || Location.LEADING_STORES));
             itemsToAdd = Array.from({ length: quantity }, () => ({
                 name,
@@ -2723,7 +2243,8 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
 
   const scannedSerialsProcessingResult = useMemo(() => {
     const selectedItemType = itemTypes.find(it => it.name === newScannedItemDetails.name);
-    if (selectedItemType?.category !== StockCategory.METERS) {
+    const isMeter = (selectedItemType?.category || '').toLowerCase() === 'meters' || selectedItemType?.category === StockCategory.METERS;
+    if (!isMeter) {
         return { serials: [], error: null };
     }
     
@@ -2758,22 +2279,21 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
     setIsSubmitting(true);
     try {
         const selectedItemType = itemTypes.find(it => it.name === newScannedItemDetails.name);
-        const isMeterType = selectedItemType?.category === StockCategory.METERS;
+        const isMeterCategory = (selectedItemType?.category || '').toLowerCase() === 'meters' || selectedItemType?.category === StockCategory.METERS;
+        const isTypeUnique = Boolean(selectedItemType?.is_unique || isMeterCategory);
         
         let itemsToAdd = [];
         let successCount = 0;
 
-        if (isMeterType) {
+        if (isMeterCategory && newScannedItemDetails.firstSerial && newScannedItemDetails.lastSerial) {
             const { serials, error: processingError } = scannedSerialsProcessingResult;
             if (processingError) throw new Error(processingError);
             if (serials.length === 0) throw new Error("Please provide a valid serial number range.");
             
-            if (selectedItemType?.is_unique) {
-                const existingBarcodes = await getExistingBarcodes(serials);
-                if (existingBarcodes.size > 0) {
-                    const duplicates = Array.from(existingBarcodes);
-                    throw new Error(`The following serial numbers already exist: ${duplicates.slice(0, 5).join(', ')}${duplicates.length > 5 ? '...' : ''}. No items were added.`);
-                }
+            const existingBarcodes = await getExistingBarcodes(serials);
+            if (existingBarcodes.size > 0) {
+                const duplicates = Array.from(existingBarcodes);
+                throw new Error(`The following serial numbers already exist: ${duplicates.slice(0, 5).join(', ')}${duplicates.length > 5 ? '...' : ''}. No items were added.`);
             }
 
             const targetLocation = newScannedItemDetails.location || (dashboardFilters.location !== 'All' ? dashboardFilters.location : (displayLocations[0] || Location.LEADING_STORES));
@@ -2791,13 +2311,25 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
             if (isNaN(quantity) || quantity < 1) {
                 throw new Error("Please enter a valid quantity.");
             }
-            if (selectedItemType?.is_unique) {
+            if (isTypeUnique) {
                 if (quantity > 1) {
                     throw new Error("Cannot add multiple unique items with the same serial number.");
                 }
-                const existing = await getStockItemsByBarcode(newScannedItemDetails.barcode);
-                if (existing.length > 0) {
-                    throw new Error(`An item with serial number "${newScannedItemDetails.barcode}" already exists.`);
+                const existing = await getExistingBarcodes([newScannedItemDetails.barcode.trim()]);
+                if (existing.size > 0) {
+                    throw new Error(`An item with serial number "${newScannedItemDetails.barcode.trim()}" already exists in stock.`);
+                }
+            } else {
+                const existingBarcodes = await getExistingBarcodes([newScannedItemDetails.barcode.trim()]);
+                if (existingBarcodes.size > 0) {
+                    const existingMatches = stock.filter(s => s.barcode === newScannedItemDetails.barcode.trim());
+                    const isExistingMeterOrUnique = existingMatches.some(s => {
+                        const matchType = itemTypes.find(it => it.name === s.name);
+                        return Boolean(matchType?.is_unique || (matchType?.category || '').toLowerCase() === 'meters');
+                    });
+                    if (isExistingMeterOrUnique) {
+                        throw new Error(`The serial number / barcode "${newScannedItemDetails.barcode.trim()}" is already assigned to a unique meter in stock.`);
+                    }
                 }
             }
             const targetLocation = newScannedItemDetails.location || (dashboardFilters.location !== 'All' ? dashboardFilters.location : (displayLocations[0] || Location.LEADING_STORES));
@@ -2919,13 +2451,17 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
 
       // 2. Insert alert record into unrecognised scans / discrepancies table
       const discrepancyMessage = `Stock Discrepancy: ${numToAssign}x "${itemName}" signed out to ${team} (${availableCount} available at ${location}, excess: ${excessQty}). Recommended Action: Conduct Stock Take.`;
-      const { error: logError } = await supabase.from('unrecognized_scans').insert({
-        barcode: discrepancyMessage,
-        scanned_by: user?.id || null,
-        profile_name: selectedProfile?.name || 'Unknown'
-      });
-      if (logError) {
-        console.error("Failed to log discrepancy into unrecognized_scans:", logError);
+      if (isTrainingMode) {
+        trainingManager.logUnrecognizedScan(discrepancyMessage, selectedProfile?.name || 'Trainee');
+      } else {
+        const { error: logError } = await supabase.from('unrecognized_scans').insert({
+          barcode: discrepancyMessage,
+          scanned_by: user?.id || null,
+          profile_name: selectedProfile?.name || 'Unknown'
+        });
+        if (logError) {
+          console.error("Failed to log discrepancy into unrecognized_scans:", logError);
+        }
       }
 
       await refetchStock();
@@ -2997,11 +2533,15 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
       }
 
       for (const msg of discrepancies) {
-        await supabase.from('unrecognized_scans').insert({
-          barcode: msg,
-          scanned_by: user?.id || null,
-          profile_name: profileName
-        });
+        if (isTrainingMode) {
+          trainingManager.logUnrecognizedScan(msg, profileName);
+        } else {
+          await supabase.from('unrecognized_scans').insert({
+            barcode: msg,
+            scanned_by: user?.id || null,
+            profile_name: profileName
+          });
+        }
       }
 
       await refetchStock();
@@ -4470,10 +4010,12 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
       [View.LIST]: { title: `Hi, ${selectedProfile?.name}` },
       [View.ADD_ITEM]: { title: 'Add New Stock' },
       [View.SCAN]: { title: 'Scan Serial Number' },
+      [View.STOCK_TAKE]: { title: 'Stock Take' },
       [View.ADMIN]: { title: 'Admin' },
       [View.ASSIGNMENTS]: { title: 'Log' },
       [View.REPORTING]: { title: 'Inventory Reports' },
       [View.PURCHASING]: { title: 'Purchase Orders' },
+      [View.SETTINGS]: { title: 'Settings' },
   }), [selectedProfile]);
 
   const AddItemsPreview = () => (
@@ -4513,7 +4055,9 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
     if (!selectedItemType) {
         return { isAddFormInvalid: true, addFormButtonText: 'Add Item(s)' };
     }
-    if (selectedItemType.is_unique) {
+    const isMeterCat = (selectedItemType?.category || '').toLowerCase() === 'meters' || selectedItemType?.category === StockCategory.METERS;
+    const isTypeUnique = Boolean(selectedItemType?.is_unique || isMeterCat);
+    if (isTypeUnique) {
         const invalid = !!addItemsError || processedSerials.length === 0;
         const text = processedSerials.length > 0 ? `Add ${processedSerials.length} Item(s)` : 'Add Item(s)';
         return { isAddFormInvalid: invalid, addFormButtonText: text };
@@ -4539,100 +4083,151 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
               <span className="ml-3 font-semibold text-lg text-zinc-900 dark:text-white">Bregan MainsFlow</span>
           </div>
 
-          {/* Dedicated Storehouse Location Switcher */}
-          <div className="p-3 border-b border-zinc-200 dark:border-zinc-700 bg-zinc-50/70 dark:bg-zinc-800/60">
-            <label htmlFor="sidebar-location-select" className="block text-[11px] font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400 mb-1.5 flex items-center gap-1.5">
-              <BuildingStoreIcon className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
-              <span>Current Storehouse</span>
-            </label>
-            <select
-              id="sidebar-location-select"
-              value={activeLocation}
-              onChange={(e) => handleSelectActiveLocation(e.target.value)}
-              className="w-full text-xs font-semibold bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-600 rounded-md py-1.5 px-2 text-zinc-800 dark:text-zinc-100 focus:outline-none focus:ring-1 focus:ring-blue-500 cursor-pointer shadow-sm"
-              title="Select storehouse location to filter stock view and actions"
-            >
-              <option value="All">All Locations (Company-Wide)</option>
-              {displayLocations.map(loc => (
-                <option key={loc} value={loc}>{loc}</option>
-              ))}
-            </select>
-            {activeLocation !== 'All' && (
-              <p className="mt-1 text-[10px] text-blue-600 dark:text-blue-400 font-medium truncate">
-                Scoped to: {activeLocation}
-              </p>
-            )}
+          {/* Scanner HID Connection Status Indicator */}
+          <div className="px-3 py-2 border-b border-zinc-200 dark:border-zinc-700 bg-zinc-50/60 dark:bg-zinc-800/50 flex justify-start">
+              <ScannerStatusIndicator />
           </div>
+
+          {/* Dedicated Storehouse Location Switcher */}
+          {currentView !== View.REPORTING && (
+            <div className="p-3 border-b border-zinc-200 dark:border-zinc-700 bg-zinc-50/70 dark:bg-zinc-800/60">
+              <label htmlFor="sidebar-location-select" className="block text-[11px] font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400 mb-1.5 flex items-center gap-1.5">
+                <BuildingStoreIcon className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+                <span>Current Storehouse</span>
+              </label>
+              <select
+                id="sidebar-location-select"
+                value={activeLocation}
+                onChange={(e) => handleSelectActiveLocation(e.target.value)}
+                className="w-full text-xs font-semibold bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-600 rounded-md py-1.5 px-2 text-zinc-800 dark:text-zinc-100 focus:outline-none focus:ring-1 focus:ring-blue-500 cursor-pointer shadow-sm"
+                title="Select storehouse location to filter stock view and actions"
+              >
+                <option value="All">All Locations (Company-Wide)</option>
+                {displayLocations.map(loc => (
+                  <option key={loc} value={loc}>{loc}</option>
+                ))}
+              </select>
+              {activeLocation !== 'All' && (
+                <p className="mt-1 text-[10px] text-blue-600 dark:text-blue-400 font-medium truncate">
+                  Scoped to: {activeLocation}
+                </p>
+              )}
+            </div>
+          )}
 
           <nav className="flex-1 p-4 space-y-1.5 overflow-y-auto">
               <SidebarNavItem icon={<ListIcon />} label="Dashboard" isActive={currentView === View.LIST} onClick={() => navigateTo(View.LIST)} />
               {isAdminProfile && (
-                <SidebarNavItem icon={<ArchiveIcon />} label="Log" isActive={currentView === View.ASSIGNMENTS} onClick={() => navigateTo(View.ASSIGNMENTS)} />
+                <SidebarNavItem icon={<ChartBarIcon />} label="Reports" isActive={currentView === View.REPORTING} onClick={() => navigateTo(View.REPORTING)} />
               )}
               <SidebarNavItem icon={<ScanIcon />} label="Scan / Action" isActive={currentView === View.SCAN || currentView === View.ADD_ITEM} onClick={() => setIsScanModeModalOpen(true)} />
+              <SidebarNavItem icon={<ClipboardCheckIcon />} label="Stock Take" isActive={currentView === View.STOCK_TAKE} onClick={() => navigateTo(View.STOCK_TAKE)} />
               {isAdminProfile && (
                 <>
                   <SidebarNavItem icon={<PurchasingIcon />} label="Purchasing" isActive={currentView === View.PURCHASING} onClick={() => navigateTo(View.PURCHASING)} />
-                  <SidebarNavItem icon={<ChartBarIcon />} label="Reporting" isActive={currentView === View.REPORTING} onClick={() => navigateTo(View.REPORTING)} />
-                  <SidebarNavItem icon={<ClipboardCheckIcon />} label="Stock Take" isActive={currentView === View.STOCK_TAKE} onClick={() => navigateTo(View.STOCK_TAKE)} />
                   <SidebarNavItem icon={<AdminIcon />} label="Admin Panel" isActive={currentView === View.ADMIN} onClick={handleAdminClick} />
                 </>
               )}
+              <SidebarNavItem icon={<SettingsIcon />} label="Settings" isActive={currentView === View.SETTINGS} onClick={() => navigateTo(View.SETTINGS)} />
           </nav>
-          <div className="p-4 border-t border-zinc-200 dark:border-zinc-700">
-              <div className="flex items-center">
-                  <div className="flex-1 min-w-0">
-                      <p className="text-sm font-semibold truncate text-zinc-900 dark:text-zinc-100">{selectedProfile?.name}</p>
-                      <p className="text-xs text-zinc-500 dark:text-zinc-400 truncate">{userProfile?.email}</p>
+          <div className="p-4 border-t border-zinc-200 dark:border-zinc-700 flex-shrink-0">
+              <div className="flex items-center gap-3 min-w-0 mb-3">
+                  <div className="w-9 h-9 rounded-full bg-blue-100 dark:bg-blue-950 text-blue-700 dark:text-blue-300 flex items-center justify-center font-bold text-sm shrink-0 border border-blue-200 dark:border-blue-800">
+                      {selectedProfile?.name ? selectedProfile.name.charAt(0).toUpperCase() : 'U'}
                   </div>
-                  <button onClick={onSwitchProfile} className="p-2 ml-2 rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-700 transition-colors" aria-label="Switch Profile" title="Switch Profile">
-                    <SwitchUserIcon className="w-5 h-5"/>
+                  <div className="flex-1 min-w-0">
+                      <p className="text-sm font-semibold truncate text-zinc-900 dark:text-zinc-100 leading-snug" title={selectedProfile?.name}>{selectedProfile?.name}</p>
+                      <p className="text-xs text-zinc-500 dark:text-zinc-400 truncate leading-snug" title={userProfile?.email}>{userProfile?.email}</p>
+                  </div>
+              </div>
+              <div className="flex items-center justify-between border-t border-zinc-200/80 dark:border-zinc-700/80 pt-2.5">
+                  <button onClick={onSwitchProfile} className="p-1.5 rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-700 text-zinc-600 dark:text-zinc-300 transition-colors" aria-label="Switch Profile" title="Switch Profile">
+                    <SwitchUserIcon className="w-4 h-4"/>
                   </button>
                   {syncQueue && syncQueue.length > 0 && (
-      <button onClick={() => setIsQueueModalOpen(true)} className="p-2 rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-700 transition-colors relative" aria-label="Upload Queue" title="Upload Queue">
-        <UploadIcon className="w-5 h-5 text-amber-500" />
-        <span className="absolute top-0 right-0 inline-flex items-center justify-center px-1.5 py-0.5 text-[10px] font-bold leading-none text-white transform translate-x-1/4 -translate-y-1/4 bg-red-600 rounded-full">{syncQueue.length}</span>
-      </button>
-  )}
+                      <button onClick={() => setIsQueueModalOpen(true)} className="p-1.5 rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-700 transition-colors relative" aria-label="Upload Queue" title="Upload Queue">
+                        <UploadIcon className="w-4 h-4 text-amber-500" />
+                        <span className="absolute top-0 right-0 inline-flex items-center justify-center px-1 py-0.5 text-[9px] font-bold leading-none text-white transform translate-x-1/3 -translate-y-1/3 bg-red-600 rounded-full">{syncQueue.length}</span>
+                      </button>
+                  )}
                   {isAdminProfile && (
-                      <button onClick={() => setIsUnrecognizedModalOpen(true)} className="p-2 rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-700 transition-colors relative" aria-label="Notifications" title="Notifications">
-                          <BellIcon className="w-5 h-5 text-zinc-500" />
+                      <button onClick={() => setIsUnrecognizedModalOpen(true)} className="p-1.5 rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-700 transition-colors relative" aria-label="Notifications" title="Notifications">
+                          <BellIcon className="w-4 h-4 text-zinc-600 dark:text-zinc-300" />
                           {unrecognizedScans.length > 0 && (
-                              <span className="absolute top-0 right-0 inline-flex items-center justify-center px-1.5 py-0.5 text-[10px] font-bold leading-none text-white transform translate-x-1/4 -translate-y-1/4 bg-red-600 rounded-full">{unrecognizedScans.length}</span>
+                              <span className="absolute top-0 right-0 inline-flex items-center justify-center px-1.5 py-0.5 text-[9px] font-bold leading-none text-white transform translate-x-1/3 -translate-y-1/3 bg-red-600 rounded-full">{unrecognizedScans.length}</span>
                           )}
                       </button>
                   )}
-  <button onClick={() => setIsSettingsModalOpen(true)} className="p-2 rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-700 transition-colors" aria-label="Settings" title="Settings">
-                    <SettingsIcon className="w-5 h-5"/>
+                  <button onClick={() => navigateTo(View.SETTINGS)} className={`p-1.5 rounded-md transition-colors ${currentView === View.SETTINGS ? 'bg-blue-50 text-blue-600 dark:bg-zinc-700 dark:text-blue-400' : 'hover:bg-zinc-100 dark:hover:bg-zinc-700 text-zinc-600 dark:text-zinc-300'}`} aria-label="Settings" title="Settings">
+                    <SettingsIcon className="w-4 h-4"/>
                   </button>
-                  <button onClick={toggleDarkMode} className="p-2 rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-700 transition-colors" aria-label="Toggle Dark Mode" title="Toggle Dark Mode">
-                    {isDarkMode ? <SunIcon className="w-5 h-5"/> : <MoonIcon className="w-5 h-5"/>}
+                  <button onClick={toggleDarkMode} className="p-1.5 rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-700 text-zinc-600 dark:text-zinc-300 transition-colors" aria-label="Toggle Dark Mode" title="Toggle Dark Mode">
+                    {isDarkMode ? <SunIcon className="w-4 h-4"/> : <MoonIcon className="w-4 h-4"/>}
                   </button>
-                  <button onClick={onLogout} className="p-2 rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-700 transition-colors" aria-label="Logout" title="Logout">
-                      <LogoutIcon className="w-5 h-5"/>
+                  <button onClick={onLogout} className="p-1.5 rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-700 text-zinc-600 dark:text-zinc-300 hover:text-red-600 dark:hover:text-red-400 transition-colors" aria-label="Logout" title="Logout">
+                      <LogoutIcon className="w-4 h-4"/>
                   </button>
               </div>
               <div className="mt-2 text-center">
-                  <span className="text-[10px] font-medium text-zinc-400 dark:text-zinc-500 tracking-wider">0.10</span>
+                  <span className="text-[10px] font-medium text-zinc-400 dark:text-zinc-500 tracking-wider">V0.11</span>
               </div>
           </div>
         </aside>
 
         <div className="flex-1 flex flex-col overflow-hidden">
+          {/* Training Sandbox Persistent Banner */}
+          {isTrainingMode && (
+            <div 
+              className="bg-gradient-to-r from-amber-500 via-amber-400 to-amber-500 text-zinc-950 px-4 py-2 shadow-md flex items-center justify-between gap-3 text-xs sm:text-sm font-semibold border-b border-amber-600/30 z-30 flex-shrink-0"
+              style={{
+                paddingTop: Capacitor.isNativePlatform() 
+                  ? 'calc(max(2.5rem, env(safe-area-inset-top, 0px)) + 0.35rem)' 
+                  : '0.5rem',
+                paddingBottom: '0.5rem'
+              }}
+            >
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="w-5 h-5 rounded bg-zinc-950/15 flex items-center justify-center text-sm font-bold shrink-0">🎓</span>
+                <span className="font-extrabold tracking-wide uppercase text-[10px] sm:text-xs bg-zinc-950/15 px-2 py-0.5 rounded">Training Mode</span>
+                <span className="hidden md:inline font-medium text-zinc-900 truncate">
+                  Safe Sandbox: All scans, counts, assignments, and reports are isolated. Zero backend writes.
+                </span>
+                <span className="md:hidden font-medium text-zinc-900 truncate">
+                  Isolated sandbox (zero backend writes)
+                </span>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setIsResetTrainingModalOpen(true)}
+                  className="px-2.5 py-1 text-xs font-semibold rounded bg-zinc-950/10 hover:bg-zinc-950/20 text-zinc-950 transition-colors cursor-pointer"
+                  title="Reset training items back to original sandbox seed"
+                >
+                  Reset Stock
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIsExitTrainingModalOpen(true)}
+                  className="px-3 py-1 text-xs font-bold rounded bg-zinc-950 hover:bg-zinc-800 text-amber-300 transition-colors shadow-xs cursor-pointer flex items-center gap-1"
+                >
+                  <span>Exit Training</span>
+                  <span aria-hidden="true">&times;</span>
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* --- HEADER (Mobile) --- */}
           <header 
             className="bg-white dark:bg-zinc-800 shadow-sm text-zinc-900 dark:text-white p-4 flex items-center justify-between md:hidden border-b border-zinc-200 dark:border-zinc-700"
-            style={{ paddingTop: Capacitor.isNativePlatform() ? 'calc(1rem + env(safe-area-inset-top, 0px))' : '1rem' }}
+            style={{ paddingTop: (Capacitor.isNativePlatform() && !isTrainingMode) ? 'calc(1rem + env(safe-area-inset-top, 0px))' : '1rem' }}
           >
-              <div className="flex items-center space-x-3">
-                  {currentView === View.LIST || currentView === View.ASSIGNMENTS ? (
-                    <BrandIcon className="w-8 h-8 text-blue-600" />
-                  ) : (
-                    <div className="w-8 h-8" /> // Placeholder for alignment
-                  )}
-                  <h1 className="text-xl font-bold tracking-tight">{headerTitle}</h1>
+              <div className="flex items-center space-x-3 min-w-0">
+                  <BrandIcon className="w-8 h-8 text-blue-600 shrink-0" />
+                  <h1 className="text-xl font-bold tracking-tight truncate">{headerTitle}</h1>
               </div>
-              <div className="flex items-center">
+              <div className="flex items-center space-x-2 shrink-0">
+                 <ScannerStatusIndicator compact={true} />
                  {isAdminProfile && (
                      <button onClick={() => setIsUnrecognizedModalOpen(true)} className="p-2 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-700 transition-colors relative mr-1" aria-label="Notifications" title="Notifications">
                         <BellIcon className="w-6 h-6" />
@@ -4651,23 +4246,25 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
           </header>
 
           {/* Mobile Storehouse Location Bar */}
-          <div className="md:hidden bg-zinc-50 dark:bg-zinc-800/90 border-b border-zinc-200 dark:border-zinc-700 px-3 py-1.5 flex items-center justify-between gap-2 shadow-xs flex-shrink-0">
-            <div className="flex items-center gap-1.5 text-xs font-medium text-zinc-600 dark:text-zinc-400 min-w-0">
-              <BuildingStoreIcon className="w-4 h-4 text-blue-600 dark:text-blue-400 flex-shrink-0" />
-              <span className="truncate">Storehouse:</span>
+          {currentView !== View.REPORTING && (
+            <div className="md:hidden bg-zinc-50 dark:bg-zinc-800/90 border-b border-zinc-200 dark:border-zinc-700 px-3 py-1.5 flex items-center justify-between gap-2 shadow-xs flex-shrink-0">
+              <div className="flex items-center gap-1.5 text-xs font-medium text-zinc-600 dark:text-zinc-400 min-w-0">
+                <BuildingStoreIcon className="w-4 h-4 text-blue-600 dark:text-blue-400 flex-shrink-0" />
+                <span className="truncate">Storehouse:</span>
+              </div>
+              <select
+                aria-label="Select Storehouse"
+                value={activeLocation}
+                onChange={(e) => handleSelectActiveLocation(e.target.value)}
+                className="text-xs font-semibold bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-600 rounded px-2 py-1 text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-1 focus:ring-blue-500 max-w-[210px] truncate"
+              >
+                <option value="All">All Locations (Company-Wide)</option>
+                {displayLocations.map(loc => (
+                  <option key={loc} value={loc}>{loc}</option>
+                ))}
+              </select>
             </div>
-            <select
-              aria-label="Select Storehouse"
-              value={activeLocation}
-              onChange={(e) => handleSelectActiveLocation(e.target.value)}
-              className="text-xs font-semibold bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-600 rounded px-2 py-1 text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-1 focus:ring-blue-500 max-w-[210px] truncate"
-            >
-              <option value="All">All Locations (Company-Wide)</option>
-              {displayLocations.map(loc => (
-                <option key={loc} value={loc}>{loc}</option>
-              ))}
-            </select>
-          </div>
+          )}
 
           {/* --- Toast Notifications Container --- */}
           <div aria-live="assertive" className="fixed inset-0 flex items-start px-4 py-6 pointer-events-none sm:p-6 sm:items-start z-[10001] toast-notifications-container">
@@ -5819,7 +5416,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                       </Page>
                     )}
 
-                    {currentView === View.STOCK_TAKE && isAdminProfile && (
+                    {currentView === View.STOCK_TAKE && (
                        <StockTakePage 
                            stock={stock} 
                            setStock={setStock} 
@@ -5830,6 +5427,10 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                            itemTypes={itemTypes}
                            supplierPartNumbers={supplierPartNumbers}
                            refetchStock={refetchStock}
+                           userProfile={userProfile}
+                           selectedProfile={selectedProfile}
+                           profiles={profiles}
+                           isTrainingMode={isTrainingMode}
                        />
                     )}
 
@@ -6295,8 +5896,15 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                           setLoading={setReportLoading}
                           itemTypes={itemTypes}
                           stock={stock}
+                          supplierPartNumbers={supplierPartNumbers}
+                          partNumberLookupMap={partNumberLookupMap}
+                          suppliers={suppliers}
+                          userProfile={userProfile}
+                          selectedProfile={selectedProfile}
+                          profiles={profiles}
                           setError={setError}
                           setIsPrintInfoModalOpen={setIsPrintInfoModalOpen}
+                          isTrainingMode={isTrainingMode}
                        />
                      )}
                      {currentView === View.PURCHASING && isAdminProfile && (
@@ -6312,21 +5920,49 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                           groupedItemTypes={groupedItemTypes}
                        />
                      )}
+                     {currentView === View.SETTINGS && (
+                       <SettingsView
+                         userProfile={userProfile}
+                         selectedProfile={selectedProfile}
+                         isDarkMode={isDarkMode}
+                         toggleDarkMode={toggleDarkMode}
+                         isBeepEnabled={isBeepEnabled}
+                         setIsBeepEnabled={setIsBeepEnabled}
+                         scannerPreference={scannerPreference}
+                         setScannerPreference={setScannerPreference}
+                         isAdminProfile={isAdminProfile}
+                         handleAdminClick={handleAdminClick}
+                         setPinChangeError={setPinChangeError}
+                         setPinChangeData={setPinChangeData}
+                         setIsChangePinModalOpen={setIsChangePinModalOpen}
+                         isDevMode={isDevMode}
+                         setIsDevMode={setIsDevMode}
+                         setIsDevLoginModalOpen={setIsDevLoginModalOpen}
+                         setIsDevPurgeModalOpen={setIsDevPurgeModalOpen}
+                         isTrainingMode={isTrainingMode}
+                         setIsResetTrainingModalOpen={setIsResetTrainingModalOpen}
+                         setIsExitTrainingModalOpen={setIsExitTrainingModalOpen}
+                         onEnterTrainingMode={onEnterTrainingMode}
+                       />
+                     )}
                 </div>
                 )}
           </main>
         </div>
 
         <footer 
-            className="fixed bottom-0 left-0 right-0 bg-white dark:bg-zinc-800 shadow-top pt-2 px-2 md:hidden border-t border-zinc-200 dark:border-zinc-700" 
+            className="fixed bottom-0 left-0 right-0 bg-white dark:bg-zinc-800 shadow-top pt-2 px-1 sm:px-2 md:hidden border-t border-zinc-200 dark:border-zinc-700 z-50" 
             style={{ paddingBottom: Capacitor.isNativePlatform() ? 'calc(0.75rem + env(safe-area-inset-bottom, 0px))' : 'env(safe-area-inset-bottom, 0.5rem)' }}
         >
             <nav className="flex">
                 <MobileNavItem icon={<ListIcon/>} label="Stock" isActive={currentView === View.LIST} onClick={() => navigateTo(View.LIST)} />
                 {isAdminProfile && (
-                  <MobileNavItem icon={<ArchiveIcon/>} label="Log" isActive={currentView === View.ASSIGNMENTS} onClick={() => navigateTo(View.ASSIGNMENTS)} />
+                  <MobileNavItem icon={<ChartBarIcon/>} label="Reports" isActive={currentView === View.REPORTING} onClick={() => navigateTo(View.REPORTING)} />
                 )}
                 <MobileNavItem icon={<ScanIcon/>} label="Scan" isActive={currentView === View.SCAN || currentView === View.ADD_ITEM} onClick={() => setIsScanModeModalOpen(true)} />
+                {showStockTakeInMobileNav && (
+                  <MobileNavItem icon={<ClipboardCheckIcon/>} label="Stock Take" isActive={currentView === View.STOCK_TAKE} onClick={() => navigateTo(View.STOCK_TAKE)} />
+                )}
                 
                 {isAdminProfile && (
                   <MobileNavItem icon={<AdminIcon/>} label="Admin" isActive={[View.ADMIN, View.PURCHASING, View.REPORTING].includes(currentView)} onClick={handleAdminClick} />
@@ -6334,7 +5970,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                 {syncQueue && syncQueue.length > 0 && (
       <MobileNavItem icon={<div className="relative"><UploadIcon/><span className="absolute -top-1 -right-2 inline-flex items-center justify-center px-1.5 py-0.5 text-[10px] font-bold leading-none text-white bg-red-600 rounded-full">{syncQueue.length}</span></div>} label="Sync Queue" isActive={isQueueModalOpen} onClick={() => setIsQueueModalOpen(true)} />
   )}
-  <MobileNavItem icon={<SettingsIcon/>} label="Settings" isActive={isSettingsModalOpen} onClick={() => setIsSettingsModalOpen(true)} />
+                <MobileNavItem icon={<SettingsIcon/>} label="Settings" isActive={currentView === View.SETTINGS} onClick={() => navigateTo(View.SETTINGS)} />
             </nav>
         </footer>
       </div>
@@ -6617,6 +6253,19 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                   <AddIcon className="w-10 h-10 text-green-600 dark:text-green-400 mb-2" />
                   <p className="font-semibold text-zinc-800 dark:text-zinc-100">Add Manually</p>
                   <p className="text-xs text-zinc-500 dark:text-zinc-400">Enter item details without scanning.</p>
+              </button>
+              <button
+                  onClick={() => { setIsScanModeModalOpen(false); navigateTo(View.STOCK_TAKE); }}
+                  className="col-span-2 flex items-center justify-between p-3.5 bg-white dark:bg-zinc-700/50 border border-zinc-200 dark:border-zinc-700 rounded-lg hover:bg-emerald-50 dark:hover:bg-emerald-900/20 hover:border-emerald-400 dark:hover:border-emerald-600 transition-all text-left"
+              >
+                  <div className="flex items-center gap-3">
+                      <ClipboardCheckIcon className="w-8 h-8 text-emerald-600 dark:text-emerald-400 flex-shrink-0" />
+                      <div>
+                          <p className="font-semibold text-sm text-zinc-800 dark:text-zinc-100">Stock Take</p>
+                          <p className="text-xs text-zinc-500 dark:text-zinc-400">Perform full or rolling stock counts and manage historical reports.</p>
+                      </div>
+                  </div>
+                  <span className="text-xs font-semibold text-emerald-600 dark:text-emerald-400 bg-emerald-100 dark:bg-emerald-950/60 px-2.5 py-1 rounded">Open &rarr;</span>
               </button>
           </div>
       </Modal>
@@ -8476,159 +8125,82 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
           </button>
         </div>
       </Modal>
-      
-      <Modal isOpen={isSettingsModalOpen} onClose={() => setIsSettingsModalOpen(false)} title="App Settings">
-        <div className="space-y-6">
-           <div>
-              <h3 className="text-lg font-medium text-zinc-900 dark:text-zinc-100 mb-2">Appearance</h3>
-              <div className="flex items-center justify-between p-4 bg-zinc-50 dark:bg-zinc-700/50 rounded-lg">
-                  <label htmlFor="dark-mode-toggle" className="font-medium text-zinc-700 dark:text-zinc-300">Dark Mode</label>
-                   <button
-                    id="dark-mode-toggle"
-                    onClick={toggleDarkMode}
-                    className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 dark:focus:ring-offset-zinc-800 ${
-                        isDarkMode ? 'bg-blue-600' : 'bg-zinc-200'
-                    }`}
-                  >
-                    <span
-                      aria-hidden="true"
-                      className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
-                        isDarkMode ? 'translate-x-5' : 'translate-x-0'
-                      }`}
-                    />
-                  </button>
-              </div>
-           </div>
-           <div>
-              <h3 className="text-lg font-medium text-zinc-900 dark:text-zinc-100 mb-2">Scanner</h3>
-              <div className="p-4 bg-zinc-50 dark:bg-zinc-700/50 rounded-lg space-y-4">
-                  <div className="flex items-center justify-between">
-                     <label htmlFor="beep-toggle" className="font-medium text-zinc-700 dark:text-zinc-300">Audible Beep on Scan</label>
-                      <button
-                        id="beep-toggle"
-                        onClick={() => setIsBeepEnabled(!isBeepEnabled)}
-                        className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 dark:focus:ring-offset-zinc-800 ${
-                            isBeepEnabled ? 'bg-blue-600' : 'bg-zinc-200'
-                        }`}
-                      >
-                        <span className="sr-only">Enable beep</span>
-                        <span
-                          className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
-                            isBeepEnabled ? 'translate-x-5' : 'translate-x-0'
-                          }`}
-                        />
-                      </button>
-                  </div>
-                  {Capacitor.isNativePlatform() && (
-                    <div className="pt-4 border-t border-zinc-200 dark:border-zinc-600">
-                        <label className="block font-medium text-zinc-700 dark:text-zinc-300">Scanner Type</label>
-                        <p className="text-xs text-zinc-500 dark:text-zinc-400 mb-2">Use the built-in camera or an external handheld scanner.</p>
-                        <div className="flex rounded-md shadow-sm">
-                            <button
-                                type="button"
-                                disabled
-                                className={`relative inline-flex items-center rounded-l-md px-4 py-2 text-sm font-medium border focus:z-10 focus:outline-none focus:ring-1 focus:ring-blue-500 ${scannerPreference === 'camera' ? 'bg-blue-600 text-white border-blue-600' : 'bg-white dark:bg-zinc-800 border-zinc-300 dark:border-zinc-600 text-zinc-700 dark:text-zinc-200 hover:bg-zinc-50 dark:hover:bg-zinc-700'} disabled:opacity-50 disabled:cursor-not-allowed`}
-                            >
-                                Camera
-                            </button>
-                            <button
-                                type="button"
-                                onClick={() => setScannerPreference('external')}
-                                className={`relative -ml-px inline-flex items-center rounded-r-md px-4 py-2 text-sm font-medium border focus:z-10 focus:outline-none focus:ring-1 focus:ring-blue-500 ${scannerPreference === 'external' ? 'bg-blue-600 text-white border-blue-600' : 'bg-white dark:bg-zinc-800 border-zinc-300 dark:border-zinc-600 text-zinc-700 dark:text-zinc-200 hover:bg-zinc-50 dark:hover:bg-zinc-700'}`}
-                            >
-                                External
-                            </button>
-                        </div>
-                    </div>
-                  )}
-              </div>
-           </div>
-           <div>
-              <h3 className="text-lg font-medium text-zinc-900 dark:text-zinc-100 mb-2">Security</h3>
-              <div className="p-4 bg-zinc-50 dark:bg-zinc-700/50 rounded-lg">
-                  <button 
-                      onClick={() => {
-                          setIsSettingsModalOpen(false);
-                          setPinChangeError('');
-                          setPinChangeData({ currentPin: '', newPin: '', confirmNewPin: '' });
-                          setIsChangePinModalOpen(true);
-                      }}
-                      className="w-full text-left font-medium text-zinc-700 dark:text-zinc-300"
-                  >
-                      <div className="flex justify-between items-center">
-                          <span>Change Your PIN</span>
-                          <span className="text-blue-600 dark:text-blue-400 text-sm font-semibold">Edit &rarr;</span>
-                      </div>
-                  </button>
-              </div>
-            </div>
-            {isAdminProfile && (
-               <div>
-                  <h3 className="text-lg font-medium text-zinc-900 dark:text-zinc-100 mb-2">System Administration</h3>
-                  <div className="p-4 bg-zinc-50 dark:bg-zinc-700/50 rounded-lg">
-                      <button 
-                          onClick={() => {
-                              setIsSettingsModalOpen(false);
-                              handleAdminClick();
-                          }}
-                          className="w-full text-left font-medium text-zinc-700 dark:text-zinc-300"
-                      >
-                          <div className="flex justify-between items-center">
-                              <span>Go to Admin Panel</span>
-                              <span className="text-blue-600 dark:text-blue-400 text-sm font-semibold">Manage &rarr;</span>
-                          </div>
-                      </button>
-                  </div>
-                </div>
-            )}
-            
-            
-            {isAdminProfile && (
-               <div>
-                  <h3 className="text-lg font-medium text-zinc-900 dark:text-zinc-100 mb-2">Developer Tools</h3>
-                  <div className="p-4 bg-zinc-50 dark:bg-zinc-700/50 rounded-lg">
-                      {!isDevMode ? (
-                          <button 
-                              onClick={() => {
-                                  setIsSettingsModalOpen(false);
-                                  setIsDevLoginModalOpen(true);
-                              }}
-                              className="w-full text-left font-medium text-zinc-700 dark:text-zinc-300"
-                          >
-                              <div className="flex justify-between items-center">
-                                  <span>Enable Developer Mode</span>
-                                  <span className="text-blue-600 dark:text-blue-400 text-sm font-semibold">Unlock &rarr;</span>
-                              </div>
-                          </button>
-                      ) : (
-                          <div className="space-y-3">
-                              <div className="flex items-center justify-between">
-                                  <span className="text-green-600 dark:text-green-400 font-bold text-sm uppercase tracking-wider">Dev Mode Active</span>
-                                  <button onClick={() => setIsDevMode(false)} className="text-xs text-red-600 hover:underline">Disable</button>
-                              </div>
-                              <button 
-                                  onClick={() => {
-                                      setIsSettingsModalOpen(false);
-                                      setIsDevPurgeModalOpen(true);
-                                  }}
-                                  className="w-full text-left font-medium text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 p-3 rounded-md border border-red-200 dark:border-red-800/30"
-                              >
-                                  <div className="flex justify-between items-center">
-                                      <span>Purge Barcode Items</span>
-                                      <span className="text-sm font-semibold">&rarr;</span>
-                                  </div>
-                              </button>
-                          </div>
-                      )}
-                  </div>
-                </div>
-            )}
 
-                        <div className="pt-6 mt-6 border-t border-zinc-200 dark:border-zinc-700 flex justify-center">
-                <span className="px-3 py-1 bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400 text-xs font-mono rounded-full font-medium tracking-wide">
-                    Version v0.10
-                </span>
-            </div>
+      {/* Modal: Exit Training Mode Confirmation */}
+      <Modal 
+        isOpen={isExitTrainingModalOpen} 
+        onClose={() => setIsExitTrainingModalOpen(false)} 
+        title="Exit Training Mode?"
+      >
+        <div className="space-y-4">
+          <div className="p-4 rounded-xl bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800/40 text-amber-900 dark:text-amber-200 text-sm">
+            <p className="font-semibold mb-1 flex items-center gap-2">
+              <span className="text-lg">⚠️</span>
+              <span>All Training Changes Will Be Cleared</span>
+            </p>
+            <p className="text-xs text-amber-800 dark:text-amber-300">
+              Exiting Training Mode completely clears all scanned items, counts, movements, and stock takes created during this training session. Zero data was modified on your live production database.
+            </p>
+          </div>
+          <p className="text-sm text-zinc-600 dark:text-zinc-400">
+            Are you sure you want to exit and return to the profile selector?
+          </p>
+          <div className="flex justify-end gap-3 pt-3 border-t border-zinc-200 dark:border-zinc-700">
+            <button
+              type="button"
+              onClick={() => setIsExitTrainingModalOpen(false)}
+              className="px-4 py-2 rounded-lg text-sm font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setIsExitTrainingModalOpen(false);
+                if (typeof onExitTrainingMode === 'function') {
+                  onExitTrainingMode();
+                }
+              }}
+              className="px-4 py-2 rounded-lg text-sm font-bold bg-amber-500 hover:bg-amber-400 text-zinc-950 transition-colors shadow-sm"
+            >
+              Exit & Clear Training Data
+            </button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Modal: Reset Training Sandbox */}
+      <Modal 
+        isOpen={isResetTrainingModalOpen} 
+        onClose={() => setIsResetTrainingModalOpen(false)} 
+        title="Reset Training Sandbox?"
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-zinc-600 dark:text-zinc-400">
+            This will discard any items you've scanned or edited in this session and restore the clean initial training inventory (sample meters, tools, and pipework).
+          </p>
+          <div className="flex justify-end gap-3 pt-3 border-t border-zinc-200 dark:border-zinc-700">
+            <button
+              type="button"
+              onClick={() => setIsResetTrainingModalOpen(false)}
+              className="px-4 py-2 rounded-lg text-sm font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setIsResetTrainingModalOpen(false);
+                trainingManager.resetTrainingSession();
+                if (typeof refetchStock === 'function') refetchStock();
+                fetchUnrecognizedScans();
+                addToast("Training sandbox restored to initial seed.", "success");
+              }}
+              className="px-4 py-2 rounded-lg text-sm font-bold bg-amber-500 hover:bg-amber-400 text-zinc-950 transition-colors shadow-sm"
+            >
+              Reset Sandbox
+            </button>
+          </div>
         </div>
       </Modal>
 
@@ -8951,7 +8523,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                                                       </span>
                                                       <span className="text-xs text-zinc-500 dark:text-zinc-400">
                                                           {new Date(scan.scanned_at).toLocaleString('en-GB')}
-                                                          {scan.profile_name && ` by ${scan.profile_name}`}
+                                                          {resolveScanProfileName(scan) && ` by ${resolveScanProfileName(scan)}`}
                                                       </span>
                                                   </div>
                                                   <p className="text-xs font-medium text-zinc-800 dark:text-zinc-200 leading-relaxed">
@@ -8995,7 +8567,7 @@ const StockManagerApp = ({ userProfile, selectedProfile, onSwitchProfile, onLogo
                                       <p className="font-mono font-bold text-sm text-zinc-900 dark:text-zinc-100">{scan.barcode}</p>
                                       <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">
                                           Scanned: {new Date(scan.scanned_at).toLocaleString('en-GB')}
-                                          {scan.profile_name && ` by ${scan.profile_name}`}
+                                          {resolveScanProfileName(scan) && ` by ${resolveScanProfileName(scan)}`}
                                       </p>
                                   </div>
                                   <button 

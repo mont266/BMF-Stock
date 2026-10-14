@@ -3,16 +3,56 @@ import StockManagerApp from './components/StockManagerApp';
 import Auth from './components/Auth';
 import { supabase } from './lib/supabaseClient';
 import { BrandIcon } from './components/Icons';
+import AnimatedLogo from './components/AnimatedLogo';
 import { App as CapacitorApp } from '@capacitor/app';
 import ProfileSelection from './components/ProfileSelection';
 import { useInactivityTimeout } from './hooks/useInactivityTimeout';
+import { trainingManager } from './lib/trainingEnvironment';
 
 const App = () => {
     const [session, setSession] = useState(null);
     const [userProfile, setUserProfile] = useState(null);
     const [loading, setLoading] = useState(true);
     const [profileError, setProfileError] = useState(null);
-    const [selectedProfile, setSelectedProfile] = useState(null);
+    const [selectedProfile, setSelectedProfileState] = useState(() => {
+        try {
+            localStorage.removeItem('active_selected_profile');
+            const saved = sessionStorage.getItem('active_selected_profile');
+            return saved ? JSON.parse(saved) : null;
+        } catch (e) {
+            return null;
+        }
+    });
+
+    const setSelectedProfile = useCallback((profileOrUpdater) => {
+        setSelectedProfileState(prev => {
+            const nextProfile = typeof profileOrUpdater === 'function' ? profileOrUpdater(prev) : profileOrUpdater;
+            try {
+                if (nextProfile) {
+                    sessionStorage.setItem('active_selected_profile', JSON.stringify(nextProfile));
+                } else {
+                    sessionStorage.removeItem('active_selected_profile');
+                }
+                localStorage.removeItem('active_selected_profile');
+            } catch (e) {
+                console.warn('Could not persist selectedProfile to sessionStorage:', e);
+            }
+            return nextProfile;
+        });
+    }, []);
+    const [isTrainingMode, setIsTrainingMode] = useState(() => trainingManager.isActive);
+
+    const handleEnterTrainingMode = useCallback((profile = null) => {
+        trainingManager.startTrainingSession();
+        setIsTrainingMode(true);
+        setSelectedProfile(profile || { id: 'training_user', name: 'Training User (Admin)', role: 'Admin' });
+    }, []);
+
+    const handleExitTrainingMode = useCallback(() => {
+        trainingManager.exitTrainingSession();
+        setIsTrainingMode(false);
+        setSelectedProfile(null);
+    }, []);
 
     const fetchUserProfile = useCallback(async (user) => {
         if (!user) {
@@ -24,25 +64,23 @@ const App = () => {
                 .from('users')
                 .select('*')
                 .eq('id', user.id)
-                .single();
+                .maybeSingle();
 
             if (error) {
-                // Throw the error to be caught by the catch block
-                throw error;
+                // If permission denied or infinite recursion, log warning and fallback
+                console.warn("Could not fetch user record from users table:", error.message);
+                if (error.message && error.message.includes('infinite recursion')) {
+                    setProfileError("Database Configuration Error: A security policy on the 'users' table is causing an infinite loop. An administrator must fix the RLS policy.");
+                    return;
+                }
             }
             
-            setUserProfile(data);
-            // Clear any previous errors on a successful fetch
+            setUserProfile(data || { id: user.id, email: user.email, role: 'User' });
             setProfileError(null); 
             
         } catch (e) {
             console.error("Error fetching user profile:", e.message);
-            if (e.message && e.message.includes('infinite recursion')) {
-                setProfileError("Database Configuration Error: A security policy on the 'users' table is causing an infinite loop. An administrator must fix the RLS policy.");
-            } else {
-                setProfileError(`Failed to load user profile: ${e.message}`);
-            }
-            setUserProfile(null);
+            setUserProfile({ id: user.id, email: user.email, role: 'User' });
         }
     }, []);
 
@@ -79,15 +117,34 @@ const App = () => {
         };
     }, [fetchUserProfile]);
 
+    // Ensure training session is cleaned up if app/tab is closed
+    useEffect(() => {
+        const handleUnload = () => {
+            if (trainingManager.isActive) {
+                trainingManager.exitTrainingSession();
+            }
+        };
+        window.addEventListener('beforeunload', handleUnload);
+        return () => window.removeEventListener('beforeunload', handleUnload);
+    }, []);
+
     const handleLogout = async () => {
+        if (isTrainingMode) {
+            trainingManager.exitTrainingSession();
+            setIsTrainingMode(false);
+        }
         const { error } = await supabase.auth.signOut();
         if (error) console.error('Error logging out:', error.message);
         setSelectedProfile(null);
     };
 
     const handleSwitchProfile = useCallback(() => {
+        if (isTrainingMode) {
+            trainingManager.exitTrainingSession();
+            setIsTrainingMode(false);
+        }
         setSelectedProfile(null);
-    }, []);
+    }, [isTrainingMode]);
 
     // Add inactivity timeout hook. If a profile is selected, start the timer.
     // After 10 minutes of inactivity, it will call `handleSwitchProfile`, locking the app.
@@ -96,8 +153,8 @@ const App = () => {
     if (loading) {
         return (
             <div className="flex flex-col justify-center items-center min-h-screen bg-zinc-100 dark:bg-zinc-900">
-                <BrandIcon className="w-16 h-16 text-blue-600 animate-pulse" />
-                <p className="text-zinc-600 dark:text-zinc-400 mt-4">Loading Application...</p>
+                <AnimatedLogo className="w-16 h-16" />
+                <p className="text-zinc-600 dark:text-zinc-400 mt-4 font-medium text-sm">Loading Application...</p>
             </div>
         );
     }
@@ -117,17 +174,27 @@ const App = () => {
     }
 
     if (!selectedProfile) {
-        return <ProfileSelection onProfileSelect={setSelectedProfile} session={session} onLogout={handleLogout} />;
+        return (
+            <ProfileSelection 
+                onProfileSelect={setSelectedProfile} 
+                session={session} 
+                onLogout={handleLogout}
+                onEnterTrainingMode={handleEnterTrainingMode}
+            />
+        );
     }
 
     return (
         <div className="min-h-screen bg-zinc-100 dark:bg-zinc-900">
             <StockManagerApp
-                key={session.user.id}
+                key={isTrainingMode ? 'training-session' : session.user.id}
                 userProfile={userProfile}
                 selectedProfile={selectedProfile}
                 onSwitchProfile={handleSwitchProfile}
                 onLogout={handleLogout}
+                isTrainingMode={isTrainingMode}
+                onEnterTrainingMode={handleEnterTrainingMode}
+                onExitTrainingMode={handleExitTrainingMode}
             />
         </div>
     );

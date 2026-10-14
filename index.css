@@ -20,6 +20,92 @@ html.dark {
     animation: pulse-glow 3s infinite ease-in-out;
   }
 
+  /* One-Off Spiral Load-In Animation (Static Afterwards) */
+  @keyframes logo-spiral-in {
+    0% {
+      opacity: 0;
+      transform: scale(0.08) rotate(-720deg);
+      filter: blur(10px) drop-shadow(0 0 0 rgba(57, 176, 208, 0));
+    }
+    45% {
+      opacity: 0.9;
+      transform: scale(0.7) rotate(-180deg);
+      filter: blur(2px) drop-shadow(0 0 25px rgba(57, 176, 208, 0.6));
+    }
+    75% {
+      opacity: 1;
+      transform: scale(1.08) rotate(16deg);
+      filter: blur(0px) drop-shadow(0 8px 24px rgba(57, 176, 208, 0.4));
+    }
+    88% {
+      transform: scale(0.97) rotate(-4deg);
+    }
+    100% {
+      opacity: 1;
+      transform: scale(1) rotate(0deg);
+      filter: blur(0px) drop-shadow(0 3px 10px rgba(57, 176, 208, 0.2));
+    }
+  }
+
+  @keyframes logo-spiral-aura {
+    0% {
+      opacity: 0;
+      transform: scale(0.1) rotate(-360deg);
+    }
+    35% {
+      opacity: 0.85;
+      transform: scale(0.85) rotate(-90deg);
+    }
+    70% {
+      opacity: 0.45;
+      transform: scale(1.35) rotate(45deg);
+    }
+    100% {
+      opacity: 0;
+      transform: scale(1.6) rotate(120deg);
+    }
+  }
+
+  @keyframes logo-spiral-shimmer {
+    0% {
+      transform: translateX(-150%) skewX(-24deg);
+      opacity: 0;
+    }
+    25% {
+      opacity: 0.85;
+    }
+    100% {
+      transform: translateX(250%) skewX(-24deg);
+      opacity: 0;
+    }
+  }
+
+  .animate-logo-spiral {
+    animation: logo-spiral-in 1.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    will-change: transform, opacity, filter;
+  }
+
+  .animate-logo-spiral-aura {
+    animation: logo-spiral-aura 1.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    will-change: transform, opacity;
+  }
+
+  .animate-logo-spiral-shimmer {
+    animation: logo-spiral-shimmer 0.75s cubic-bezier(0.4, 0, 0.2, 1) 0.75s forwards;
+    will-change: transform, opacity;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .animate-logo-spiral,
+    .animate-logo-spiral-aura,
+    .animate-logo-spiral-shimmer {
+      animation: none !important;
+      opacity: 1 !important;
+      transform: none !important;
+      filter: none !important;
+    }
+  }
+
   /* When the barcode scanner is active, make the entire webview transparent to see the camera view */
   html.barcode-scan-active,
   body.barcode-scan-active {

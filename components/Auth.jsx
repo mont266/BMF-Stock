@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { supabase } from '../lib/supabaseClient';
+import AnimatedLogo from './AnimatedLogo';
 
 const Auth = () => {
   const [loading, setLoading] = useState(false);
@@ -24,17 +25,17 @@ const Auth = () => {
   return (
     <div className="flex min-h-screen bg-white dark:bg-zinc-900">
       <div className="relative hidden w-0 flex-1 lg:block">
-        <div className="absolute inset-0 h-full w-full bg-zinc-900 flex flex-col justify-center items-center p-12">
-            <img src="/favicon.svg" alt="Bregan MainsFlow Logo" className="w-32" />
-            <h1 className="mt-6 text-4xl font-bold tracking-tight text-white">Bregan MainsFlow Stock</h1>
-            <p className="mt-2 text-lg text-zinc-400">Inventory control, streamlined for professionals.</p>
+        <div className="absolute inset-0 h-full w-full bg-zinc-900 flex flex-col justify-center items-center p-12 overflow-hidden">
+            <AnimatedLogo className="w-32 h-32" auraClassName="-inset-8 bg-gradient-to-tr from-cyan-400/35 via-blue-500/30 to-teal-400/20 blur-2xl" />
+            <h1 className="mt-8 text-4xl font-bold tracking-tight text-white text-center">Bregan MainsFlow Stock</h1>
+            <p className="mt-2 text-lg text-zinc-400 text-center">Inventory control, streamlined for professionals.</p>
         </div>
       </div>
       <div className="flex flex-1 flex-col justify-center py-12 px-4 sm:px-6 lg:flex-none lg:px-20 xl:px-24">
         <div className="mx-auto w-full max-w-sm lg:w-96">
             <div>
                 <div className="lg:hidden flex justify-center mb-6">
-                    <img src="/favicon.svg" alt="Bregan MainsFlow Logo" className="w-24" />
+                    <AnimatedLogo className="w-24 h-24" />
                 </div>
                 <h2 className="text-3xl font-bold tracking-tight text-zinc-900 dark:text-white">
                 Sign in to your account

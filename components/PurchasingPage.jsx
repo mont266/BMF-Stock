@@ -240,30 +240,32 @@ const PurchaseOrderForm = ({ existingPO, onSave, onCancel, isSubmitting, supplie
 
             const fileName = `PurchaseOrder_${poNumber}.pdf`;
 
-            if (Capacitor.isNativePlatform()) {
+            if (Capacitor.isNativePlatform() && Capacitor.isPluginAvailable('Filesystem')) {
                 try {
                     const pdfBase64 = doc.output('datauristring').split(',')[1];
                     
                     const savedFile = await Filesystem.writeFile({
                         path: fileName,
                         data: pdfBase64,
-                        directory: Directory.Documents
+                        directory: Directory.Cache
                     });
-                    try {
-                        await Share.share({
-                            title: `Purchase Order ${poNumber}`,
-                            url: savedFile.uri,
-                            dialogTitle: 'Share or Save PDF'
-                        });
-                    } catch (shareErr) {
-                        console.warn("Native PDF share failed, but file is saved", shareErr);
-                        setPdfPreviewUrl('native-saved');
+                    if (Capacitor.isPluginAvailable('Share')) {
+                        try {
+                            await Share.share({
+                                title: `Purchase Order ${poNumber}`,
+                                url: savedFile.uri,
+                                dialogTitle: 'Share or Save PDF'
+                            });
+                            return;
+                        } catch (shareErr) {
+                            console.warn("Native PDF share failed, but file is saved", shareErr);
+                            setPdfPreviewUrl('native-saved');
+                            return;
+                        }
                     }
-                    return;
                 } catch (nativeErr) {
-                    console.error("Native file save failed", nativeErr);
-                    setError("Failed to save PDF on device: " + nativeErr.message);
-                    return;
+                    console.warn("Native file save failed, falling back to Web Share / Download:", nativeErr);
+                    // Fall through gracefully to blob share / download below
                 }
             }
             
@@ -543,14 +545,24 @@ const ReceiveStockModal = ({ isOpen, onClose, po, userProfile, selectedProfile, 
 
                 totalItemsReceived += received.quantity;
                 
-                if (item.item_types.is_unique) {
+                const isTypeUnique = Boolean(item.item_types?.is_unique || (item.item_types?.category || '').toLowerCase() === 'meters');
+                if (isTypeUnique) {
                     if (received.serials.some(s => !s.trim())) {
                         throw new Error(`Please enter all serial numbers for "${item.item_types.name}".`);
                     }
-                    if (new Set(received.serials).size !== received.serials.length) {
+                    const cleanSerials = received.serials.map(s => s.trim());
+                    if (new Set(cleanSerials).size !== cleanSerials.length) {
                         throw new Error(`Duplicate serial numbers found for "${item.item_types.name}".`);
                     }
-                    received.serials.forEach(serial => {
+                    const { data: existingItems } = await supabase
+                        .from('stock_items')
+                        .select('barcode')
+                        .in('barcode', cleanSerials);
+                    if (existingItems && existingItems.length > 0) {
+                        const dupes = existingItems.map(d => d.barcode).join(', ');
+                        throw new Error(`The following serial numbers already exist in stock: ${dupes}. Cannot receive duplicates.`);
+                    }
+                    cleanSerials.forEach(serial => {
                         stockToAdd.push({
                             name: item.item_types.name,
                             barcode: serial,
