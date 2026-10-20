@@ -108,7 +108,7 @@ export const ReportingPage = ({
 
   const REPORT_TABS = useMemo(() => [
     { id: 'movements', label: 'Sign In / Sign Out History', icon: <ChartBarIcon className="w-4 h-4" /> },
-    { id: 'audit', label: 'Meter & Serial Audit Trail', icon: <BarcodeIcon className="w-4 h-4" /> },
+    { id: 'audit', label: 'Unique Serial Audit Trail', icon: <BarcodeIcon className="w-4 h-4" /> },
     { id: 'assigned', label: 'Assigned Stock by Team', icon: <UsersIcon className="w-4 h-4" /> },
     { id: 'thresholds', label: 'Stock Thresholds & Replenishment', icon: <AlertTriangleIcon className="w-4 h-4" /> },
   ], []);
@@ -165,6 +165,7 @@ export const ReportingPage = ({
   const [auditTrailMovements, setAuditTrailMovements] = useState([]);
   const [auditActiveStockItem, setAuditActiveStockItem] = useState(null);
   const [auditPartNumberFilter, setAuditPartNumberFilter] = useState('All');
+  const [auditError, setAuditError] = useState(null);
 
   // Assigned stock search & filter
   const [assignedTeamFilter, setAssignedTeamFilter] = useState('All');
@@ -836,25 +837,86 @@ export const ReportingPage = ({
     });
   }, [stock, itemTypes, isUniqueItem, effectiveSupplierPartNumbers]);
 
-  // --- Meter & Serial Audit Trail Handler ---
+  // --- Unique Item Serial Audit Trail Handler ---
   const handlePerformSerialAudit = useCallback(async (serialToLookup) => {
     const serial = (serialToLookup || auditSearchQuery).trim();
     if (!serial) return;
 
     setActiveAuditSerial(serial);
     setAuditLoading(true);
+    setAuditError(null);
     if (typeof setError === 'function') setError(null);
+
+    const clean = serial.toLowerCase();
+
+    // 1. Verify against active in-memory stock
+    const matchedStockItems = stock.filter(s => (s.barcode || '').toLowerCase() === clean);
+    if (matchedStockItems.length > 0) {
+      const isUnique = matchedStockItems.some(s => isUniqueItem(s.name) || s.is_unique);
+      if (!isUnique) {
+        const bulkItemName = matchedStockItems[0].name;
+        setAuditError({
+          type: 'NOT_UNIQUE',
+          itemName: bulkItemName,
+          serial: serial,
+          message: `The Audit Trail feature is strictly restricted to unique items with individual serial numbers (e.g. meters and serialized equipment). "${bulkItemName}" is a bulk inventory item with a shared barcode, so it does not have individual serial lifecycle tracking.`
+        });
+        setAuditTrailMovements([]);
+        setAuditActiveStockItem(null);
+        setAuditLoading(false);
+        return;
+      }
+    }
+
+    // 2. Verify against itemTypes catalog
+    const matchedItemType = itemTypes.find(it => (it.barcode || '').toLowerCase() === clean);
+    if (matchedItemType && !isUniqueItem(matchedItemType.name) && !matchedItemType.is_unique) {
+      setAuditError({
+        type: 'NOT_UNIQUE',
+        itemName: matchedItemType.name,
+        serial: serial,
+        message: `The Audit Trail feature is strictly restricted to unique items with individual serial numbers. "${matchedItemType.name}" is a bulk item catalog barcode, not an individual serial number.`
+      });
+      setAuditTrailMovements([]);
+      setAuditActiveStockItem(null);
+      setAuditLoading(false);
+      return;
+    }
 
     if (isTrainingMode) {
       try {
-        const clean = serial.toLowerCase();
         const allMovements = trainingManager.getMovements();
-        const matched = allMovements.filter(m => (m.item_barcode || '').toLowerCase().includes(clean));
+        const matched = allMovements.filter(m => (m.item_barcode || '').toLowerCase() === clean);
+
+        if (matched.length > 0) {
+          const isUnique = matched.some(m => isUniqueItem(m.item_name));
+          if (!isUnique) {
+            const bulkItemName = matched[0].item_name;
+            setAuditError({
+              type: 'NOT_UNIQUE',
+              itemName: bulkItemName,
+              serial: serial,
+              message: `The Audit Trail feature is strictly restricted to unique items with individual serial numbers. "${bulkItemName}" is a bulk item, so barcode "${serial}" cannot be audited as a unique serial.`
+            });
+            setAuditTrailMovements([]);
+            setAuditActiveStockItem(null);
+            return;
+          }
+        } else if (matchedStockItems.length === 0) {
+          setAuditError({
+            type: 'NOT_FOUND',
+            serial: serial,
+            message: `No unique serialized item found matching serial number "${serial}". The audit trail only tracks unique items and meters.`
+          });
+          setAuditTrailMovements([]);
+          setAuditActiveStockItem(null);
+          return;
+        }
+
         setAuditTrailMovements(matched);
 
         const currentStockList = trainingManager.getStock();
-        const found = currentStockList.find(s => (s.barcode || '').toLowerCase() === clean) ||
-                      currentStockList.find(s => (s.barcode || '').toLowerCase().includes(clean));
+        const found = currentStockList.find(s => (s.barcode || '').toLowerCase() === clean);
         setAuditActiveStockItem(found || null);
       } catch (err) {
         if (typeof setError === 'function') setError(`Failed to perform serial audit: ${err.message}`);
@@ -869,25 +931,57 @@ export const ReportingPage = ({
       const { data: movements, error: moveErr } = await supabase
         .from('stock_movements')
         .select('*')
-        .ilike('item_barcode', `%${serial}%`)
+        .ilike('item_barcode', serial)
         .order('created_at', { ascending: false });
 
       if (moveErr) throw moveErr;
-      setAuditTrailMovements(movements || []);
 
       // 2. Find current status in stock items
       const { data: currentItems, error: stockErr } = await supabase
         .from('stock_items')
         .select('*')
-        .eq('barcode', serial);
+        .ilike('barcode', serial);
 
-      if (!stockErr && currentItems && currentItems.length > 0) {
-        setAuditActiveStockItem(currentItems[0]);
-      } else {
-        // Fallback search in memory
-        const found = stock.find(s => s.barcode === serial);
-        setAuditActiveStockItem(found || null);
+      const activeItem = (currentItems && currentItems.length > 0)
+        ? currentItems[0]
+        : (stock.find(s => (s.barcode || '').toLowerCase() === clean) || null);
+
+      // Verify that this serial number belongs to a unique item
+      let isUnique = false;
+      let detectedItemName = activeItem?.name;
+
+      if (activeItem) {
+        isUnique = Boolean(isUniqueItem(activeItem.name) || activeItem.is_unique);
+      } else if (movements && movements.length > 0) {
+        detectedItemName = movements[0].item_name;
+        isUnique = Boolean(isUniqueItem(movements[0].item_name));
       }
+
+      if (detectedItemName && !isUnique) {
+        setAuditError({
+          type: 'NOT_UNIQUE',
+          itemName: detectedItemName,
+          serial: serial,
+          message: `The Audit Trail feature is strictly restricted to unique items with individual serial numbers. "${detectedItemName}" is a bulk item and cannot be audited as an individual serial.`
+        });
+        setAuditTrailMovements([]);
+        setAuditActiveStockItem(null);
+        return;
+      }
+
+      if (!activeItem && (!movements || movements.length === 0)) {
+        setAuditError({
+          type: 'NOT_FOUND',
+          serial: serial,
+          message: `No unique serialized item found matching serial number "${serial}". The audit trail is restricted to unique items with individual serial numbers.`
+        });
+        setAuditTrailMovements([]);
+        setAuditActiveStockItem(null);
+        return;
+      }
+
+      setAuditTrailMovements(movements || []);
+      setAuditActiveStockItem(activeItem || null);
     } catch (err) {
       if (typeof setError === 'function') {
         setError(`Failed to perform serial audit: ${err.message}`);
@@ -895,7 +989,7 @@ export const ReportingPage = ({
     } finally {
       setAuditLoading(false);
     }
-  }, [auditSearchQuery, setError, stock]);
+  }, [auditSearchQuery, setError, stock, itemTypes, isUniqueItem, isTrainingMode]);
 
   // --- CSV Export (detailed every single serial/item row with Part Number & Supplier) ---
   const handleExportCsv = async () => {
@@ -1788,35 +1882,41 @@ export const ReportingPage = ({
                       {move.barcodes.length > 0 && (
                         <div className="pt-2 border-t border-zinc-100 dark:border-zinc-700/60 flex items-center justify-between">
                           <div className="text-xs font-mono text-zinc-600 dark:text-zinc-400 truncate max-w-[200px]">
-                            {move.barcodes.length === 1 ? (
-                              <span>SN: {move.barcodes[0]}</span>
+                            {move.isUnique ? (
+                              move.barcodes.length === 1 ? (
+                                <span>SN: {move.barcodes[0]}</span>
+                              ) : (
+                                <span>{formatSerialRangeDisplay(move.barcodes)}</span>
+                              )
                             ) : (
-                              <span>{formatSerialRangeDisplay(move.barcodes)}</span>
+                              <span>Barcode: {move.barcodes[0]}</span>
                             )}
                           </div>
-                          {move.barcodes.length > 1 ? (
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setViewSerialsModalData(move);
-                                setSerialSearchTerm('');
-                              }}
-                              className="text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
-                            >
-                              View All Serials ({move.barcodes.length})
-                            </button>
-                          ) : (
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setActiveTab('audit');
-                                setAuditSearchQuery(move.barcodes[0]);
-                                handlePerformSerialAudit(move.barcodes[0]);
-                              }}
-                              className="text-xs text-blue-600 dark:text-blue-400 hover:underline"
-                            >
-                              Audit Serial
-                            </button>
+                          {move.isUnique && (
+                            move.barcodes.length > 1 ? (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setViewSerialsModalData(move);
+                                  setSerialSearchTerm('');
+                                }}
+                                className="text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
+                              >
+                                View All Serials ({move.barcodes.length})
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setActiveTab('audit');
+                                  setAuditSearchQuery(move.barcodes[0]);
+                                  handlePerformSerialAudit(move.barcodes[0]);
+                                }}
+                                className="text-xs text-blue-600 dark:text-blue-400 hover:underline"
+                              >
+                                Audit Serial
+                              </button>
+                            )
                           )}
                         </div>
                       )}
@@ -1895,34 +1995,38 @@ export const ReportingPage = ({
                             ) : move.barcodes.length === 1 ? (
                               <div className="flex items-center gap-2">
                                 <span className="text-xs font-mono text-zinc-700 dark:text-zinc-300">{move.barcodes[0]}</span>
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setActiveTab('audit');
-                                    setAuditSearchQuery(move.barcodes[0]);
-                                    handlePerformSerialAudit(move.barcodes[0]);
-                                  }}
-                                  className="text-[11px] text-blue-600 hover:text-blue-700 dark:text-blue-400 underline"
-                                  title="View lifecycle audit trail for this serial"
-                                >
-                                  Audit
-                                </button>
+                                {move.isUnique && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setActiveTab('audit');
+                                      setAuditSearchQuery(move.barcodes[0]);
+                                      handlePerformSerialAudit(move.barcodes[0]);
+                                    }}
+                                    className="text-[11px] text-blue-600 hover:text-blue-700 dark:text-blue-400 underline"
+                                    title="View lifecycle audit trail for this unique serial"
+                                  >
+                                    Audit
+                                  </button>
+                                )}
                               </div>
                             ) : (
                               <div className="flex items-center gap-2">
                                 <span className="text-xs font-mono text-zinc-600 dark:text-zinc-400">
                                   {formatSerialRangeDisplay(move.barcodes)}
                                 </span>
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setViewSerialsModalData(move);
-                                    setSerialSearchTerm('');
-                                  }}
-                                  className="px-2 py-0.5 text-xs font-medium rounded bg-blue-50 hover:bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300 transition-colors"
-                                >
-                                  View All ({move.barcodes.length})
-                                </button>
+                                {move.isUnique && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setViewSerialsModalData(move);
+                                      setSerialSearchTerm('');
+                                    }}
+                                    className="px-2 py-0.5 text-xs font-medium rounded bg-blue-50 hover:bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300 transition-colors"
+                                  >
+                                    View All ({move.barcodes.length})
+                                  </button>
+                                )}
                               </div>
                             )}
                           </td>
@@ -1949,44 +2053,46 @@ export const ReportingPage = ({
         </div>
       )}
 
-      {/* ================= TAB 2: METER & SERIAL AUDIT TRAIL ================= */}
+      {/* ================= TAB 2: UNIQUE ITEM SERIAL AUDIT TRAIL ================= */}
       {activeTab === 'audit' && (
         <div className="space-y-6">
           <div className="bg-white dark:bg-zinc-800/60 p-5 rounded-xl shadow-sm border border-zinc-200 dark:border-zinc-700 space-y-4">
             <div>
               <h2 className="text-base font-semibold text-zinc-900 dark:text-white flex items-center gap-2">
                 <BarcodeIcon className="w-5 h-5 text-blue-600" />
-                Meter & Serial Number Full Lifecycle Audit Trail
+                Unique Serial Number Lifecycle Audit Trail
               </h2>
               <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">
-                Every meter item has its own unique serial number. Track complete movement history from delivery, through storehouses and teams, to surveyor assignments.
+                The audit trail feature is restricted exclusively to unique items with individual serial numbers (such as meters and unique serialized equipment). Bulk items with shared barcodes are not audited individually.
               </p>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-              {/* Part Number Filter for Meters */}
+              {/* Part Number Filter for Unique Items */}
               <div>
                 <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300">
-                  Filter Meters by Supplier Part Number
+                  Filter Unique Items by Supplier Part Number
                 </label>
                 <select
                   value={auditPartNumberFilter}
                   onChange={e => setAuditPartNumberFilter(e.target.value)}
                   className={formInputStyle}
                 >
-                  <option value="All">All Part Numbers</option>
-                  {availableSupplierPartNumbers.map(p => (
-                    <option key={p.partNumber} value={p.partNumber}>
-                      {p.partNumber} ({p.supplierName} — {p.itemName})
-                    </option>
-                  ))}
+                  <option value="All">All Unique Part Numbers</option>
+                  {availableSupplierPartNumbers
+                    .filter(p => isUniqueItem(p.itemName))
+                    .map(p => (
+                      <option key={p.partNumber} value={p.partNumber}>
+                        {p.partNumber} ({p.supplierName} — {p.itemName})
+                      </option>
+                    ))}
                 </select>
               </div>
 
               {/* Direct Serial Search */}
               <div className="md:col-span-2">
                 <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300">
-                  Search Exact Serial Number / Barcode
+                  Search Unique Item Serial Number
                 </label>
                 <form
                   onSubmit={e => {
@@ -1998,7 +2104,7 @@ export const ReportingPage = ({
                   <div className="relative flex-1">
                     <input
                       type="text"
-                      placeholder="e.g. SN-04829, MET-99201, 501234..."
+                      placeholder="e.g. SN-04829, MET-99201, 23M4012..."
                       value={auditSearchQuery}
                       onChange={e => setAuditSearchQuery(e.target.value)}
                       className={formInputStyle}
@@ -2020,7 +2126,7 @@ export const ReportingPage = ({
             {stock && stock.some(s => isUniqueItem(s.name)) && (
               <div className="pt-2 border-t border-zinc-100 dark:border-zinc-700/60">
                 <span className="text-xs text-zinc-500 dark:text-zinc-400 font-medium mr-2">
-                  {auditPartNumberFilter !== 'All' ? `Unique Meters for Part #${auditPartNumberFilter}:` : 'Recent Unique Meters in Stock:'}
+                  {auditPartNumberFilter !== 'All' ? `Unique Serials for Part #${auditPartNumberFilter}:` : 'Recent Unique Serials in Stock:'}
                 </span>
                 <div className="inline-flex flex-wrap gap-1.5 mt-1">
                   {stock
@@ -2051,8 +2157,36 @@ export const ReportingPage = ({
             )}
           </div>
 
-          {/* Audit Results */}
-          {activeAuditSerial && (
+          {/* Validation Notice when restricted non-unique item or not found */}
+          {auditError && (
+            <div className={`p-4 rounded-xl border flex items-start gap-3 shadow-xs ${
+              auditError.type === 'NOT_UNIQUE'
+                ? 'bg-amber-50 dark:bg-amber-900/20 border-amber-300 dark:border-amber-700 text-amber-900 dark:text-amber-200'
+                : 'bg-zinc-50 dark:bg-zinc-800/80 border-zinc-300 dark:border-zinc-700 text-zinc-800 dark:text-zinc-200'
+            }`}>
+              <AlertTriangleIcon className={`w-5 h-5 flex-shrink-0 mt-0.5 ${
+                auditError.type === 'NOT_UNIQUE' ? 'text-amber-600 dark:text-amber-400' : 'text-zinc-500 dark:text-zinc-400'
+              }`} />
+              <div className="space-y-1">
+                <h4 className="text-sm font-bold">
+                  {auditError.type === 'NOT_UNIQUE'
+                    ? 'Audit Trail Restricted to Unique Serial Numbers'
+                    : 'Unique Serial Number Not Found'}
+                </h4>
+                <p className="text-xs leading-relaxed">
+                  {auditError.message}
+                </p>
+                {auditError.type === 'NOT_UNIQUE' && (
+                  <p className="text-xs text-amber-800 dark:text-amber-300 pt-1">
+                    To review bulk items, please view the <strong>Sign In / Sign Out History</strong> tab or check overall allocations under <strong>Assigned Stock by Team</strong>.
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Audit Results (only rendered if no restriction error and active serial) */}
+          {!auditError && activeAuditSerial && (
             <div className="space-y-6">
               {/* Current Status Banner */}
               <div className="bg-white dark:bg-zinc-800/60 p-5 rounded-xl shadow-sm border border-zinc-200 dark:border-zinc-700">
@@ -2327,7 +2461,7 @@ export const ReportingPage = ({
                                   </p>
                                 </div>
 
-                                {details.barcodes.length > 0 && (
+                                 {details.isUnique && details.barcodes.length > 0 && (
                                   <div className="flex items-center gap-2">
                                     <button
                                       type="button"
@@ -2348,7 +2482,7 @@ export const ReportingPage = ({
                               </div>
 
                               {/* Expandable list of serial numbers */}
-                              {isExpanded && details.barcodes.length > 0 && (
+                              {details.isUnique && isExpanded && details.barcodes.length > 0 && (
                                 <div className="mt-2 p-3 bg-zinc-50 dark:bg-zinc-900/60 rounded-lg border border-zinc-200 dark:border-zinc-700 space-y-2">
                                   <div className="flex items-center justify-between text-xs font-medium text-zinc-500 dark:text-zinc-400">
                                     <span>Individual Meter Serial Numbers ({details.barcodes.length}):</span>
@@ -2619,18 +2753,22 @@ export const ReportingPage = ({
                         )}
                       </div>
 
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setViewAssociatedBarcodesModal(null);
-                          setActiveTab('audit');
-                          setAuditSearchQuery(barcode);
-                          handlePerformSerialAudit(barcode);
-                        }}
-                        className="text-xs text-blue-600 hover:underline font-sans"
-                      >
-                        Audit
-                      </button>
+                      {isUniqueSerial ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setViewAssociatedBarcodesModal(null);
+                            setActiveTab('audit');
+                            setAuditSearchQuery(barcode);
+                            handlePerformSerialAudit(barcode);
+                          }}
+                          className="text-xs text-blue-600 hover:underline font-sans"
+                        >
+                          Audit Serial
+                        </button>
+                      ) : (
+                        <span className="text-[11px] text-zinc-400 italic">Bulk Code</span>
+                      )}
                     </div>
                   );
                 })}

@@ -177,6 +177,8 @@ export const useStock = (isTrainingMode = false) => {
       movement = { item_id: itemBeforeUpdate.id, item_barcode: itemBeforeUpdate.barcode, item_name: itemBeforeUpdate.name, movement_type: 'OUT', location_from: oldLocation, location_to: assigned_to, user_id: user.id, username: assignerName };
     } else if (oldAssignedTo !== Team.UNASSIGNED && assigned_to === Team.UNASSIGNED) {
       movement = { item_id: itemBeforeUpdate.id, item_barcode: itemBeforeUpdate.barcode, item_name: itemBeforeUpdate.name, movement_type: 'IN', location_from: oldAssignedTo, location_to: location, user_id: user.id, username: assignerName };
+    } else if (oldAssignedTo !== Team.UNASSIGNED && assigned_to !== Team.UNASSIGNED && oldAssignedTo !== assigned_to) {
+      movement = { item_id: itemBeforeUpdate.id, item_barcode: itemBeforeUpdate.barcode, item_name: itemBeforeUpdate.name, movement_type: 'OUT', location_from: oldAssignedTo, location_to: assigned_to, user_id: user.id, username: assignerName };
     } else if (oldLocation !== location) {
       movement = { item_id: itemBeforeUpdate.id, item_barcode: itemBeforeUpdate.barcode, item_name: itemBeforeUpdate.name, movement_type: 'IN', location_from: oldLocation, location_to: location, user_id: user.id, username: assignerName };
     }
@@ -382,11 +384,17 @@ export const useStock = (isTrainingMode = false) => {
         const user = session?.user;
         if (!user) throw new Error('User not authenticated');
         
+        const isAssigning = item.assigned_to && item.assigned_to !== Team.UNASSIGNED;
         const newItem = {
-          ...item,
+          name: item.name,
+          barcode: item.barcode,
+          purchase_price: item.purchase_price ?? null,
+          description: item.description || '',
           location: item.location || Location.LEADING_STORES,
-          assigned_to: Team.UNASSIGNED,
-          user_id: user.id,
+          assigned_to: item.assigned_to || Team.UNASSIGNED,
+          assigned_at: isAssigning ? (item.assigned_at || new Date().toISOString()) : null,
+          assigned_by: isAssigning ? (item.assigned_by || assignerName) : null,
+          user_id: user.id
         };
 
         const { data: insertedData, error } = await supabase.from('stock_items').insert([newItem]).select().single();
@@ -425,6 +433,7 @@ export const useStock = (isTrainingMode = false) => {
         const newTasks = [];
         for (const item of items) {
             const tempId = Math.random().toString(36).substr(2, 9);
+            const isAssigning = item.assigned_to && item.assigned_to !== Team.UNASSIGNED;
             const task = {
                 id: Math.random().toString(36).substr(2, 9),
                 action: 'ADD_STOCK',
@@ -437,7 +446,9 @@ export const useStock = (isTrainingMode = false) => {
                 ...item,
                 id: tempId,
                 location: item.location || Location.LEADING_STORES,
-                assigned_to: Team.UNASSIGNED,
+                assigned_to: item.assigned_to || Team.UNASSIGNED,
+                assigned_at: isAssigning ? (item.assigned_at || new Date().toISOString()) : null,
+                assigned_by: isAssigning ? (item.assigned_by || assignerName) : null,
                 user_id: 'offline_user'
             });
         }
@@ -455,33 +466,45 @@ export const useStock = (isTrainingMode = false) => {
         const user = session?.user;
         if (!user) throw new Error('User not authenticated');
 
-        const newItems = items.map(item => ({
-          ...item,
-          location: item.location || Location.LEADING_STORES,
-          assigned_to: Team.UNASSIGNED,
-          user_id: user.id
-        }));
+        const newItems = items.map(item => {
+          const isAssigning = item.assigned_to && item.assigned_to !== Team.UNASSIGNED;
+          return {
+            name: item.name,
+            barcode: item.barcode,
+            purchase_price: item.purchase_price ?? null,
+            description: item.description || '',
+            location: item.location || Location.LEADING_STORES,
+            assigned_to: item.assigned_to || Team.UNASSIGNED,
+            assigned_at: isAssigning ? (item.assigned_at || new Date().toISOString()) : null,
+            assigned_by: isAssigning ? (item.assigned_by || assignerName) : null,
+            user_id: user.id
+          };
+        });
         
         const { data: insertedData, error } = await supabase.from('stock_items').insert(newItems).select();
         if (error) throw error;
         
         if (insertedData) {
-            const movements = insertedData.map(d => ({
-                item_id: d.id,
-                item_barcode: d.barcode,
-                item_name: d.name,
-                movement_type: 'IN',
-                location_from: 'New Stock',
-                location_to: d.location,
-                user_id: user.id,
-                username: assignerName,
-            }));
+            const movements = insertedData.map(d => {
+                const isAssigning = d.assigned_to && d.assigned_to !== Team.UNASSIGNED;
+                return {
+                    item_id: d.id,
+                    item_barcode: d.barcode,
+                    item_name: d.name,
+                    movement_type: isAssigning ? 'OUT' : 'IN',
+                    location_from: isAssigning ? d.location : 'New Stock',
+                    location_to: isAssigning ? d.assigned_to : d.location,
+                    user_id: user.id,
+                    username: assignerName,
+                };
+            });
             const { error: moveError } = await supabase.from('stock_movements').insert(movements);
             if (moveError) {
                 console.error("Bulk movement log failed:", moveError.message);
             }
         }
         await fetchStock();
+        return insertedData;
     } catch (err) {
         if (isOfflineError(err)) {
             handleOffline();
