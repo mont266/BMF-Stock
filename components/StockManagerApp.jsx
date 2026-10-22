@@ -379,64 +379,105 @@ export const ListItemSkeleton = ({ count = 5 }) => (
 
 const ExternalScannerPage = ({ onScanSuccess, onCancel, persistent = false }) => {
     const inputRef = useRef(null);
+    const [manualInput, setManualInput] = useState('');
 
     useEffect(() => {
+        let buffer = '';
+        let timeout = null;
+
         const focusInput = () => {
-            // Avoid focusing if activeElement is an interactive button or control
             if (document.activeElement && (document.activeElement.tagName === 'BUTTON' || document.activeElement.closest?.('button'))) {
                 return;
             }
             inputRef.current?.focus({ preventScroll: true });
         };
-        const timeoutId = setTimeout(focusInput, 100); 
-        return () => clearTimeout(timeoutId);
-    }, []);
+        const timeoutId = setTimeout(focusInput, 100);
+
+        const handleGlobalKeyDown = (e) => {
+            // Ignore if user is typing into an input/textarea
+            if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable)) {
+                return;
+            }
+
+            if (timeout) clearTimeout(timeout);
+
+            if (e.key === 'Enter') {
+                if (buffer.trim().length >= 2) {
+                    e.preventDefault();
+                    onScanSuccess(buffer.trim());
+                }
+                buffer = '';
+            } else if (e.key && e.key.length === 1) {
+                buffer += e.key;
+                timeout = setTimeout(() => { buffer = ''; }, 500);
+            }
+        };
+
+        window.addEventListener('keydown', handleGlobalKeyDown);
+
+        return () => {
+            clearTimeout(timeoutId);
+            if (timeout) clearTimeout(timeout);
+            window.removeEventListener('keydown', handleGlobalKeyDown);
+        };
+    }, [onScanSuccess]);
 
     const handleSubmit = (e) => {
         e.preventDefault();
-        const scannedValue = inputRef.current?.value.trim();
+        const scannedValue = manualInput.trim() || inputRef.current?.value.trim();
         if (scannedValue) {
             onScanSuccess(scannedValue);
+            setManualInput('');
             if (inputRef.current) {
                 inputRef.current.value = '';
             }
+            setTimeout(() => {
+                inputRef.current?.focus({ preventScroll: true });
+            }, 50);
         }
     };
 
     return (
-        <div className="fixed inset-0 z-[9999] flex flex-col justify-center items-center p-8 bg-zinc-50 dark:bg-zinc-900 text-center" aria-modal="true" role="dialog">
-            <form onSubmit={handleSubmit}>
-                <ScanIcon className="w-16 h-16 text-blue-500 mx-auto animate-pulse" />
-                <h2 className="mt-4 text-2xl font-bold text-zinc-800 dark:text-zinc-100">Ready to Scan</h2>
-                <p className="mt-2 text-zinc-600 dark:text-zinc-400 max-w-sm mx-auto">Use your external handheld scanner to scan a barcode. The captured value will appear here.</p>
-                <input
-                    ref={inputRef}
-                    type="text"
-                    inputMode="none"
-                    autoComplete="off"
-                    autoCorrect="off"
-                    autoCapitalize="off"
-                    spellCheck="false"
-                    tabIndex={-1}
-                    className="absolute top-[-9999px] left-[-9999px] opacity-0 pointer-events-none"
-                    aria-label="External scanner input"
-                    onBlur={(e) => {
-                        // Do not forcefully refocus if focus moved to a button or interactive control
-                        if (e.relatedTarget && (e.relatedTarget.tagName === 'BUTTON' || e.relatedTarget.closest?.('button'))) {
-                            return;
-                        }
-                    }} 
-                />
+        <div className="fixed inset-0 z-[9999] flex flex-col justify-center items-center p-4 bg-zinc-900/90 backdrop-blur-md text-center" aria-modal="true" role="dialog" onClick={() => inputRef.current?.focus({ preventScroll: true })}>
+            <div className="w-full max-w-md bg-zinc-900 p-6 rounded-2xl border border-zinc-700/80 shadow-2xl flex flex-col items-center" onClick={(e) => e.stopPropagation()}>
+                <ScanIcon className="w-14 h-14 text-blue-500 mx-auto animate-pulse mb-2" />
+                <h2 className="text-xl font-bold text-zinc-100">Ready to Scan Barcodes</h2>
+                <p className="mt-1 text-xs text-zinc-400 max-w-xs mx-auto">
+                    Use your handheld barcode scanner or type a barcode / serial number below to stage items.
+                </p>
+
+                <form onSubmit={handleSubmit} className="w-full mt-4 flex gap-2">
+                    <input
+                        ref={inputRef}
+                        type="text"
+                        autoComplete="off"
+                        autoCorrect="off"
+                        autoCapitalize="off"
+                        spellCheck="false"
+                        placeholder="Scan or type barcode / serial..."
+                        value={manualInput}
+                        onChange={(e) => setManualInput(e.target.value)}
+                        className="flex-1 px-3.5 py-2.5 bg-zinc-800 border border-zinc-700 rounded-xl text-white font-mono text-sm placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    />
+                    <button
+                        type="submit"
+                        disabled={!manualInput.trim()}
+                        className="px-4 py-2.5 bg-blue-600 hover:bg-blue-500 disabled:bg-zinc-800 disabled:text-zinc-600 text-white rounded-xl text-xs font-bold transition-colors shrink-0"
+                    >
+                        Stage
+                    </button>
+                </form>
+
                 {!persistent && (
                     <button
                         type="button"
                         onClick={onCancel}
-                        className="mt-8 px-8 py-3 bg-white/80 dark:bg-zinc-800/80 text-zinc-800 dark:text-zinc-100 rounded-lg backdrop-blur-md text-lg font-semibold border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-700 transition-colors"
+                        className="mt-4 px-6 py-2 bg-zinc-800 text-zinc-300 hover:text-white rounded-xl text-xs font-semibold border border-zinc-700 transition-colors"
                     >
-                        Cancel
+                        Cancel Scanner
                     </button>
                 )}
-            </form>
+            </div>
         </div>
     );
 };
@@ -604,7 +645,7 @@ const StockManagerApp = ({
   const [supplierPartNumbersLoading, setSupplierPartNumbersLoading] = useState(true);
   const [selectedItemTypeForParts, setSelectedItemTypeForParts] = useState(null);
   const [isManagePartNumbersModalOpen, setIsManagePartNumbersModalOpen] = useState(false);
-  const [newPartNumberInfo, setNewPartNumberInfo] = useState({ supplier_id: '', supplier_name: '', part_number: '', barcode: '', purchase_price: '', notes: '' });
+  const [newPartNumberInfo, setNewPartNumberInfo] = useState({ supplier_id: '', supplier_name: '', part_number: '', barcode: '', purchase_price: '', lead_time_days: '', notes: '' });
   const [editingPartNumber, setEditingPartNumber] = useState(null);
   const [stockSearchTerm, setStockSearchTerm] = useState('');
   const [expandedSupplierCatalog, setExpandedSupplierCatalog] = useState({});
@@ -684,6 +725,7 @@ const StockManagerApp = ({
   const [isBatchConfirmModalOpen, setIsBatchConfirmModalOpen] = useState(false);
   const [isSubmittingBatchSignOut, setIsSubmittingBatchSignOut] = useState(false);
   const [teamBarcodeInput, setTeamBarcodeInput] = useState('');
+  const [batchConfirmBarcodeInput, setBatchConfirmBarcodeInput] = useState('');
   const [isPrintTeamBadgesModalOpen, setIsPrintTeamBadgesModalOpen] = useState(false);
   const [teamBadgesFilter, setTeamBadgesFilter] = useState('');
 
@@ -717,6 +759,8 @@ const StockManagerApp = ({
   const [devPasswordInput, setDevPasswordInput] = useState('');
   const [devLoginError, setDevLoginError] = useState('');
   const [isDevPurgeModalOpen, setIsDevPurgeModalOpen] = useState(false);
+  const [isDevResetModalOpen, setIsDevResetModalOpen] = useState(false);
+  const [isDevResetting, setIsDevResetting] = useState(false);
   const [devPurgeBarcode, setDevPurgeBarcode] = useState('');
   const [devPurgeResults, setDevPurgeResults] = useState(null);
   const [devPurgeLoading, setDevPurgeLoading] = useState(false);
@@ -1017,6 +1061,11 @@ const StockManagerApp = ({
   
   const fetchItemTypes = useCallback(async () => {
     setItemTypesLoading(true);
+    if (isTrainingMode) {
+      setItemTypes(trainingManager.getItemTypes());
+      setItemTypesLoading(false);
+      return;
+    }
     try {
         const { data, error } = await supabase
             .from('item_types')
@@ -1030,10 +1079,19 @@ const StockManagerApp = ({
     } finally {
         setItemTypesLoading(false);
     }
-  }, []);
+  }, [isTrainingMode]);
 
   const fetchCategories = useCallback(async () => {
     setCategoriesLoading(true);
+    if (isTrainingMode) {
+      const cats = trainingManager.getCategories();
+      setCategories(cats);
+      if (cats.length > 0) {
+        setNewItemTypeInfo(prev => ({...prev, category: prev.category || cats[0].name}));
+      }
+      setCategoriesLoading(false);
+      return;
+    }
     try {
         const { data, error } = await supabase.from('item_category').select('*').order('name');
         if (error) throw error;
@@ -1057,7 +1115,7 @@ const StockManagerApp = ({
     } finally {
         setCategoriesLoading(false);
     }
-  }, []);
+  }, [isTrainingMode]);
   
   const saveTeamBarcodeToCache = useCallback((teamName, barcode) => {
     try {
@@ -1075,6 +1133,15 @@ const StockManagerApp = ({
 
   const fetchTeams = useCallback(async () => {
     setTeamsLoading(true);
+    if (isTrainingMode) {
+      const tm = trainingManager.getTeams();
+      setTeams(tm);
+      if (tm.length > 0) {
+        setAssignmentContext(prev => ({ ...prev, team: prev.team || tm[0]?.name || '' }));
+      }
+      setTeamsLoading(false);
+      return;
+    }
     try {
         const { data: { session } } = await supabase.auth.getSession();
         const user = session?.user;
@@ -1115,10 +1182,15 @@ const StockManagerApp = ({
     } finally {
         setTeamsLoading(false);
     }
-  }, []);
+  }, [isTrainingMode]);
 
   const fetchLocations = useCallback(async () => {
     setLocationsLoading(true);
+    if (isTrainingMode) {
+      setDbLocations(trainingManager.getLocations());
+      setLocationsLoading(false);
+      return;
+    }
     try {
         const { data: { session } } = await supabase.auth.getSession();
         if (!session?.user) throw new Error('User not authenticated');
@@ -1131,10 +1203,15 @@ const StockManagerApp = ({
     } finally {
         setLocationsLoading(false);
     }
-  }, []);
+  }, [isTrainingMode]);
 
   const fetchSuppliers = useCallback(async () => {
     setSuppliersLoading(true);
+    if (isTrainingMode) {
+      setSuppliers(trainingManager.getSuppliers());
+      setSuppliersLoading(false);
+      return;
+    }
     try {
         const { data: { session } } = await supabase.auth.getSession();
       const user = session?.user;
@@ -1147,7 +1224,7 @@ const StockManagerApp = ({
     } finally {
         setSuppliersLoading(false);
     }
-  }, []);
+  }, [isTrainingMode]);
 
   const fetchUnrecognizedScans = useCallback(async () => {
     if (isTrainingMode) {
@@ -1206,6 +1283,11 @@ const StockManagerApp = ({
 
   const fetchSupplierPartNumbers = useCallback(async () => {
     setSupplierPartNumbersLoading(true);
+    if (isTrainingMode) {
+      setSupplierPartNumbers(trainingManager.getSupplierPartNumbers());
+      setSupplierPartNumbersLoading(false);
+      return;
+    }
     try {
         const { data, error } = await supabase
             .from('item_supplier_part_numbers')
@@ -1227,7 +1309,7 @@ const StockManagerApp = ({
     } finally {
         setSupplierPartNumbersLoading(false);
     }
-  }, []);
+  }, [isTrainingMode]);
 
   const deleteUnrecognizedScan = async (id) => {
       if (isTrainingMode) {
@@ -1357,6 +1439,7 @@ const StockManagerApp = ({
           partNumber: p.part_number,
           purchasePrice: p.purchase_price,
           barcode: p.barcode,
+          leadTimeDays: p.lead_time_days || 0,
           notes: p.notes
         };
         if (p.part_number) {
@@ -1484,13 +1567,22 @@ const StockManagerApp = ({
         }
 
         // Resolve matched item type (from supplier part lookup, internal master barcode, or associated stock barcodes)
-        const matchedItemType = partLookup
+        let matchedItemType = partLookup
             ? itemTypes.find(it => it.id === partLookup.itemTypeId || it.name === partLookup.itemTypeName)
             : itemTypes.find(it => {
                 if (it.barcode && String(it.barcode).trim().toLowerCase() === lowerScan) return true;
+                if (it.name && String(it.name).trim().toLowerCase() === lowerScan) return true;
+                if (it.name && String(it.name).replace(/\s+/g, '').toLowerCase() === lowerScan.replace(/\s+/g, '')) return true;
                 const associated = itemTypeBarcodesMap[it.name] || [];
                 return associated.some(bc => String(bc).trim().toLowerCase() === lowerScan);
             });
+
+        if (!matchedItemType && stock && stock.length > 0) {
+            const stockMatch = stock.find(s => String(s.barcode || '').trim().toLowerCase() === lowerScan);
+            if (stockMatch) {
+                matchedItemType = itemTypes.find(it => it.name === stockMatch.name);
+            }
+        }
 
         if (scanMode === 'out-batch') {
             if (isProcessingScanRef.current) return;
@@ -1500,71 +1592,114 @@ const StockManagerApp = ({
                     const items = await getStockItemsByBarcode(decodedText, matchedItemType?.name);
                     const itemTypeDetails = items.length > 0 ? itemTypes.find(it => it.name === items[0].name) : (matchedItemType || null);
                     const isUnique = !!itemTypeDetails?.is_unique;
+                    const targetLoc = assignmentContext.location;
 
                     if (items.length === 0) {
-                        if (matchedItemType && !isUnique) {
+                        if (matchedItemType) {
                             const itemName = matchedItemType.name;
                             setStagedBatchItems(prev => {
-                                const existingIdx = prev.findIndex(entry => entry.name === itemName && !entry.isUnique);
-                                if (existingIdx >= 0) {
-                                    const updated = [...prev];
-                                    const currentEntry = updated[existingIdx];
-                                    const newQty = currentEntry.quantity + 1;
-                                    updated[existingIdx] = { ...currentEntry, quantity: newQty, availableCount: 0 };
-                                    addToast(`+1 ${itemName} staged (0 recorded in stock at ${assignmentContext.location})`, 'warning', decodedText);
-                                    triggerScanFeedback('warning');
-                                    return updated;
-                                }
-                                addToast(`+1 ${itemName} staged (0 recorded in stock at ${assignmentContext.location})`, 'warning', decodedText);
-                                triggerScanFeedback('warning');
-                                return [
-                                    ...prev,
-                                    {
-                                        id: `bulk-${itemName}-${Date.now()}`,
-                                        name: itemName,
-                                        barcode: decodedText,
-                                        isUnique: false,
-                                        quantity: 1,
-                                        location: assignmentContext.location,
-                                        availableCount: 0,
-                                        partNumber: partLookup?.partNumber || ''
+                                if (isUnique) {
+                                    const alreadyStaged = prev.some(entry => entry.barcode === decodedText || entry.serial === decodedText);
+                                    if (alreadyStaged) {
+                                        addToast(`Serial ${decodedText} is already scanned in this batch`, 'warning', decodedText);
+                                        triggerScanFeedback('warning');
+                                        return prev;
                                     }
-                                ];
+                                    addToast(`+1 ${itemName} staged (0 recorded in stock at ${targetLoc})`, 'warning', decodedText);
+                                    triggerScanFeedback('warning');
+                                    return [
+                                        ...prev,
+                                        {
+                                            id: `unique-${decodedText}-${Date.now()}`,
+                                            name: itemName,
+                                            barcode: decodedText,
+                                            serial: decodedText,
+                                            isUnique: true,
+                                            quantity: 1,
+                                            location: targetLoc,
+                                            availableCount: 0,
+                                            partNumber: partLookup?.partNumber || ''
+                                        }
+                                    ];
+                                } else {
+                                    const existingIdx = prev.findIndex(entry => entry.name === itemName && !entry.isUnique);
+                                    if (existingIdx >= 0) {
+                                        const updated = [...prev];
+                                        const currentEntry = updated[existingIdx];
+                                        const newQty = currentEntry.quantity + 1;
+                                        updated[existingIdx] = { ...currentEntry, quantity: newQty, availableCount: 0 };
+                                        addToast(`+1 ${itemName} staged (0 recorded in stock at ${targetLoc})`, 'warning', decodedText);
+                                        triggerScanFeedback('warning');
+                                        return updated;
+                                    }
+                                    addToast(`+1 ${itemName} staged (0 recorded in stock at ${targetLoc})`, 'warning', decodedText);
+                                    triggerScanFeedback('warning');
+                                    return [
+                                        ...prev,
+                                        {
+                                            id: `bulk-${itemName}-${Date.now()}`,
+                                            name: itemName,
+                                            barcode: decodedText,
+                                            isUnique: false,
+                                            quantity: 1,
+                                            location: targetLoc,
+                                            availableCount: 0,
+                                            partNumber: partLookup?.partNumber || ''
+                                        }
+                                    ];
+                                }
                             });
                             return;
                         }
 
-                        if (matchedItemType) {
-                            addToast(`"${matchedItemType.name}" is out of stock`, 'warning', decodedText);
-                            triggerScanFeedback('warning');
-                        } else {
-                            logUnrecognizedBarcode(decodedText);
-                            addToast(`Unrecognised barcode: ${decodedText}`, 'error', decodedText);
-                            triggerScanFeedback('error');
-                        }
+                        logUnrecognizedBarcode(decodedText);
+                        addToast(`Unrecognised barcode: ${decodedText}`, 'error', decodedText);
+                        triggerScanFeedback('error');
                         return;
                     }
 
-                    const targetLoc = assignmentContext.location;
                     const availableItems = items.filter(i => 
                         i.assigned_to === Team.UNASSIGNED && (targetLoc === 'All' || i.location === targetLoc)
                     );
 
                     if (availableItems.length === 0) {
                         const itemName = items[0].name;
-                        if (!isUnique) {
-                            setStagedBatchItems(prev => {
+                        setStagedBatchItems(prev => {
+                            if (isUnique) {
+                                const alreadyStaged = prev.some(entry => entry.barcode === decodedText || entry.serial === decodedText);
+                                if (alreadyStaged) {
+                                    addToast(`Serial ${decodedText} is already scanned in this batch`, 'warning', decodedText);
+                                    triggerScanFeedback('warning');
+                                    return prev;
+                                }
+                                addToast(`+1 ${itemName} staged (0 available at ${targetLoc})`, 'warning', decodedText);
+                                triggerScanFeedback('warning');
+                                return [
+                                    ...prev,
+                                    {
+                                        id: `unique-${decodedText}-${Date.now()}`,
+                                        name: itemName,
+                                        barcode: decodedText,
+                                        serial: decodedText,
+                                        isUnique: true,
+                                        quantity: 1,
+                                        location: targetLoc,
+                                        availableCount: 0,
+                                        partNumber: partLookup?.partNumber || ''
+                                    }
+                                ];
+                            } else {
                                 const existingIdx = prev.findIndex(entry => entry.name === itemName && !entry.isUnique);
                                 if (existingIdx >= 0) {
                                     const updated = [...prev];
                                     const currentEntry = updated[existingIdx];
                                     const newQty = currentEntry.quantity + 1;
                                     updated[existingIdx] = { ...currentEntry, quantity: newQty, availableCount: 0 };
-                                    addToast(`+1 ${itemName} staged (0 at ${targetLoc})`, 'warning', decodedText);
+                                    addToast(`+1 ${itemName} staged (0 available at ${targetLoc})`, 'warning', decodedText);
                                     triggerScanFeedback('warning');
                                     return updated;
                                 }
-                                addToast(`+1 ${itemName} staged (0 at ${targetLoc})`, 'warning', decodedText);
+                                addToast(`+1 ${itemName} staged (0 available at ${targetLoc})`, 'warning', decodedText);
                                 triggerScanFeedback('warning');
                                 return [
                                     ...prev,
@@ -1579,17 +1714,8 @@ const StockManagerApp = ({
                                         partNumber: partLookup?.partNumber || ''
                                     }
                                 ];
-                            });
-                            return;
-                        }
-
-                        const otherLocs = [...new Set(items.filter(i => i.assigned_to === Team.UNASSIGNED).map(i => i.location || 'another storehouse'))].join(', ');
-                        if (otherLocs) {
-                            addToast(`No stock at ${targetLoc} (available at ${otherLocs})`, 'warning', decodedText);
-                        } else {
-                            addToast(`"${items[0].name}" is currently out of stock`, 'warning', decodedText);
-                        }
-                        triggerScanFeedback('warning');
+                            }
+                        });
                         return;
                     }
 
@@ -3000,6 +3126,18 @@ const StockManagerApp = ({
     if (!name) return;
     setIsSubmitting(true);
     try {
+      if (isTrainingMode) {
+        const created = trainingManager.addCategory({ name });
+        await fetchCategories();
+        setNewCategoryName('');
+        setIsAddCategoryModalOpen(false);
+        addToast(`Category "${name}" created successfully`, 'success');
+        setNewItemTypeInfo(prev => ({ ...prev, category: name, subcategory_id: '' }));
+        if (editingItemType) {
+          setEditingItemType(prev => ({ ...prev, category: name, subcategory_id: '' }));
+        }
+        return;
+      }
       const { data, error } = await supabase.from('item_category').insert([{ name }]).select();
       if (error) throw error;
       await fetchCategories();
@@ -3025,6 +3163,14 @@ const StockManagerApp = ({
     const oldName = editingCategory.name;
     setIsSubmitting(true);
     try {
+      if (isTrainingMode) {
+        trainingManager.updateCategory(editingCategory.id, { name: trimmed });
+        await fetchCategories();
+        setEditingCategory(null);
+        setEditCategoryName('');
+        addToast(`Category renamed to "${trimmed}"`, 'success');
+        return;
+      }
       const { error } = await supabase.from('item_category').update({ name: trimmed }).eq('id', editingCategory.id);
       if (error) throw error;
 
@@ -3055,6 +3201,12 @@ const StockManagerApp = ({
     if (!window.confirm(msg)) return;
 
     try {
+      if (isTrainingMode) {
+        trainingManager.deleteCategory(cat.id);
+        await fetchCategories();
+        addToast(`Category "${cat.name}" deleted`, 'success');
+        return;
+      }
       await supabase.from('item_subcategory').delete().eq('category_id', cat.id);
       const { error } = await supabase.from('item_category').delete().eq('id', cat.id);
       if (error) throw error;
@@ -3071,6 +3223,12 @@ const StockManagerApp = ({
     if (!name || !selectedParentCategoryId) return;
     setIsSubmitting(true);
     try {
+      if (isTrainingMode) {
+        setNewSubcategoryName('');
+        setIsAddSubcategoryModalOpen(false);
+        addToast(`Sub-category "${name}" created successfully`, 'success');
+        return;
+      }
       const { data, error } = await supabase.from('item_subcategory').insert([{ name, category_id: selectedParentCategoryId }]).select();
       if (error) throw error;
       await fetchCategories();
@@ -3099,6 +3257,12 @@ const StockManagerApp = ({
     if (!trimmed) return;
     setIsSubmitting(true);
     try {
+      if (isTrainingMode) {
+        setEditingSubcategory(null);
+        setEditSubcategoryName('');
+        addToast(`Sub-category updated to "${trimmed}"`, 'success');
+        return;
+      }
       const { error } = await supabase.from('item_subcategory').update({ name: trimmed }).eq('id', editingSubcategory.id);
       if (error) throw error;
       await fetchCategories();
@@ -3121,6 +3285,10 @@ const StockManagerApp = ({
     if (!window.confirm(msg)) return;
 
     try {
+      if (isTrainingMode) {
+        addToast(`Sub-category "${sub.name}" deleted`, 'success');
+        return;
+      }
       await supabase.from('item_types').update({ subcategory_id: null }).eq('subcategory_id', sub.id);
       const { error } = await supabase.from('item_subcategory').delete().eq('id', sub.id);
       if (error) throw error;
@@ -3136,10 +3304,6 @@ const StockManagerApp = ({
     if (!newItemTypeInfo.name.trim()) return;
     setIsSubmitting(true);
     try {
-      const { data: { session } } = await supabase.auth.getSession();
-      const user = session?.user;
-      if (!user) throw new Error('User not authenticated');
-      
       const subId = newItemTypeInfo.subcategory_id ? parseInt(newItemTypeInfo.subcategory_id) : null;
       const supId = newItemTypeInfo.supplier_id ? parseInt(newItemTypeInfo.supplier_id) : null;
       const barcodeVal = newItemTypeInfo.barcode?.trim() || null;
@@ -3152,12 +3316,21 @@ const StockManagerApp = ({
         supplier_id: supId,
         stock_threshold: parseInt(newItemTypeInfo.stock_threshold, 10) || 0,
         is_unique: newItemTypeInfo.is_unique,
-        user_id: user.id 
+        barcode: barcodeVal
       };
 
-      if (barcodeVal) {
-        payload.barcode = barcodeVal;
+      if (isTrainingMode) {
+        trainingManager.addItemType(payload);
+        setNewItemTypeInfo({ name: '', barcode: '', price: '', category: '', subcategory_id: '', stock_threshold: '', is_unique: false, supplier_id: '' });
+        await fetchItemTypes();
+        setIsAddItemTypeModalOpen(false);
+        return;
       }
+
+      const { data: { session } } = await supabase.auth.getSession();
+      const user = session?.user;
+      if (!user) throw new Error('User not authenticated');
+      payload.user_id = user.id;
 
       let { error: insertError } = await supabase.from('item_types').insert([payload]);
       if (insertError && (insertError.code === '42703' || insertError.message?.includes('barcode'))) {
@@ -3282,21 +3455,41 @@ const StockManagerApp = ({
 
     try {
         if (actionType === 'DELETE_ITEM_TYPE') {
-             const { error } = await supabase.from('item_types').delete().eq('id', item.id);
-             if (error) throw error;
-             await fetchItemTypes();
+             if (isTrainingMode) {
+               trainingManager.deleteItemType(item.id);
+               await fetchItemTypes();
+             } else {
+               const { error } = await supabase.from('item_types').delete().eq('id', item.id);
+               if (error) throw error;
+               await fetchItemTypes();
+             }
         } else if (actionType === 'DELETE_TEAM') {
-             const { error } = await supabase.from('teams').delete().eq('id', item.id);
-             if (error) throw error;
-             await fetchTeams();
+             if (isTrainingMode) {
+               trainingManager.deleteTeam(item.id);
+               await fetchTeams();
+             } else {
+               const { error } = await supabase.from('teams').delete().eq('id', item.id);
+               if (error) throw error;
+               await fetchTeams();
+             }
         } else if (actionType === 'DELETE_SUPPLIER') {
-             const { error } = await supabase.from('suppliers').delete().eq('id', item.id);
-             if (error) throw error;
-             await fetchSuppliers();
+             if (isTrainingMode) {
+               trainingManager.deleteSupplier(item.id);
+               await fetchSuppliers();
+             } else {
+               const { error } = await supabase.from('suppliers').delete().eq('id', item.id);
+               if (error) throw error;
+               await fetchSuppliers();
+             }
         } else if (actionType === 'DELETE_LOCATION') {
-             const { error } = await supabase.from('locations').delete().eq('id', item.id);
-             if (error) throw error;
-             await fetchLocations();
+             if (isTrainingMode) {
+               trainingManager.deleteLocation(item.id);
+               await fetchLocations();
+             } else {
+               const { error } = await supabase.from('locations').delete().eq('id', item.id);
+               if (error) throw error;
+               await fetchLocations();
+             }
         } else if (actionType === 'DELETE_STOCK_ITEM') {
              if (item.items && item.items.length > 1) {
                  const itemIds = item.items.map(i => i.id);
@@ -3332,17 +3525,40 @@ const StockManagerApp = ({
 
   const handleDevPurgeSearch = async (e) => {
       e.preventDefault();
-      if (!devPurgeBarcode.trim()) return;
+      const searchCode = devPurgeBarcode.trim();
+      if (!searchCode) return;
       setDevPurgeLoading(true);
       setDevPurgeResults(null);
       setError(null);
       try {
-          const items = await getStockItemsByBarcode(devPurgeBarcode);
-          const { data: itemType } = await supabase.from('item_types').select('*').eq('barcode', devPurgeBarcode).maybeSingle();
+          const items = await getStockItemsByBarcode(searchCode);
+          const itemIds = (items || []).map(i => i.id);
+          const { data: itemType } = await supabase.from('item_types').select('*').eq('barcode', searchCode).maybeSingle();
           
+          let movementsCount = 0;
+          if (isTrainingMode) {
+            movementsCount = trainingManager.getMovements().filter(m => 
+              (m.item_barcode && String(m.item_barcode).toLowerCase() === searchCode.toLowerCase()) || 
+              (m.barcode && String(m.barcode).toLowerCase() === searchCode.toLowerCase()) || 
+              (itemIds.length > 0 && itemIds.includes(m.item_id)) ||
+              (itemType && m.item_name === itemType.name)
+            ).length;
+          } else {
+            let filter = `item_barcode.eq.${searchCode}`;
+            if (itemIds.length > 0) {
+              filter += `,item_id.in.(${itemIds.join(',')})`;
+            }
+            if (itemType?.name) {
+              filter += `,item_name.eq.${itemType.name}`;
+            }
+            const { count } = await supabase.from('stock_movements').select('*', { count: 'exact', head: true }).or(filter);
+            movementsCount = count || 0;
+          }
+
           setDevPurgeResults({
               stockItems: items || [],
-              itemType: itemType || null
+              itemType: itemType || null,
+              movementsCount: movementsCount || 0
           });
       } catch (err) {
           setError(`Search failed: ${err.message}`);
@@ -3353,25 +3569,82 @@ const StockManagerApp = ({
 
   const handleDevPurgeConfirm = async () => {
       if (!devPurgeResults) return;
-      
+      const searchCode = devPurgeBarcode.trim();
       const itemIds = devPurgeResults.stockItems.map(i => i.id);
       
       try {
           if (itemIds.length > 0) {
               await bulkDeleteStockItems(itemIds, selectedProfile.name);
           }
+
           if (devPurgeResults.itemType) {
-              await supabase.from('item_types').delete().eq('id', devPurgeResults.itemType.id);
+              if (isTrainingMode) {
+                trainingManager.deleteItemType(devPurgeResults.itemType.id);
+              } else {
+                await supabase.from('item_types').delete().eq('id', devPurgeResults.itemType.id);
+              }
               await fetchItemTypes();
           }
+
+          // Purge all movement logs for this barcode/item (including any deletion log generated during step 1)
+          if (isTrainingMode) {
+            trainingManager.deleteMovementsForBarcode(searchCode, devPurgeResults.itemType?.name, itemIds);
+          } else {
+            // Delete movements where item_barcode = searchCode
+            const { error: err1 } = await supabase.from('stock_movements').delete().eq('item_barcode', searchCode);
+            if (err1) console.warn("Notice deleting movements by item_barcode:", err1.message);
+
+            // Delete movements where item_id IN (itemIds)
+            if (itemIds.length > 0) {
+              const { error: err2 } = await supabase.from('stock_movements').delete().in('item_id', itemIds);
+              if (err2) console.warn("Notice deleting movements by item_id:", err2.message);
+            }
+
+            // Delete movements where item_name = itemType.name if itemType was purged
+            if (devPurgeResults.itemType?.name) {
+              const { error: err3 } = await supabase.from('stock_movements').delete().eq('item_name', devPurgeResults.itemType.name);
+              if (err3) console.warn("Notice deleting movements by item_name:", err3.message);
+            }
+
+            // Delete unrecognized scan alerts for this barcode
+            await supabase.from('unrecognized_scans').delete().eq('barcode', searchCode);
+          }
           
-          setSuccessMessage(`Successfully purged ${itemIds.length} items${devPurgeResults.itemType ? ' and associated type data' : ''}.`);
+          setSuccessMessage(`Successfully purged ${itemIds.length} physical stock items, all movement logs, and associated records for ${searchCode}.`);
           setIsDevPurgeModalOpen(false);
           setDevPurgeResults(null);
           setDevPurgeBarcode('');
       } catch (err) {
           setError(`Purge failed: ${err.message}`);
       }
+  };
+
+  const handleDevResetInventory = async () => {
+    setIsDevResetting(true);
+    setError(null);
+    try {
+      if (isTrainingMode) {
+        trainingManager.resetTrainingSession();
+      } else {
+        const { error: moveErr } = await supabase.from('stock_movements').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+        if (moveErr) console.warn("Notice resetting stock_movements:", moveErr);
+
+        const { error: stockErr } = await supabase.from('stock_items').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+        if (stockErr) throw stockErr;
+
+        const { error: unrecErr } = await supabase.from('unrecognized_scans').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+        if (unrecErr) console.warn("Notice resetting unrecognized_scans:", unrecErr);
+      }
+
+      await refetchStock();
+      fetchUnrecognizedScans();
+      setIsDevResetModalOpen(false);
+      addToast("Storehouse inventory & movement logs successfully reset. All item types and catalog setups remain intact.", "success");
+    } catch (err) {
+      setError(`Failed to reset inventory: ${err.message}`);
+    } finally {
+      setIsDevResetting(false);
+    }
   };
 
   const handleDeleteItemType = async (type) => {
@@ -3413,6 +3686,13 @@ const StockManagerApp = ({
             updatePayload.barcode = barcodeVal;
         }
 
+        if (isTrainingMode) {
+          trainingManager.updateItemType(editingItemType.id, updatePayload);
+          setEditingItemType(null);
+          await fetchItemTypes();
+          return;
+        }
+
         let { error } = await supabase
             .from('item_types')
             .update(updatePayload)
@@ -3451,15 +3731,21 @@ const StockManagerApp = ({
     setError(null);
 
     try {
+      const trimmedBarcode = newTeamInfo.barcode?.trim() || null;
+      const payload = { name: trimmedName, type: newTeamInfo.type, barcode: trimmedBarcode };
+
+      if (isTrainingMode) {
+        trainingManager.addTeam(payload);
+        setNewTeamInfo({ name: '', type: TeamType.TEAM, barcode: '' });
+        await fetchTeams();
+        setIsAddTeamModalOpen(false);
+        return;
+      }
+
       const { data: { session } } = await supabase.auth.getSession();
       const user = session?.user;
       if (!user) throw new Error('User not authenticated');
-
-      const trimmedBarcode = newTeamInfo.barcode?.trim() || null;
-      const payload = { name: trimmedName, type: newTeamInfo.type, user_id: user.id };
-      if (trimmedBarcode) {
-        payload.barcode = trimmedBarcode;
-      }
+      payload.user_id = user.id;
 
       let { error: insertError } = await supabase.from('teams').insert([payload]);
       if (insertError && (insertError.code === '42703' || insertError.message?.includes('barcode'))) {
@@ -3506,6 +3792,13 @@ const StockManagerApp = ({
           updatePayload.barcode = trimmedBarcode;
         }
 
+        if (isTrainingMode) {
+          trainingManager.updateTeam(editingTeam.id, updatePayload);
+          setEditingTeam(null);
+          await fetchTeams();
+          return;
+        }
+
         let { error: updateError } = await supabase
             .from('teams')
             .update(updatePayload)
@@ -3544,13 +3837,20 @@ const StockManagerApp = ({
     e.preventDefault();
     if (!newLocationInfo.name.trim()) return;
     try {
+      if (isTrainingMode) {
+        trainingManager.addLocation({ name: newLocationInfo.name.trim() });
+        setNewLocationInfo({ name: '' });
+        await fetchLocations();
+        setIsAddLocationModalOpen(false);
+        return;
+      }
       const { error } = await supabase.from('locations').insert([{ name: newLocationInfo.name.trim() }]);
       if (error) throw error;
       setNewLocationInfo({ name: '' });
       await fetchLocations();
       setIsAddLocationModalOpen(false);
     } catch (err) {
-      setError(`Failed to add location (Did you create the table?): ${err.message}`);
+      setError(`Failed to add location: ${err.message}`);
     }
   };
 
@@ -3558,6 +3858,12 @@ const StockManagerApp = ({
     e.preventDefault();
     if (!editingLocation.name.trim()) return;
     try {
+        if (isTrainingMode) {
+          trainingManager.updateLocation(editingLocation.id, { name: editingLocation.name.trim() });
+          setEditingLocation(null);
+          await fetchLocations();
+          return;
+        }
         const { error } = await supabase
             .from('locations')
             .update({ name: editingLocation.name.trim() })
@@ -3571,7 +3877,7 @@ const StockManagerApp = ({
   };
 
   const handleDeleteLocation = async (location) => {
-      setConfirmDialog({
+      setConfirmationModal({
           isOpen: true,
           title: 'Delete Location',
           message: `Are you sure you want to delete the location "${location.name}"? This will not affect existing historical stock movements but will remove it as a selectable option.`,
@@ -3587,12 +3893,21 @@ const StockManagerApp = ({
 
     setError(null);
     try {
+      const supplierData = { ...newSupplierInfo, name: trimmedName };
+      supplierData.lead_time_days = parseInt(supplierData.lead_time_days, 10) || 7;
+
+      if (isTrainingMode) {
+        trainingManager.addSupplier(supplierData);
+        setNewSupplierInfo({ name: '', contact_person: '', phone: '', email: '', lead_time_days: 7 });
+        await fetchSuppliers();
+        setIsAddSupplierModalOpen(false);
+        return;
+      }
+
       const { data: { session } } = await supabase.auth.getSession();
       const user = session?.user;
       if (!user) throw new Error('User not authenticated');
-      
-      const supplierData = { ...newSupplierInfo, name: trimmedName, user_id: user.id };
-      supplierData.lead_time_days = parseInt(supplierData.lead_time_days, 10) || 7;
+      supplierData.user_id = user.id;
 
       const { error } = await supabase.from('suppliers').insert([supplierData]);
       if (error) {
@@ -4276,8 +4591,6 @@ const StockManagerApp = ({
     }
     setIsSubmitting(true);
     try {
-      const { data: { session } } = await supabase.auth.getSession();
-      const user = session?.user;
       const supId = partData.supplier_id ? parseInt(partData.supplier_id, 10) : null;
       const supplierObj = suppliers.find(s => s.id === supId);
 
@@ -4288,9 +4601,27 @@ const StockManagerApp = ({
         part_number: partData.part_number.trim(),
         barcode: partData.barcode?.trim() || null,
         purchase_price: parseFloat(partData.purchase_price) || 0,
-        notes: partData.notes?.trim() || null,
-        user_id: user?.id || null
+        lead_time_days: parseInt(partData.lead_time_days, 10) || 0,
+        notes: partData.notes?.trim() || null
       };
+
+      if (isTrainingMode) {
+        const itemTypeObj = itemTypes.find(it => it.id === itemTypeId);
+        const created = trainingManager.addSupplierPartNumber({
+          ...payload,
+          suppliers: supplierObj ? { id: supplierObj.id, name: supplierObj.name } : null,
+          item_types: itemTypeObj ? { id: itemTypeObj.id, name: itemTypeObj.name, category: itemTypeObj.category } : null
+        });
+        await fetchSupplierPartNumbers();
+        setNewPartNumberInfo({ supplier_id: '', supplier_name: '', part_number: '', barcode: '', purchase_price: '', lead_time_days: '', notes: '' });
+        setSuccessMessage(`Supplier part number "${payload.part_number}" saved successfully.`);
+        setTimeout(() => setSuccessMessage(null), 3500);
+        return created;
+      }
+
+      const { data: { session } } = await supabase.auth.getSession();
+      const user = session?.user;
+      payload.user_id = user?.id || null;
 
       const { data, error } = await supabase
         .from('item_supplier_part_numbers')
@@ -4300,7 +4631,7 @@ const StockManagerApp = ({
       if (error) throw error;
 
       await fetchSupplierPartNumbers();
-      setNewPartNumberInfo({ supplier_id: '', supplier_name: '', part_number: '', barcode: '', purchase_price: '', notes: '' });
+      setNewPartNumberInfo({ supplier_id: '', supplier_name: '', part_number: '', barcode: '', purchase_price: '', lead_time_days: '', notes: '' });
       setSuccessMessage(`Supplier part number "${payload.part_number}" saved successfully.`);
       setTimeout(() => setSuccessMessage(null), 3500);
       return data?.[0];
@@ -4328,9 +4659,19 @@ const StockManagerApp = ({
         part_number: partData.part_number.trim(),
         barcode: partData.barcode?.trim() || null,
         purchase_price: parseFloat(partData.purchase_price) || 0,
+        lead_time_days: parseInt(partData.lead_time_days, 10) || 0,
         notes: partData.notes?.trim() || null,
         updated_at: new Date().toISOString()
       };
+
+      if (isTrainingMode) {
+        trainingManager.updateSupplierPartNumber(partId, payload);
+        await fetchSupplierPartNumbers();
+        setEditingPartNumber(null);
+        setSuccessMessage(`Supplier part number "${payload.part_number}" updated.`);
+        setTimeout(() => setSuccessMessage(null), 3500);
+        return;
+      }
 
       const { error } = await supabase
         .from('item_supplier_part_numbers')
@@ -4353,6 +4694,14 @@ const StockManagerApp = ({
 
   const handleDeleteSupplierPartNumber = async (partId) => {
     try {
+      if (isTrainingMode) {
+        trainingManager.deleteSupplierPartNumber(partId);
+        await fetchSupplierPartNumbers();
+        setSuccessMessage("Supplier part number removed.");
+        setTimeout(() => setSuccessMessage(null), 3000);
+        return;
+      }
+
       const { error } = await supabase
         .from('item_supplier_part_numbers')
         .delete()
@@ -4542,7 +4891,7 @@ const StockManagerApp = ({
                   </button>
               </div>
               <div className="mt-2 text-center">
-                  <span className="text-[10px] font-medium text-zinc-400 dark:text-zinc-500 tracking-wider">V0.12</span>
+                  <span className="text-[10px] font-medium text-zinc-400 dark:text-zinc-500 tracking-wider">V0.13</span>
               </div>
           </div>
         </aside>
@@ -4551,39 +4900,39 @@ const StockManagerApp = ({
           {/* Training Sandbox Persistent Banner */}
           {isTrainingMode && (
             <div 
-              className="bg-gradient-to-r from-amber-500 via-amber-400 to-amber-500 text-zinc-950 px-4 py-2 shadow-md flex items-center justify-between gap-3 text-xs sm:text-sm font-semibold border-b border-amber-600/30 z-30 flex-shrink-0"
+              className="bg-gradient-to-r from-amber-500 via-amber-400 to-amber-500 text-zinc-950 px-3 sm:px-4 py-1.5 shadow-sm flex items-center justify-between gap-2 text-xs font-semibold border-b border-amber-600/30 z-30 flex-shrink-0"
               style={{
                 paddingTop: Capacitor.isNativePlatform() 
-                  ? 'calc(max(2.5rem, env(safe-area-inset-top, 0px)) + 0.35rem)' 
-                  : '0.5rem',
-                paddingBottom: '0.5rem'
+                  ? 'calc(max(2.5rem, env(safe-area-inset-top, 0px)) + 0.25rem)' 
+                  : '0.35rem',
+                paddingBottom: '0.35rem'
               }}
             >
-              <div className="flex items-center gap-2 min-w-0">
-                <span className="w-5 h-5 rounded bg-zinc-950/15 flex items-center justify-center text-sm font-bold shrink-0">🎓</span>
-                <span className="font-extrabold tracking-wide uppercase text-[10px] sm:text-xs bg-zinc-950/15 px-2 py-0.5 rounded">Training Mode</span>
+              <div className="flex items-center gap-1.5 sm:gap-2 min-w-0 flex-1">
+                <span className="w-5 h-5 rounded bg-zinc-950/15 flex items-center justify-center text-xs sm:text-sm font-bold shrink-0">🎓</span>
+                <span className="font-extrabold tracking-wider uppercase text-[10px] sm:text-xs bg-zinc-950/15 px-1.5 sm:px-2 py-0.5 rounded leading-none shrink-0">Training Mode</span>
                 <span className="hidden md:inline font-medium text-zinc-900 truncate">
                   Safe Sandbox: All scans, counts, assignments, and reports are isolated. Zero backend writes.
                 </span>
-                <span className="md:hidden font-medium text-zinc-900 truncate">
-                  Isolated sandbox (zero backend writes)
+                <span className="inline md:hidden font-medium text-zinc-900 text-[11px] leading-tight shrink min-w-0">
+                  • Sandbox (0 backend writes)
                 </span>
               </div>
-              <div className="flex items-center gap-2 shrink-0">
+              <div className="flex items-center gap-1.5 shrink-0">
                 <button
                   type="button"
                   onClick={() => setIsResetTrainingModalOpen(true)}
-                  className="px-2.5 py-1 text-xs font-semibold rounded bg-zinc-950/10 hover:bg-zinc-950/20 text-zinc-950 transition-colors cursor-pointer"
-                  title="Reset training items back to original sandbox seed"
+                  className="px-2 py-0.5 sm:px-2.5 sm:py-1 text-[11px] sm:text-xs font-semibold rounded bg-zinc-950/10 hover:bg-zinc-950/20 text-zinc-950 transition-colors cursor-pointer shrink-0"
+                  title="Reset training items back to original snapshot"
                 >
-                  Reset Stock
+                  Reset
                 </button>
                 <button
                   type="button"
                   onClick={() => setIsExitTrainingModalOpen(true)}
-                  className="px-3 py-1 text-xs font-bold rounded bg-zinc-950 hover:bg-zinc-800 text-amber-300 transition-colors shadow-xs cursor-pointer flex items-center gap-1"
+                  className="px-2.5 py-0.5 sm:px-3 sm:py-1 text-[11px] sm:text-xs font-bold rounded bg-zinc-950 hover:bg-zinc-800 text-amber-300 transition-colors shadow-xs cursor-pointer flex items-center gap-1 shrink-0"
                 >
-                  <span>Exit Training</span>
+                  <span>Exit</span>
                   <span aria-hidden="true">&times;</span>
                 </button>
               </div>
@@ -6374,6 +6723,7 @@ const StockManagerApp = ({
                          setIsDevMode={setIsDevMode}
                          setIsDevLoginModalOpen={setIsDevLoginModalOpen}
                          setIsDevPurgeModalOpen={setIsDevPurgeModalOpen}
+                          setIsDevResetModalOpen={setIsDevResetModalOpen}
                          isTrainingMode={isTrainingMode}
                          setIsResetTrainingModalOpen={setIsResetTrainingModalOpen}
                          setIsExitTrainingModalOpen={setIsExitTrainingModalOpen}
@@ -6993,6 +7343,40 @@ const StockManagerApp = ({
               </div>
             </div>
           )}
+
+          {/* Scan additional items directly in confirmation modal */}
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (batchConfirmBarcodeInput.trim()) {
+                handleScanSuccess(batchConfirmBarcodeInput.trim());
+                setBatchConfirmBarcodeInput('');
+              }
+            }}
+            className="flex gap-2"
+          >
+            <div className="relative flex-1">
+              <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-zinc-400">
+                <BarcodeIcon className="w-4 h-4" />
+              </div>
+              <input
+                type="text"
+                autoFocus
+                placeholder="Scan or type barcode / serial to stage more products..."
+                value={batchConfirmBarcodeInput}
+                onChange={(e) => setBatchConfirmBarcodeInput(e.target.value)}
+                className="w-full text-xs font-mono pl-9 pr-3 py-2 border border-zinc-300 dark:border-zinc-700 rounded-lg bg-zinc-50 dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+            <button
+              type="submit"
+              disabled={!batchConfirmBarcodeInput.trim()}
+              className="px-3.5 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-zinc-200 dark:disabled:bg-zinc-800 disabled:text-zinc-400 text-white rounded-lg text-xs font-semibold transition-colors flex items-center gap-1 shrink-0"
+            >
+              <AddIcon className="w-3.5 h-3.5" />
+              <span>Add</span>
+            </button>
+          </form>
 
           {/* Staged Items Table */}
           <div className="border border-zinc-200 dark:border-zinc-700 rounded-lg overflow-hidden">
@@ -8687,10 +9071,11 @@ const StockManagerApp = ({
                       <h4 className="font-bold text-red-800 dark:text-red-300 mb-2">Search Results</h4>
                       <ul className="list-disc pl-5 text-sm text-red-700 dark:text-red-400 space-y-1 mb-4">
                           <li>Found <strong>{devPurgeResults.stockItems.length}</strong> physical stock items.</li>
+                          <li>Found <strong>{devPurgeResults.movementsCount || 0}</strong> movement log entry / entries.</li>
                           <li>Found <strong>{devPurgeResults.itemType ? '1' : '0'}</strong> registered item type.</li>
                       </ul>
                       
-                      {devPurgeResults.stockItems.length > 0 || devPurgeResults.itemType ? (
+                      {devPurgeResults.stockItems.length > 0 || devPurgeResults.movementsCount > 0 || devPurgeResults.itemType ? (
                           <div className="flex justify-end gap-3 pt-3 border-t border-red-200 dark:border-red-800/30">
                               <button onClick={() => setDevPurgeResults(null)} className="px-3 py-1.5 text-sm font-medium text-red-700 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-900/30 rounded-md">
                                   Cancel
@@ -8699,7 +9084,7 @@ const StockManagerApp = ({
                                   setConfirmationModal({
                                       isOpen: true,
                                       title: 'Confirm Total Purge',
-                                      message: `Are you absolutely sure you want to permanently delete ${devPurgeResults.stockItems.length} stock items${devPurgeResults.itemType ? ' and the item type' : ''} for barcode ${devPurgeBarcode}? This action cannot be reversed.`,
+                                      message: `Are you absolutely sure you want to permanently delete ${devPurgeResults.stockItems.length} stock items, ${devPurgeResults.movementsCount || 0} movement logs${devPurgeResults.itemType ? ' and the item type' : ''} for barcode ${devPurgeBarcode}? This action cannot be reversed.`,
                                       onConfirm: handleDevPurgeConfirm,
                                       confirmText: 'Yes, Delete Everything',
                                       isDestructive: true
@@ -8714,6 +9099,61 @@ const StockManagerApp = ({
                   </div>
               )}
           </div>
+      </Modal>
+
+      {/* Modal: Developer Mode Reset Storehouse Inventory & Movement Logs */}
+      <Modal isOpen={isDevResetModalOpen} onClose={() => setIsDevResetModalOpen(false)} title="Reset Inventory & Movement Logs">
+        <div className="space-y-4">
+          <div className="p-4 rounded-xl bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800/40 text-amber-900 dark:text-amber-200 text-sm">
+            <p className="font-bold mb-1 flex items-center gap-2">
+              <span className="text-lg">⚠️</span>
+              <span>Storehouse Inventory Reset</span>
+            </p>
+            <p className="text-xs text-amber-800 dark:text-amber-300 leading-relaxed">
+              This action clears all physical stock items (resetting stock counts to 0) and purges all sign-in / sign-out movement logs.
+            </p>
+          </div>
+
+          <div className="p-3 bg-zinc-50 dark:bg-zinc-800 rounded-lg border border-zinc-200 dark:border-zinc-700 text-xs space-y-1.5 text-zinc-700 dark:text-zinc-300">
+            <p className="font-bold text-zinc-900 dark:text-zinc-100 uppercase tracking-wider text-[10px]">What will be preserved:</p>
+            <ul className="list-disc pl-4 space-y-1">
+              <li><strong>Item Types Catalog</strong> (Names, categories, subcategories, stock thresholds & primary barcodes)</li>
+              <li><strong>Supplier Part Numbers</strong> (Part numbers, packaging barcodes, prices & lead times)</li>
+              <li><strong>Suppliers List</strong> (Contact details and supplier profiles)</li>
+              <li><strong>Storehouse Locations</strong> (Depot and storehouse names)</li>
+              <li><strong>Teams & Surveyors</strong> (Team names, types & assigned barcodes)</li>
+              <li><strong>User Profiles & PINs</strong> (System user accounts)</li>
+            </ul>
+          </div>
+
+          <div className="flex justify-end gap-3 pt-3 border-t border-zinc-200 dark:border-zinc-700">
+            <button
+              type="button"
+              onClick={() => setIsDevResetModalOpen(false)}
+              className="px-4 py-2 bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-600 text-zinc-800 dark:text-zinc-200 rounded-md hover:bg-zinc-50 dark:hover:bg-zinc-600 text-sm font-medium transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              disabled={isDevResetting}
+              onClick={() => {
+                setConfirmationModal({
+                  isOpen: true,
+                  title: 'Confirm Inventory & Movement Log Reset',
+                  message: 'Are you sure you want to reset all physical stock items and clear all movement logs? All catalog settings, item types, and barcodes will remain fully preserved.',
+                  onConfirm: handleDevResetInventory,
+                  confirmText: 'Yes, Reset Inventory & Logs',
+                  isDestructive: true
+                });
+              }}
+              className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-md text-sm font-bold transition-colors flex items-center gap-1.5 shadow-sm disabled:opacity-50"
+            >
+              {isDevResetting && <Spinner className="w-4 h-4 mr-1" />}
+              <span>Reset Inventory Counts & Logs</span>
+            </button>
+          </div>
+        </div>
       </Modal>
 
       <Modal isOpen={isChangePinModalOpen} onClose={() => setIsChangePinModalOpen(false)} title="Change PIN">
@@ -9133,6 +9573,18 @@ const StockManagerApp = ({
                                   placeholder="0.00"
                                 />
                               </div>
+                              <div>
+                                <label className="block text-xs font-medium text-zinc-600 dark:text-zinc-400">Lead Time (Days)</label>
+                                <input
+                                  type="number"
+                                  min="0"
+                                  step="1"
+                                  value={editingPartNumber.lead_time_days || ''}
+                                  onChange={(e) => setEditingPartNumber(prev => ({ ...prev, lead_time_days: e.target.value }))}
+                                  className={`${formInputStyle} !mt-0 text-xs py-1.5 font-mono`}
+                                  placeholder="e.g. 14"
+                                />
+                              </div>
                             </div>
                             <div>
                               <label className="block text-xs font-medium text-zinc-600 dark:text-zinc-400">Notes</label>
@@ -9178,6 +9630,11 @@ const StockManagerApp = ({
                               {part.barcode && (
                                 <span className="font-mono text-xs text-zinc-500 dark:text-zinc-400 bg-white dark:bg-zinc-900 px-1.5 py-0.5 rounded border border-zinc-200 dark:border-zinc-700">
                                   Barcode: {part.barcode}
+                                </span>
+                              )}
+                              {part.lead_time_days > 0 && (
+                                <span className="text-xs font-semibold text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 px-2 py-0.5 rounded-full flex items-center gap-1">
+                                  ⏱️ Lead Time: {part.lead_time_days} days
                                 </span>
                               )}
                             </div>
@@ -9258,7 +9715,7 @@ const StockManagerApp = ({
                   </div>
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                   <div>
                     <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
                       Supplier Barcode (Optional)
@@ -9289,6 +9746,21 @@ const StockManagerApp = ({
                       value={newPartNumberInfo.purchase_price}
                       onChange={(e) => setNewPartNumberInfo(prev => ({ ...prev, purchase_price: e.target.value }))}
                       className={formInputStyle + " text-sm py-2"}
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                      Lead Time (Days)
+                    </label>
+                    <input
+                      type="number"
+                      min="0"
+                      step="1"
+                      placeholder="e.g. 14"
+                      value={newPartNumberInfo.lead_time_days}
+                      onChange={(e) => setNewPartNumberInfo(prev => ({ ...prev, lead_time_days: e.target.value }))}
+                      className={formInputStyle + " text-sm py-2 font-mono"}
                     />
                   </div>
                 </div>

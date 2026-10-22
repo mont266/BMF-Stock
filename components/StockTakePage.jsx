@@ -4,6 +4,7 @@ import { Page, Spinner, EmptyState, formInputStyle } from './StockManagerApp';
 import Modal from './Modal';
 import { PlusCircleIcon, ClipboardCheckIcon, ArchiveIcon, ChartBarIcon, TrashIcon, BuildingStoreIcon, ChevronDownIcon, TagIcon, BarcodeIcon } from './Icons';
 import { trainingManager } from '../lib/trainingEnvironment';
+import { Team, Location } from '../types';
 
 // --- Helper functions for serial number range expansion in Stock Take ---
 const parseSerial = (serial) => {
@@ -219,10 +220,30 @@ const StockTakePage = ({
                 setActiveStockTake(data);
                 const { data: items, error: itemsError } = await supabase
                     .from('stock_take_items')
-                    .select('*, stock_items(id, name, barcode, purchase_price, description, location, assigned_to)')
+                    .select('*, stock_items(id, name, barcode, purchase_price, description, location, assigned_to, created_at)')
                     .eq('stock_take_id', data.id);
                 if (!itemsError && items) {
-                    setStockTakeItems(items);
+                    const takeCreatedAt = data.created_at ? new Date(data.created_at).getTime() : 0;
+                    const itemsToFixInDb = [];
+                    const normalizedItems = items.map(item => {
+                        const itemCreatedAt = item.stock_items?.created_at ? new Date(item.stock_items.created_at).getTime() : 0;
+                        const wasCreatedDuringTake = itemCreatedAt > 0 && takeCreatedAt > 0 && itemCreatedAt >= (takeCreatedAt - 3000);
+                        if (wasCreatedDuringTake && (item.expected_quantity || 0) > 0) {
+                            itemsToFixInDb.push(item.id);
+                            return { ...item, expected_quantity: 0 };
+                        }
+                        return item;
+                    });
+
+                    if (itemsToFixInDb.length > 0) {
+                        supabase
+                            .from('stock_take_items')
+                            .update({ expected_quantity: 0 })
+                            .in('id', itemsToFixInDb)
+                            .then();
+                    }
+
+                    setStockTakeItems(normalizedItems);
                 }
             } else {
                 setActiveStockTake(null);
@@ -263,17 +284,26 @@ const StockTakePage = ({
                     status: 'PENDING'
                 };
             }
-            const exp = typeof item.expected_quantity === 'number' ? item.expected_quantity : 1;
+            // If the physical item was created during/after the stock take started, it was not in the system at the start
+            const takeCreatedAt = activeStockTake?.created_at ? new Date(activeStockTake.created_at).getTime() : 0;
+            const itemCreatedAt = item.stock_items?.created_at ? new Date(item.stock_items.created_at).getTime() : 0;
+            const wasCreatedDuringTake = itemCreatedAt > 0 && takeCreatedAt > 0 && itemCreatedAt >= (takeCreatedAt - 3000);
+
+            const exp = wasCreatedDuringTake 
+                ? 0 
+                : (typeof item.expected_quantity === 'number' ? item.expected_quantity : 1);
             const cnt = typeof item.counted_quantity === 'number' ? item.counted_quantity : 0;
             groups[itemTypeName].expected_quantity += exp;
             groups[itemTypeName].counted_quantity += cnt;
             groups[itemTypeName].rawItems.push({
                 ...item,
+                expected_quantity: wasCreatedDuringTake ? 0 : (item.expected_quantity ?? 1),
                 stock_items: item.stock_items || stockItemFallback || {
                     id: item.item_id,
                     name: itemTypeName,
                     barcode: defaultBarcode,
-                    purchase_price: price
+                    purchase_price: price,
+                    created_at: item.stock_items?.created_at
                 }
             });
             if (cnt > 0) {
@@ -295,7 +325,7 @@ const StockTakePage = ({
                 value_variance: (g.counted_quantity - g.expected_quantity) * g.price
             };
         });
-    }, [itemTypesMap, itemTypes, stockMap]);
+    }, [itemTypesMap, itemTypes, stockMap, activeStockTake?.created_at]);
 
     const activeGroupedItems = useMemo(() => {
         return groupStockTakeByItemType(stockTakeItems);
@@ -369,7 +399,7 @@ const StockTakePage = ({
             setSelectedHistoryReport(st);
             const { data: items, error } = await supabase
                 .from('stock_take_items')
-                .select('*, stock_items(id, name, barcode, purchase_price, description, location, assigned_to)')
+                .select('*, stock_items(id, name, barcode, purchase_price, description, location, assigned_to, created_at)')
                 .eq('stock_take_id', st.id);
             if (error) throw error;
             
@@ -589,7 +619,7 @@ const StockTakePage = ({
             // 2. Fetch all recorded stock take items for this audit
             const { data: takeItems, error: itemsFetchError } = await supabase
                 .from('stock_take_items')
-                .select('*, stock_items(id, name, barcode, purchase_price, description, location, assigned_to)')
+                .select('*, stock_items(id, name, barcode, purchase_price, description, location, assigned_to, created_at)')
                 .eq('stock_take_id', activeStockTake.id);
             if (itemsFetchError) throw itemsFetchError;
 
@@ -1346,12 +1376,14 @@ const StockTakePage = ({
             // For each serial in the range, find or create the physical stock_item
             const resolvedStockItems = [];
             const newStockItemsToCreate = [];
+            const newlyCreatedBarcodes = new Set();
 
             for (const serial of serials) {
                 const existing = existingByBarcode.get(serial);
                 if (existing) {
                     resolvedStockItems.push(existing);
                 } else {
+                    newlyCreatedBarcodes.add(serial);
                     newStockItemsToCreate.push({
                         name: targetTypeName,
                         barcode: serial,
@@ -1365,6 +1397,7 @@ const StockTakePage = ({
             }
 
             // Insert new stock items in batch if any were missing from stock_items
+            const newlyCreatedIds = new Set();
             if (newStockItemsToCreate.length > 0) {
                 const { data: createdItems, error: createError } = await supabase
                     .from('stock_items')
@@ -1373,6 +1406,7 @@ const StockTakePage = ({
 
                 if (createError) throw createError;
                 if (createdItems) {
+                    createdItems.forEach(ci => newlyCreatedIds.add(ci.id));
                     resolvedStockItems.push(...createdItems);
                     if (typeof setStock === 'function') {
                         setStock(prev => [...prev, ...createdItems]);
@@ -1390,16 +1424,26 @@ const StockTakePage = ({
 
             const takeItemsToInsert = [];
             const takeItemIdsToUpdate = [];
+            const takeCreatedAt = activeStockTakeRef.current?.created_at ? new Date(activeStockTakeRef.current.created_at).getTime() : 0;
 
             for (const sItem of resolvedStockItems) {
                 const existingTakeItem = existingTakeItemsMap.get(sItem.id);
                 if (existingTakeItem) {
                     takeItemIdsToUpdate.push(existingTakeItem.id);
                 } else {
+                    const isNewlyCreated = newlyCreatedIds.has(sItem.id) || newlyCreatedBarcodes.has(sItem.barcode);
+                    const itemCreatedAt = sItem.created_at ? new Date(sItem.created_at).getTime() : 0;
+                    const wasCreatedDuringTake = itemCreatedAt > 0 && takeCreatedAt > 0 && itemCreatedAt >= (takeCreatedAt - 3000);
+
+                    // If item was not already in the storehouse inventory when stock take started, expected_quantity is 0
+                    const wasInStockBefore = !isNewlyCreated && !wasCreatedDuringTake && 
+                        sItem.location === currentTargetLocation && 
+                        (!sItem.assigned_to || sItem.assigned_to === 'Unassigned');
+
                     takeItemsToInsert.push({
                         stock_take_id: activeStockTakeRef.current.id,
                         item_id: sItem.id,
-                        expected_quantity: 1,
+                        expected_quantity: wasInStockBefore ? 1 : 0,
                         counted_quantity: 1,
                         status: 'COUNTED'
                     });
@@ -1412,7 +1456,7 @@ const StockTakePage = ({
                 const { data: inserted, error: takeInsertError } = await supabase
                     .from('stock_take_items')
                     .insert(takeItemsToInsert)
-                    .select('*, stock_items(id, name, barcode, purchase_price, description, location, assigned_to)');
+                    .select('*, stock_items(id, name, barcode, purchase_price, description, location, assigned_to, created_at)');
 
                 if (takeInsertError) throw takeInsertError;
                 insertedTakeItems = inserted || [];
@@ -1625,7 +1669,7 @@ const StockTakePage = ({
                                             {activeStockTake.location && activeStockTake.location !== 'All' ? `Expected at ${activeStockTake.location}` : 'Total Items Expected'}
                                         </p>
                                         <p className="text-2xl font-bold">
-                                            {stockTakeItems.reduce((acc, i) => acc + (i.expected_quantity || 1), 0)}
+                                            {stockTakeItems.reduce((acc, i) => acc + (i.expected_quantity ?? 1), 0)}
                                         </p>
                                     </div>
                                     <div className="p-4 bg-zinc-50 dark:bg-zinc-700/50 rounded-lg border border-zinc-200 dark:border-zinc-700">
@@ -1637,7 +1681,7 @@ const StockTakePage = ({
                                     <div className="p-4 bg-zinc-50 dark:bg-zinc-700/50 rounded-lg border border-zinc-200 dark:border-zinc-700">
                                         <p className="text-sm text-zinc-500 dark:text-zinc-400">Total Variance</p>
                                         {(() => {
-                                            const totalExp = stockTakeItems.reduce((acc, i) => acc + (i.expected_quantity || 1), 0);
+                                            const totalExp = stockTakeItems.reduce((acc, i) => acc + (i.expected_quantity ?? 1), 0);
                                             const totalCnt = stockTakeItems.reduce((acc, i) => acc + (i.counted_quantity || 0), 0);
                                             const diff = totalCnt - totalExp;
                                             return (
@@ -1653,7 +1697,7 @@ const StockTakePage = ({
                                             £{stockTakeItems.reduce((acc, i) => acc + ((i.counted_quantity || 0) * (parseFloat(i.stock_items?.purchase_price) || 0)), 0).toFixed(2)}
                                         </p>
                                         <p className="text-xs text-zinc-400 mt-0.5">
-                                            Expected: £{stockTakeItems.reduce((acc, i) => acc + ((i.expected_quantity || 1) * (parseFloat(i.stock_items?.purchase_price) || 0)), 0).toFixed(2)}
+                                            Expected: £{stockTakeItems.reduce((acc, i) => acc + ((i.expected_quantity ?? 1) * (parseFloat(i.stock_items?.purchase_price) || 0)), 0).toFixed(2)}
                                         </p>
                                     </div>
                                 </div>
@@ -1820,7 +1864,7 @@ const StockTakePage = ({
                                                                                                 </div>
                                                                                                 <div className="flex items-center gap-3">
                                                                                                     <span className="text-zinc-500 font-sans text-xs">
-                                                                                                        Counted: <strong>{raw.counted_quantity || 0}</strong> / Expected: {raw.expected_quantity || 1}
+                                                                                                        Counted: <strong>{raw.counted_quantity || 0}</strong> / Expected: {raw.expected_quantity ?? 1}
                                                                                                     </span>
                                                                                                     <span className={`px-2 py-0.5 rounded text-[11px] font-sans font-medium ${isCounted ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300' : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'}`}>
                                                                                                         {isCounted ? 'Counted' : 'Missing'}
@@ -1893,7 +1937,7 @@ const StockTakePage = ({
                                     <p className="text-xl font-bold">
                                         {selectedHistoryItems.reduce((acc, curr) => acc + (curr.counted_quantity || 0), 0)}
                                         <span className="text-sm font-normal text-zinc-500 ml-1">
-                                            / {selectedHistoryItems.reduce((acc, curr) => acc + (curr.expected_quantity || 1), 0)}
+                                            / {selectedHistoryItems.reduce((acc, curr) => acc + (curr.expected_quantity ?? 1), 0)}
                                         </span>
                                     </p>
                                 </div>
@@ -1902,7 +1946,7 @@ const StockTakePage = ({
                                     <p className="text-xl font-bold">
                                         {(() => {
                                             const v = selectedHistoryItems.reduce((acc, item) => {
-                                                return acc + ((item.counted_quantity || 0) - (item.expected_quantity || 1));
+                                                return acc + ((item.counted_quantity || 0) - (item.expected_quantity ?? 1));
                                             }, 0);
                                             return <span className={v < 0 ? 'text-red-600' : v > 0 ? 'text-green-600' : ''}>{v > 0 ? '+' : ''}{v} units</span>;
                                         })()}
@@ -1913,7 +1957,7 @@ const StockTakePage = ({
                                     <p className="text-xl font-bold">
                                         {(() => {
                                             const v = selectedHistoryItems.reduce((acc, item) => {
-                                                const diff = (item.counted_quantity || 0) - (item.expected_quantity || 1);
+                                                const diff = (item.counted_quantity || 0) - (item.expected_quantity ?? 1);
                                                 const price = parseFloat(item.stock_items?.purchase_price) || 0;
                                                 return acc + (diff * price);
                                             }, 0);
@@ -2046,7 +2090,7 @@ const StockTakePage = ({
                                                                                     </div>
                                                                                     <div className="flex items-center gap-3">
                                                                                         <span className="text-zinc-500 font-sans text-xs">
-                                                                                            Counted: <strong>{raw.counted_quantity || 0}</strong> / Expected: {raw.expected_quantity || 1}
+                                                                                            Counted: <strong>{raw.counted_quantity || 0}</strong> / Expected: {raw.expected_quantity ?? 1}
                                                                                         </span>
                                                                                         <span className={`px-2 py-0.5 rounded text-[11px] font-sans font-medium ${isCounted ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300' : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'}`}>
                                                                                             {isCounted ? 'Counted' : 'Missing'}
@@ -2259,7 +2303,7 @@ const StockTakePage = ({
                                     <span className="font-semibold text-zinc-800 dark:text-zinc-200">
                                         {stockTakeItems
                                             .filter(i => (i.stock_items?.barcode || '') === (quantityItem.stock_items?.barcode || ''))
-                                            .reduce((acc, i) => acc + (i.expected_quantity || 1), 0)}
+                                            .reduce((acc, i) => acc + (i.expected_quantity ?? 1), 0)}
                                     </span>
                                 </div>
                                 <div>

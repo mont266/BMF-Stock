@@ -41,12 +41,80 @@ const App = () => {
         });
     }, []);
     const [isTrainingMode, setIsTrainingMode] = useState(() => trainingManager.isActive);
+    const [isStartingTraining, setIsStartingTraining] = useState(false);
 
-    const handleEnterTrainingMode = useCallback((profile = null) => {
-        trainingManager.startTrainingSession();
+    const handleEnterTrainingMode = useCallback(async (profile = null) => {
+        setIsStartingTraining(true);
+        let liveSnapshot = {};
+        try {
+            const fetchAllStock = async () => {
+                const { count } = await supabase.from('stock_items').select('*', { count: 'exact', head: true });
+                const total = count || 0;
+                if (total === 0) {
+                    const { data } = await supabase.from('stock_items').select('*');
+                    return data || [];
+                }
+                const pageSize = 1000;
+                const pages = Math.ceil(total / pageSize);
+                const promises = [];
+                for (let i = 0; i < pages; i++) {
+                    promises.push(
+                        supabase.from('stock_items').select('*').range(i * pageSize, (i + 1) * pageSize - 1)
+                    );
+                }
+                const results = await Promise.all(promises);
+                return results.flatMap(r => r.data || []);
+            };
+
+            const [
+                liveStock,
+                { data: liveMovements },
+                { data: liveItemTypes },
+                { data: liveSupplierParts },
+                { data: liveTeams },
+                { data: liveLocations },
+                { data: liveSuppliers },
+                { data: liveCategories }
+            ] = await Promise.all([
+                fetchAllStock(),
+                supabase.from('stock_movements').select('*').order('created_at', { ascending: false }).limit(200),
+                supabase.from('item_types').select('*, item_subcategory(name), suppliers(*)').order('name'),
+                supabase.from('item_supplier_part_numbers').select('*, suppliers(id, name), item_types(id, name, category, barcode)').order('id'),
+                supabase.from('teams').select('*').order('name'),
+                supabase.from('locations').select('*').order('name'),
+                supabase.from('suppliers').select('*').order('name'),
+                supabase.from('item_category').select('*').order('name')
+            ]);
+
+            liveSnapshot = {
+                stock: liveStock || [],
+                movements: liveMovements || [],
+                itemTypes: liveItemTypes || [],
+                supplierPartNumbers: liveSupplierParts || [],
+                teams: liveTeams || [],
+                locations: liveLocations || [],
+                suppliers: liveSuppliers || [],
+                categories: liveCategories || []
+            };
+        } catch (e) {
+            console.warn("Could not fetch live database snapshot for training mode:", e);
+        } finally {
+            setIsStartingTraining(false);
+        }
+
+        trainingManager.startTrainingSession(
+            liveSnapshot.stock,
+            liveSnapshot.movements,
+            liveSnapshot.itemTypes,
+            liveSnapshot.supplierPartNumbers,
+            liveSnapshot.teams,
+            liveSnapshot.locations,
+            liveSnapshot.suppliers,
+            liveSnapshot.categories
+        );
         setIsTrainingMode(true);
         setSelectedProfile(profile || { id: 'training_user', name: 'Training User (Admin)', role: 'Admin' });
-    }, []);
+    }, [setSelectedProfile]);
 
     const handleExitTrainingMode = useCallback(() => {
         trainingManager.exitTrainingSession();
@@ -150,11 +218,13 @@ const App = () => {
     // After 10 minutes of inactivity, it will call `handleSwitchProfile`, locking the app.
     useInactivityTimeout(handleSwitchProfile, 600000);
 
-    if (loading) {
+    if (loading || isStartingTraining) {
         return (
             <div className="flex flex-col justify-center items-center min-h-screen bg-zinc-100 dark:bg-zinc-900">
                 <AnimatedLogo className="w-16 h-16" />
-                <p className="text-zinc-600 dark:text-zinc-400 mt-4 font-medium text-sm">Loading Application...</p>
+                <p className="text-zinc-600 dark:text-zinc-400 mt-4 font-medium text-sm">
+                    {isStartingTraining ? 'Snapshotting Live Storehouse for Training Sandbox...' : 'Loading Application...'}
+                </p>
             </div>
         );
     }

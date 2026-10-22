@@ -798,30 +798,40 @@ export const ReportingPage = ({
     const report = [];
     itemTypes.forEach(type => {
       const currentStock = stockCounts[type.name] || 0;
-      const threshold = parseInt(type.stock_threshold, 10) || 0;
+      const baseThreshold = parseInt(type.stock_threshold, 10) || 0;
+
+      // Find matching supplier part number & lead time
+      let pNum = null;
+      let sName = null;
+      let leadTimeDays = 0;
+      const partMatch = (effectiveSupplierPartNumbers || []).find(sp => sp.item_type_id === type.id);
+      if (partMatch) {
+        pNum = partMatch.part_number;
+        sName = partMatch.suppliers?.name || partMatch.supplier_name;
+        leadTimeDays = parseInt(partMatch.lead_time_days, 10) || 0;
+      }
+
+      // Factor in lead time buffer: lead time buffer adds safety buffer based on lead time days
+      const estimatedDailyUsage = Math.max(1, Math.ceil(baseThreshold / 14));
+      const leadTimeBuffer = leadTimeDays > 0 ? (leadTimeDays * estimatedDailyUsage) : 0;
+      const effectiveThreshold = baseThreshold + leadTimeBuffer;
 
       let status = 'OK';
-      if (currentStock <= threshold) {
+      if (currentStock <= effectiveThreshold) {
         status = 'CRITICAL';
-      } else if (threshold > 0 && currentStock <= threshold * 1.5) {
+      } else if (effectiveThreshold > 0 && currentStock <= effectiveThreshold * 1.5) {
         status = 'WARNING';
       }
 
       if (status !== 'OK') {
-        const suggestedOrder = Math.max(0, threshold - currentStock);
-        // Find supplier part number
-        let pNum = null;
-        let sName = null;
-        const partMatch = (effectiveSupplierPartNumbers || []).find(sp => sp.item_type_id === type.id);
-        if (partMatch) {
-          pNum = partMatch.part_number;
-          sName = partMatch.suppliers?.name || partMatch.supplier_name;
-        }
+        const suggestedOrder = Math.max(0, effectiveThreshold - currentStock);
 
         report.push({
           name: type.name,
           currentStock,
-          threshold,
+          baseThreshold,
+          effectiveThreshold,
+          leadTimeDays,
           suggestedOrder,
           status,
           isUnique: isUniqueItem(type.name),
@@ -2547,9 +2557,10 @@ export const ReportingPage = ({
                     <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Status</th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Item Name</th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Supplier Part #</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-amber-600 dark:text-amber-400 uppercase tracking-wider">Lead Time</th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Type</th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Current Stock</th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Threshold</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Base / Adj. Threshold</th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-blue-600 dark:text-blue-400 uppercase tracking-wider">Order to Replenish</th>
                   </tr>
                 </thead>
@@ -2577,6 +2588,15 @@ export const ReportingPage = ({
                           <span className="text-zinc-400">—</span>
                         )}
                       </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-xs font-mono">
+                        {item.leadTimeDays > 0 ? (
+                          <span className="px-2 py-0.5 rounded-full bg-amber-50 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 font-bold border border-amber-200 dark:border-amber-800">
+                            ⏱️ {item.leadTimeDays} days
+                          </span>
+                        ) : (
+                          <span className="text-zinc-400">Standard</span>
+                        )}
+                      </td>
                       <td className="px-6 py-4 whitespace-nowrap text-xs">
                         {item.isUnique ? (
                           <span className="text-blue-600 dark:text-blue-400 font-semibold">⚡ Meter / Unique</span>
@@ -2585,7 +2605,16 @@ export const ReportingPage = ({
                         )}
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-zinc-900 dark:text-zinc-100 font-medium">{item.currentStock}</td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-zinc-500 dark:text-zinc-400">{item.threshold}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-zinc-500 dark:text-zinc-400">
+                        {item.leadTimeDays > 0 ? (
+                          <div>
+                            <span className="font-semibold text-zinc-800 dark:text-zinc-200">{item.effectiveThreshold}</span>
+                            <span className="block text-[10px] text-zinc-400">(Base: {item.baseThreshold} + {item.effectiveThreshold - item.baseThreshold} lead buffer)</span>
+                          </div>
+                        ) : (
+                          <span>{item.baseThreshold}</span>
+                        )}
+                      </td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm font-bold text-blue-600 dark:text-blue-400">{item.suggestedOrder || 0}</td>
                     </tr>
                   ))}

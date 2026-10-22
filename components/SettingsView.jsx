@@ -27,6 +27,7 @@ export const SettingsView = ({
   setIsDevMode,
   setIsDevLoginModalOpen,
   setIsDevPurgeModalOpen,
+  setIsDevResetModalOpen,
   isTrainingMode,
   setIsResetTrainingModalOpen,
   setIsExitTrainingModalOpen,
@@ -261,11 +262,27 @@ export const SettingsView = ({
                           <button 
                               type="button"
                               onClick={() => setIsDevPurgeModalOpen(true)}
-                              className="w-full text-left font-medium text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 p-3 rounded-md border border-red-200 dark:border-red-800/30"
+                              className="w-full text-left font-medium text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 p-3 rounded-md border border-red-200 dark:border-red-800/30 hover:bg-red-100 dark:hover:bg-red-900/30 transition-colors"
                           >
                               <div className="flex justify-between items-center">
-                                  <span>Purge Barcode Items</span>
-                                  <span className="text-sm font-semibold">&rarr;</span>
+                                  <div>
+                                    <span className="font-bold text-sm block">Purge Specific Barcode Items</span>
+                                    <span className="text-xs text-red-700/80 dark:text-red-300/80 font-normal">Search barcode to delete matching stock items and optional item type</span>
+                                  </div>
+                                  <span className="text-sm font-semibold ml-2">&rarr;</span>
+                              </div>
+                          </button>
+                          <button 
+                              type="button"
+                              onClick={() => setIsDevResetModalOpen(true)}
+                              className="w-full text-left font-medium text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/20 p-3 rounded-md border border-amber-200 dark:border-amber-800/40 hover:bg-amber-100 dark:hover:bg-amber-900/30 transition-colors"
+                          >
+                              <div className="flex justify-between items-center">
+                                  <div>
+                                    <span className="font-bold text-sm block">Reset Inventory & Movement Logs</span>
+                                    <span className="text-xs text-amber-800/80 dark:text-amber-300/80 font-normal">Wipes physical stock & movements. Keeps item types, barcodes, suppliers, teams & locations intact.</span>
+                                  </div>
+                                  <span className="text-sm font-semibold ml-2">&rarr;</span>
                               </div>
                           </button>
                       </div>
@@ -278,7 +295,7 @@ export const SettingsView = ({
         {/* Version & Build Info */}
         <div className="pt-2 flex flex-col items-center justify-center text-center space-y-1">
             <span className="px-3.5 py-1 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400 text-xs font-mono rounded-full font-semibold shadow-2xs tracking-wide">
-                Version V0.11
+                Version V0.13
             </span>
             <p className="text-[11px] text-zinc-400 dark:text-zinc-500">
               Bregan MainsFlow Stock Management System
