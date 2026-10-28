@@ -15,7 +15,8 @@ import {
   UsersIcon,
   BoxIcon,
   TagIcon,
-  ChevronDownIcon
+  ChevronDownIcon,
+  TransferIcon
 } from './Icons';
 import { Capacitor } from '@capacitor/core';
 import { Filesystem, Directory } from '@capacitor/filesystem';
@@ -94,7 +95,8 @@ export const ReportingPage = ({
   selectedProfile,
   profiles = [],
   setError,
-  isTrainingMode = false
+  isTrainingMode = false,
+  onOpenTeamTransfer
 }) => {
   const [activeTab, setActiveTab] = useState('movements'); // 'movements', 'audit', 'assigned', 'thresholds'
   const [exportDropdownOpen, setExportDropdownOpen] = useState(false);
@@ -2471,24 +2473,43 @@ export const ReportingPage = ({
                                   </p>
                                 </div>
 
-                                 {details.isUnique && details.barcodes.length > 0 && (
-                                  <div className="flex items-center gap-2">
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  {onOpenTeamTransfer && (
                                     <button
                                       type="button"
-                                      onClick={() => copyToClipboard(details.barcodes.join('\n'), `Copied ${details.barcodes.length} serials for ${itemName}`)}
-                                      className="px-2.5 py-1 text-xs font-medium rounded border border-zinc-300 dark:border-zinc-600 hover:bg-zinc-100 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-300 transition-colors"
+                                      onClick={() => onOpenTeamTransfer({
+                                        name: itemName,
+                                        assigned_to: teamName,
+                                        quantity: details.count,
+                                        barcodes: details.barcodes || [],
+                                        location: details.location || ''
+                                      })}
+                                      className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded bg-indigo-50 dark:bg-indigo-950/40 border border-indigo-200 dark:border-indigo-800 text-indigo-700 dark:text-indigo-300 hover:bg-indigo-100 dark:hover:bg-indigo-900/60 transition-colors"
+                                      title={`Transfer ${itemName} from ${teamName} to another team`}
                                     >
-                                      Copy {details.barcodes.length} Serials
+                                      <TransferIcon className="w-3.5 h-3.5 text-indigo-500" />
+                                      Transfer Team
                                     </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => setExpandedTeamItemKey(isExpanded ? null : itemKey)}
-                                      className="px-3 py-1 text-xs font-medium rounded bg-blue-50 text-blue-700 hover:bg-blue-100 dark:bg-blue-900/40 dark:text-blue-300 transition-colors"
-                                    >
-                                      {isExpanded ? 'Hide Serial Numbers' : `View ${details.barcodes.length} Serial Numbers`}
-                                    </button>
-                                  </div>
-                                )}
+                                  )}
+                                  {details.isUnique && details.barcodes.length > 0 && (
+                                    <>
+                                      <button
+                                        type="button"
+                                        onClick={() => copyToClipboard(details.barcodes.join('\n'), `Copied ${details.barcodes.length} serials for ${itemName}`)}
+                                        className="px-2.5 py-1 text-xs font-medium rounded border border-zinc-300 dark:border-zinc-600 hover:bg-zinc-100 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-300 transition-colors"
+                                      >
+                                        Copy {details.barcodes.length} Serials
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => setExpandedTeamItemKey(isExpanded ? null : itemKey)}
+                                        className="px-3 py-1 text-xs font-medium rounded bg-blue-50 text-blue-700 hover:bg-blue-100 dark:bg-blue-900/40 dark:text-blue-300 transition-colors"
+                                      >
+                                        {isExpanded ? 'Hide Serial Numbers' : `View ${details.barcodes.length} Serial Numbers`}
+                                      </button>
+                                    </>
+                                  )}
+                                </div>
                               </div>
 
                               {/* Expandable list of serial numbers */}

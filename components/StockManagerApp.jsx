@@ -827,8 +827,13 @@ const StockManagerApp = ({
     location: '',
     quantity: 1,
     maxQuantity: 1,
+    specificItem: null,
+    selectedSerials: [],
   });
   const [isTransferringTeam, setIsTransferringTeam] = useState(false);
+  const [transferTeamSearchQuery, setTransferTeamSearchQuery] = useState('');
+  const [transferTeamSearchError, setTransferTeamSearchError] = useState(null);
+  const [isTransferTeamScanning, setIsTransferTeamScanning] = useState(false);
 
   const isAdminProfile = selectedProfile?.role === 'Admin';
   // Hide Stock Take in mobile bottom nav bar for admins on both native app and mobile webapp, but show for normal users
@@ -4187,29 +4192,239 @@ const StockManagerApp = ({
     }
   };
 
-  const handleOpenTeamTransfer = (groupOrItem) => {
-    if (!groupOrItem) return;
-    const maxQty = groupOrItem.quantity || (groupOrItem.items ? groupOrItem.items.length : 1);
-    const fromTeam = groupOrItem.assigned_to;
+  // Items that currently have units assigned to any team (for team transfers)
+  const stockedAssignedItemTypes = useMemo(() => {
+    if (!itemTypes || !stock) return [];
+    return itemTypes
+      .map(it => {
+        const assignedUnits = stock.filter(s => s.name === it.name && s.assigned_to && s.assigned_to !== Team.UNASSIGNED);
+        return {
+          ...it,
+          totalAssigned: assignedUnits.length,
+        };
+      })
+      .filter(it => it.totalAssigned > 0);
+  }, [itemTypes, stock]);
+
+  // Teams currently holding the selected item in transferTeamData
+  const teamsHoldingSelectedAssignedItem = useMemo(() => {
+    if (!stock || !transferTeamData.itemName) return [];
+    const units = stock.filter(s => s.name === transferTeamData.itemName && s.assigned_to && s.assigned_to !== Team.UNASSIGNED);
+    const byTeam = {};
+    units.forEach(u => {
+      if (!byTeam[u.assigned_to]) {
+        byTeam[u.assigned_to] = { teamName: u.assigned_to, count: 0, items: [] };
+      }
+      byTeam[u.assigned_to].count += 1;
+      byTeam[u.assigned_to].items.push(u);
+    });
+    return Object.values(byTeam);
+  }, [stock, transferTeamData.itemName]);
+
+  // All units of current item held by current fromTeam
+  const unitsHeldByFromTeam = useMemo(() => {
+    if (!stock || !transferTeamData.itemName || !transferTeamData.fromTeam) return [];
+    return stock.filter(s => 
+      s.name === transferTeamData.itemName && 
+      s.assigned_to === transferTeamData.fromTeam
+    );
+  }, [stock, transferTeamData.itemName, transferTeamData.fromTeam]);
+
+  const handleLookupTeamTransferItem = useCallback((queryToLookup) => {
+    const rawQuery = (typeof queryToLookup === 'string' ? queryToLookup : transferTeamSearchQuery).trim();
+    if (!rawQuery) return;
+    setTransferTeamSearchError(null);
+    const cleanQuery = rawQuery.toLowerCase();
+
+    // 1. Check for specific serial match in assigned stock
+    const exactAssignedSerial = stock.find(s => 
+      String(s.barcode || '').trim().toLowerCase() === cleanQuery && 
+      s.assigned_to && s.assigned_to !== Team.UNASSIGNED
+    );
+
+    if (exactAssignedSerial) {
+      playBeep('success');
+      const fromTeam = exactAssignedSerial.assigned_to;
+      const defaultToTeam = teams.find(t => t.name !== fromTeam)?.name || '';
+      const itemLoc = exactAssignedSerial.location || displayLocations[0] || Location.LEADING_STORES;
+      
+      setTransferTeamData({
+        groupOrItem: exactAssignedSerial,
+        itemName: exactAssignedSerial.name,
+        fromTeam,
+        toTeam: defaultToTeam,
+        location: itemLoc,
+        quantity: 1,
+        maxQuantity: 1,
+        specificItem: exactAssignedSerial,
+        selectedSerials: exactAssignedSerial.barcode ? [exactAssignedSerial.barcode] : [],
+      });
+      setTransferTeamSearchQuery('');
+      setTransferTeamSearchError(null);
+      return;
+    }
+
+    // Check if it's a serial number in stock but currently UNASSIGNED (in storehouse)
+    const unassignedSerial = stock.find(s => 
+      String(s.barcode || '').trim().toLowerCase() === cleanQuery && 
+      s.assigned_to === Team.UNASSIGNED
+    );
+    if (unassignedSerial) {
+      playBeep('error');
+      setTransferTeamSearchError(`Item "${unassignedSerial.name}" (${rawQuery}) is in storehouse (${unassignedSerial.location}) and not signed out to any team. Use "Scan Out" to assign it.`);
+      return;
+    }
+
+    // 2. Check for supplier part number match in partNumberLookupMap
+    const partEntry = partNumberLookupMap ? partNumberLookupMap[cleanQuery] : null;
+    let matchedItemTypeName = partEntry?.itemTypeName;
+
+    // 3. Check for item type barcode match
+    if (!matchedItemTypeName) {
+      const typeMatch = itemTypes.find(it => 
+        String(it.barcode || '').trim().toLowerCase() === cleanQuery
+      );
+      if (typeMatch) {
+        matchedItemTypeName = typeMatch.name;
+      }
+    }
+
+    // 4. Check for partial name match if query is at least 3 chars
+    if (!matchedItemTypeName && rawQuery.length >= 3) {
+      const nameMatch = itemTypes.find(it => 
+        it.name.toLowerCase().includes(cleanQuery) &&
+        stock.some(s => s.name === it.name && s.assigned_to && s.assigned_to !== Team.UNASSIGNED)
+      );
+      if (nameMatch) {
+        matchedItemTypeName = nameMatch.name;
+      }
+    }
+
+    if (matchedItemTypeName) {
+      const assignedUnits = stock.filter(s => s.name === matchedItemTypeName && s.assigned_to && s.assigned_to !== Team.UNASSIGNED);
+      if (assignedUnits.length === 0) {
+        playBeep('error');
+        setTransferTeamSearchError(`"${matchedItemTypeName}" has 0 units currently signed out to any team.`);
+        return;
+      }
+
+      playBeep('success');
+      const teamsHolding = [...new Set(assignedUnits.map(u => u.assigned_to))];
+      const fromTeam = teamsHolding[0];
+      const defaultToTeam = teams.find(t => t.name !== fromTeam)?.name || '';
+      const teamUnits = assignedUnits.filter(u => u.assigned_to === fromTeam);
+      const itemLoc = teamUnits[0]?.location || displayLocations[0] || Location.LEADING_STORES;
+
+      setTransferTeamData({
+        groupOrItem: null,
+        itemName: matchedItemTypeName,
+        fromTeam,
+        toTeam: defaultToTeam,
+        location: itemLoc,
+        quantity: 1,
+        maxQuantity: teamUnits.length,
+        specificItem: null,
+        selectedSerials: [],
+      });
+      setTransferTeamSearchQuery('');
+      setTransferTeamSearchError(null);
+      return;
+    }
+
+    playBeep('error');
+    setTransferTeamSearchError(`No signed-out item or serial number matching "${rawQuery}" was found.`);
+  }, [stock, transferTeamSearchQuery, partNumberLookupMap, itemTypes, teams, displayLocations, playBeep]);
+
+  const handleOpenTeamTransfer = (groupOrItem = null) => {
+    setTransferTeamSearchQuery('');
+    setTransferTeamSearchError(null);
+    setIsTransferTeamScanning(false);
+
+    if (groupOrItem) {
+      const itemName = groupOrItem.name || groupOrItem.itemName || '';
+      const fromTeam = groupOrItem.assigned_to || groupOrItem.fromTeam || '';
+      const defaultToTeam = teams.find(t => t.name !== fromTeam)?.name || '';
+      const itemLoc = groupOrItem.location || (activeLocation !== 'All' ? activeLocation : (displayLocations[0] || Location.LEADING_STORES));
+      
+      let specificItem = null;
+      let selectedSerials = [];
+      let maxQty = 1;
+
+      if (groupOrItem.id && groupOrItem.barcode) {
+        // Specific individual stock item
+        specificItem = groupOrItem;
+        selectedSerials = [groupOrItem.barcode];
+        maxQty = 1;
+      } else if (groupOrItem.barcodes && groupOrItem.barcodes.length > 0) {
+        maxQty = groupOrItem.quantity || groupOrItem.barcodes.length;
+        selectedSerials = groupOrItem.barcodes.slice(0, maxQty);
+      } else if (groupOrItem.items && groupOrItem.items.length > 0) {
+        maxQty = groupOrItem.items.length;
+      } else {
+        maxQty = groupOrItem.quantity || 1;
+      }
+
+      setTransferTeamData({
+        groupOrItem,
+        itemName,
+        fromTeam,
+        toTeam: defaultToTeam,
+        location: itemLoc,
+        quantity: maxQty,
+        maxQuantity: maxQty,
+        specificItem,
+        selectedSerials,
+      });
+      setIsTransferTeamModalOpen(true);
+      return;
+    }
+
+    // Opened generally from Dashboard or Actions menu without pre-selected item
+    const assignedTypes = itemTypes
+      .filter(it => stock.some(s => s.name === it.name && s.assigned_to && s.assigned_to !== Team.UNASSIGNED));
+
+    let initialName = assignedTypes.length > 0 ? assignedTypes[0].name : '';
+    let fromTeam = '';
+    let maxQty = 1;
+    let itemLoc = (activeLocation !== 'All' ? activeLocation : (displayLocations[0] || Location.LEADING_STORES));
+
+    if (initialName) {
+      const units = stock.filter(s => s.name === initialName && s.assigned_to && s.assigned_to !== Team.UNASSIGNED);
+      if (units.length > 0) {
+        fromTeam = units[0].assigned_to;
+        itemLoc = units[0].location || itemLoc;
+        maxQty = units.filter(u => u.assigned_to === fromTeam).length;
+      }
+    }
+
     const defaultToTeam = teams.find(t => t.name !== fromTeam)?.name || '';
-    const itemLoc = groupOrItem.location || (activeLocation !== 'All' ? activeLocation : (displayLocations[0] || Location.LEADING_STORES));
 
     setTransferTeamData({
-      groupOrItem,
-      itemName: groupOrItem.name,
+      groupOrItem: null,
+      itemName: initialName,
       fromTeam,
       toTeam: defaultToTeam,
       location: itemLoc,
-      quantity: maxQty,
+      quantity: 1,
       maxQuantity: maxQty,
+      specificItem: null,
+      selectedSerials: [],
     });
     setIsTransferTeamModalOpen(true);
   };
 
   const handleConfirmTeamTransfer = async (e) => {
     if (e && e.preventDefault) e.preventDefault();
-    const { groupOrItem, itemName, fromTeam, toTeam, location, quantity } = transferTeamData;
+    const { itemName, fromTeam, toTeam, location, quantity, specificItem, selectedSerials } = transferTeamData;
 
+    if (!itemName) {
+      setError("Please select an item to transfer.");
+      return;
+    }
+    if (!fromTeam) {
+      setError("Please select the originating team currently holding the item.");
+      return;
+    }
     if (!toTeam) {
       setError("Please select a target team or surveyor to transfer to.");
       return;
@@ -4219,32 +4434,56 @@ const StockManagerApp = ({
       return;
     }
 
-    const qty = parseInt(quantity, 10);
-    if (isNaN(qty) || qty < 1) {
-      setError("Please enter a valid transfer quantity.");
-      return;
-    }
-
     setIsTransferringTeam(true);
     setError(null);
     try {
       let itemIdsToTransfer = [];
-      if (groupOrItem.items && groupOrItem.items.length > 0) {
-        if (qty > groupOrItem.items.length) {
-          throw new Error(`Cannot transfer more than ${groupOrItem.items.length} units.`);
-        }
-        itemIdsToTransfer = groupOrItem.items.slice(0, qty).map(i => i.id);
+
+      if (specificItem) {
+        itemIdsToTransfer = [specificItem.id];
+      } else if (selectedSerials && selectedSerials.length > 0) {
+        const matchingUnits = stock.filter(s => 
+          s.name === itemName && 
+          s.assigned_to === fromTeam && 
+          selectedSerials.includes(s.barcode)
+        );
+        itemIdsToTransfer = matchingUnits.map(u => u.id);
       } else {
-        itemIdsToTransfer = [groupOrItem.id];
+        const qty = parseInt(quantity, 10);
+        if (isNaN(qty) || qty < 1) {
+          throw new Error("Please enter a valid transfer quantity.");
+        }
+        const availableUnits = stock.filter(s => 
+          s.name === itemName && 
+          s.assigned_to === fromTeam
+        );
+        if (availableUnits.length === 0) {
+          throw new Error(`No units of "${itemName}" found currently assigned to ${fromTeam}.`);
+        }
+        if (qty > availableUnits.length) {
+          throw new Error(`Cannot transfer ${qty} units. Only ${availableUnits.length} assigned to ${fromTeam}.`);
+        }
+        itemIdsToTransfer = availableUnits.slice(0, qty).map(i => i.id);
       }
 
-      await bulkUpdateAssignments(itemIdsToTransfer, location, toTeam, selectedProfile.name);
+      if (itemIdsToTransfer.length === 0) {
+        throw new Error("No items selected to transfer.");
+      }
+
+      const targetLoc = location || (activeLocation !== 'All' ? activeLocation : (displayLocations[0] || Location.LEADING_STORES));
+      await bulkUpdateAssignments(itemIdsToTransfer, targetLoc, toTeam, selectedProfile.name);
       await refetchStock();
 
-      setSuccessMessage(`Successfully transferred ${itemIdsToTransfer.length}x ${itemName} from ${fromTeam} to ${toTeam}.`);
+      const itemTypeObj = itemTypes.find(it => it.name === itemName);
+      const isUniqueItem = itemTypeObj?.is_unique || false;
+      const serialsInfo = specificItem?.barcode 
+        ? ` (Serial: ${specificItem.barcode})` 
+        : (isUniqueItem && selectedSerials && selectedSerials.length > 0 ? ` (${selectedSerials.length} serials)` : '');
+
+      setSuccessMessage(`Successfully transferred ${itemIdsToTransfer.length}x ${itemName}${serialsInfo} from ${fromTeam} to ${toTeam}.`);
       setTimeout(() => setSuccessMessage(null), 3500);
       setIsTransferTeamModalOpen(false);
-      setTransferTeamData({ groupOrItem: null, itemName: '', fromTeam: '', toTeam: '', location: '', quantity: 1, maxQuantity: 1 });
+      setTransferTeamData({ groupOrItem: null, itemName: '', fromTeam: '', toTeam: '', location: '', quantity: 1, maxQuantity: 1, specificItem: null, selectedSerials: [] });
     } catch (err) {
       setError(`Failed to transfer to team: ${err.message}`);
     } finally {
@@ -4891,7 +5130,7 @@ const StockManagerApp = ({
                   </button>
               </div>
               <div className="mt-2 text-center">
-                  <span className="text-[10px] font-medium text-zinc-400 dark:text-zinc-500 tracking-wider">V0.13</span>
+                  <span className="text-[10px] font-medium text-zinc-400 dark:text-zinc-500 tracking-wider">V0.14</span>
               </div>
           </div>
         </aside>
@@ -5440,15 +5679,26 @@ const StockManagerApp = ({
                                       {activeLocation === 'All' ? "All Storehouses (Entire Company)" : `Storehouse: ${activeLocation}`}
                                     </span>
                                   </div>
-                                  <button
-                                    type="button"
-                                    onClick={() => handleOpenLocationTransfer()}
-                                    className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-md text-xs sm:text-sm font-semibold transition-colors flex items-center gap-1.5 shadow-xs"
-                                    title="Transfer stock between locations / storehouses"
-                                  >
-                                    <TransferIcon className="w-4 h-4" />
-                                    <span>Transfer Stock</span>
-                                  </button>
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <button
+                                      type="button"
+                                      onClick={() => handleOpenLocationTransfer()}
+                                      className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-md text-xs sm:text-sm font-semibold transition-colors flex items-center gap-1.5 shadow-xs"
+                                      title="Transfer stock between locations / storehouses"
+                                    >
+                                      <TransferIcon className="w-4 h-4" />
+                                      <span>Transfer Storehouse</span>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleOpenTeamTransfer()}
+                                      className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-md text-xs sm:text-sm font-semibold transition-colors flex items-center gap-1.5 shadow-xs"
+                                      title="Move signed-out items between teams or surveyors"
+                                    >
+                                      <UsersIcon className="w-4 h-4" />
+                                      <span>Transfer Between Teams</span>
+                                    </button>
+                                  </div>
                                 </div>
                                 
                                 <div className="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
@@ -6689,6 +6939,7 @@ const StockManagerApp = ({
                           setError={setError}
                           setIsPrintInfoModalOpen={setIsPrintInfoModalOpen}
                           isTrainingMode={isTrainingMode}
+                          onOpenTeamTransfer={handleOpenTeamTransfer}
                        />
                      )}
                      {currentView === View.PURCHASING && isAdminProfile && (
@@ -7038,6 +7289,22 @@ const StockManagerApp = ({
                   <AddIcon className="w-10 h-10 text-green-600 dark:text-green-400 mb-2" />
                   <p className="font-semibold text-zinc-800 dark:text-zinc-100">Add Manually</p>
                   <p className="text-xs text-zinc-500 dark:text-zinc-400">Enter item details without scanning.</p>
+              </button>
+              <button
+                  onClick={() => {
+                      setIsScanModeModalOpen(false);
+                      handleOpenTeamTransfer();
+                  }}
+                  className="col-span-2 flex items-center justify-between p-3.5 bg-white dark:bg-zinc-700/50 border border-zinc-200 dark:border-zinc-700 rounded-lg hover:bg-indigo-50 dark:hover:bg-indigo-900/20 hover:border-indigo-400 dark:hover:border-indigo-600 transition-all text-left"
+              >
+                  <div className="flex items-center gap-3">
+                      <UsersIcon className="w-8 h-8 text-indigo-600 dark:text-indigo-400 flex-shrink-0" />
+                      <div>
+                          <p className="font-semibold text-sm text-zinc-800 dark:text-zinc-100">Team Handover / Transfer</p>
+                          <p className="text-xs text-zinc-500 dark:text-zinc-400">Reassign signed-out stock between teams or surveyors in the field.</p>
+                      </div>
+                  </div>
+                  <span className="text-xs font-semibold text-indigo-600 dark:text-indigo-400 bg-indigo-100 dark:bg-indigo-950/60 px-2.5 py-1 rounded">Transfer &rarr;</span>
               </button>
               <button
                   onClick={() => { setIsScanModeModalOpen(false); navigateTo(View.STOCK_TAKE); }}
@@ -10125,10 +10392,13 @@ const StockManagerApp = ({
         isOpen={isTransferTeamModalOpen}
         onClose={() => {
           setIsTransferTeamModalOpen(false);
-          setTransferTeamData({ groupOrItem: null, itemName: '', fromTeam: '', toTeam: '', location: '', quantity: 1, maxQuantity: 1 });
+          setTransferTeamData({ groupOrItem: null, itemName: '', fromTeam: '', toTeam: '', location: '', quantity: 1, maxQuantity: 1, specificItem: null, selectedSerials: [] });
+          setTransferTeamSearchQuery('');
+          setTransferTeamSearchError(null);
+          setIsTransferTeamScanning(false);
         }}
         title="Transfer Assigned Stock Between Teams"
-        maxWidth="max-w-lg"
+        maxWidth="max-w-xl"
       >
         <form onSubmit={handleConfirmTeamTransfer} className="space-y-4">
           <div className="p-3 bg-indigo-50 dark:bg-indigo-950/40 border border-indigo-200 dark:border-indigo-800 rounded-lg text-xs text-indigo-900 dark:text-indigo-200 flex items-start gap-2.5">
@@ -10136,51 +10406,227 @@ const StockManagerApp = ({
             <div>
               <p className="font-semibold">Team-to-Team Handover</p>
               <p className="mt-0.5 text-indigo-800 dark:text-indigo-300">
-                Directly reassign signed-out stock from <strong>{transferTeamData.fromTeam}</strong> to another team or surveyor. Movement will be logged in reports.
+                Directly reassign signed-out stock between teams or surveyors. When a supervising team hands items to an adjacent team, stock control logs it here to preserve valid records and audit trails.
               </p>
             </div>
           </div>
 
-          <div className="p-3 bg-zinc-50 dark:bg-zinc-800 rounded-lg border border-zinc-200 dark:border-zinc-700 space-y-2">
-            <div>
-              <span className="text-xs text-zinc-500 dark:text-zinc-400 uppercase font-semibold">Item</span>
-              <p className="text-sm font-bold text-zinc-900 dark:text-zinc-100">{transferTeamData.itemName}</p>
+          {/* Quick Barcode / Serial Lookup Bar */}
+          <div className="p-3 bg-zinc-50 dark:bg-zinc-800/60 rounded-lg border border-zinc-200 dark:border-zinc-700 space-y-2">
+            <div className="flex items-center justify-between">
+              <label htmlFor="team-transfer-search" className="block text-xs font-semibold uppercase tracking-wider text-zinc-600 dark:text-zinc-400">
+                Quick Scan / Lookup Barcode or Serial
+              </label>
+              <button
+                type="button"
+                onClick={() => setIsTransferTeamScanning(true)}
+                className="inline-flex items-center gap-1 text-xs font-semibold text-indigo-600 dark:text-indigo-400 hover:text-indigo-800 dark:hover:text-indigo-300"
+              >
+                <BarcodeIcon className="w-3.5 h-3.5" />
+                <span>{scannerPreference === 'camera' ? 'Open Camera Scanner' : 'Open External Scanner'}</span>
+              </button>
             </div>
-            <div className="flex items-center gap-2 flex-wrap text-xs">
-              <span className="px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-900/40 text-amber-900 dark:text-amber-200 font-semibold">
-                Currently Assigned To: {transferTeamData.fromTeam}
-              </span>
-              <span className="text-zinc-500 dark:text-zinc-400">
-                Total Assigned: <strong>{transferTeamData.maxQuantity}</strong> unit{transferTeamData.maxQuantity !== 1 ? 's' : ''}
-              </span>
+            <div className="flex items-center gap-2">
+              <div className="relative flex-1">
+                <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-zinc-400">
+                  <SearchIcon className="h-4 w-4" />
+                </div>
+                <input
+                  id="team-transfer-search"
+                  type="text"
+                  value={transferTeamSearchQuery}
+                  onChange={(e) => {
+                    setTransferTeamSearchQuery(e.target.value);
+                    if (transferTeamSearchError) setTransferTeamSearchError(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      handleLookupTeamTransferItem(transferTeamSearchQuery);
+                    }
+                  }}
+                  placeholder="Scan or type barcode, serial, or part #..."
+                  className={formInputStyle + " pl-9 pr-3 text-sm py-2 font-mono"}
+                  autoComplete="off"
+                />
+              </div>
+              <button
+                type="button"
+                onClick={() => handleLookupTeamTransferItem(transferTeamSearchQuery)}
+                disabled={!transferTeamSearchQuery.trim()}
+                className="px-3 py-2 bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-700 dark:hover:bg-zinc-600 text-zinc-800 dark:text-zinc-200 text-xs font-semibold rounded-md border border-zinc-200 dark:border-zinc-600 transition-colors flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
+                title="Lookup signed-out item by barcode, serial, or part number"
+              >
+                <SearchIcon className="w-3.5 h-3.5" />
+                <span>Find</span>
+              </button>
             </div>
-            {transferTeamData.groupOrItem?.barcodes && transferTeamData.groupOrItem.barcodes.length > 0 && (
-              <div className="text-xs font-mono text-zinc-500 dark:text-zinc-400">
-                Serial(s): {transferTeamData.groupOrItem.barcodes.slice(0, 3).join(', ')}{transferTeamData.groupOrItem.barcodes.length > 3 ? '...' : ''}
+            {transferTeamSearchError && (
+              <div className="p-2.5 bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700/60 rounded-md text-xs text-amber-900 dark:text-amber-200 flex items-start justify-between gap-2">
+                <div className="flex items-start gap-1.5">
+                  <AlertTriangleIcon className="w-4 h-4 text-amber-600 dark:text-amber-400 flex-shrink-0 mt-0.5" />
+                  <span>{transferTeamSearchError}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setTransferTeamSearchError(null)}
+                  className="text-amber-700 dark:text-amber-400 hover:text-amber-900 font-bold"
+                >
+                  &times;
+                </button>
               </div>
             )}
           </div>
 
-          <div>
-            <label htmlFor="transfer-to-team" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-              Transfer to Team / Surveyor <span className="text-red-500">*</span>
-            </label>
-            <select
-              id="transfer-to-team"
-              value={transferTeamData.toTeam}
-              onChange={(e) => setTransferTeamData(prev => ({ ...prev, toTeam: e.target.value }))}
-              className={formInputStyle + " text-sm py-2.5"}
-              required
-            >
-              <option value="" disabled>Select destination team / surveyor...</option>
-              {teams
-                .filter(t => t.name !== transferTeamData.fromTeam)
-                .map(team => (
-                  <option key={team.id} value={team.name}>
-                    {team.name} ({team.type || 'Team'}) {team.barcode ? `[${team.barcode}]` : ''}
+          {/* Selected Item Card OR Dropdown */}
+          {transferTeamData.specificItem ? (
+            <div className="p-3.5 bg-zinc-50 dark:bg-zinc-800/80 rounded-lg border border-zinc-200 dark:border-zinc-700 space-y-2.5">
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <span className="text-[10px] text-zinc-500 dark:text-zinc-400 uppercase font-bold tracking-wider">
+                    Selected Serialized Item
+                  </span>
+                  <p className="text-sm font-bold text-zinc-900 dark:text-zinc-100">{transferTeamData.specificItem.name}</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setTransferTeamData(prev => ({ ...prev, specificItem: null, selectedSerials: [] }))}
+                  className="text-xs text-indigo-600 dark:text-indigo-400 hover:underline font-medium"
+                >
+                  Choose Different Item
+                </button>
+              </div>
+              <div className="flex items-center gap-2 flex-wrap text-xs">
+                {transferTeamData.specificItem.barcode && (
+                  <span className="font-mono bg-white dark:bg-zinc-900 px-2 py-0.5 rounded border border-zinc-200 dark:border-zinc-700 text-zinc-800 dark:text-zinc-200">
+                    Serial: <strong>{transferTeamData.specificItem.barcode}</strong>
+                  </span>
+                )}
+                <span className="px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-900/40 text-amber-900 dark:text-amber-200 font-medium">
+                  Currently With: {transferTeamData.fromTeam}
+                </span>
+                <span className="px-2 py-0.5 rounded bg-blue-100 dark:bg-blue-900/40 text-blue-800 dark:text-blue-300 font-medium">
+                  Storehouse: {transferTeamData.location}
+                </span>
+              </div>
+            </div>
+          ) : (
+            <div>
+              <div className="mb-1">
+                <label htmlFor="transfer-team-item-select" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">
+                  Item to Transfer <span className="text-red-500">*</span>
+                </label>
+              </div>
+              <select
+                id="transfer-team-item-select"
+                value={transferTeamData.itemName}
+                onChange={(e) => {
+                  const newName = e.target.value;
+                  const units = stock.filter(s => s.name === newName && s.assigned_to && s.assigned_to !== Team.UNASSIGNED);
+                  const teamsWithStock = [...new Set(units.map(u => u.assigned_to))];
+                  const newFrom = teamsWithStock.includes(transferTeamData.fromTeam)
+                    ? transferTeamData.fromTeam
+                    : (teamsWithStock[0] || '');
+                  const newTo = teams.find(t => t.name !== newFrom)?.name || '';
+                  const teamUnits = units.filter(u => u.assigned_to === newFrom);
+                  const newLoc = teamUnits[0]?.location || displayLocations[0] || Location.LEADING_STORES;
+
+                  setTransferTeamData(prev => ({
+                    ...prev,
+                    itemName: newName,
+                    fromTeam: newFrom,
+                    toTeam: newTo,
+                    location: newLoc,
+                    quantity: 1,
+                    maxQuantity: teamUnits.length,
+                    specificItem: null,
+                    selectedSerials: [],
+                  }));
+                }}
+                className={formInputStyle + " text-sm py-2"}
+                required
+              >
+                <option value="" disabled>
+                  {stockedAssignedItemTypes.length === 0 ? 'No items are currently signed out to teams' : 'Select an item currently signed out...'}
+                </option>
+                {stockedAssignedItemTypes.map(it => (
+                  <option key={it.id || it.name} value={it.name}>
+                    {it.name} ({it.totalAssigned} currently assigned to teams)
                   </option>
                 ))}
-            </select>
+              </select>
+            </div>
+          )}
+
+          {/* From Team and To Team Row */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label htmlFor="transfer-from-team" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                From Team / Surveyor <span className="text-red-500">*</span>
+              </label>
+              {transferTeamData.specificItem ? (
+                <input
+                  type="text"
+                  disabled
+                  value={transferTeamData.fromTeam}
+                  className={formInputStyle + " bg-zinc-100 dark:bg-zinc-800 cursor-not-allowed text-sm py-2 font-medium"}
+                />
+              ) : (
+                <select
+                  id="transfer-from-team"
+                  value={transferTeamData.fromTeam}
+                  onChange={(e) => {
+                    const newFrom = e.target.value;
+                    const teamUnits = stock.filter(s => s.name === transferTeamData.itemName && s.assigned_to === newFrom);
+                    const newTo = transferTeamData.toTeam === newFrom
+                      ? (teams.find(t => t.name !== newFrom)?.name || '')
+                      : transferTeamData.toTeam;
+                    const newLoc = teamUnits[0]?.location || transferTeamData.location || displayLocations[0];
+
+                    setTransferTeamData(prev => ({
+                      ...prev,
+                      fromTeam: newFrom,
+                      toTeam: newTo,
+                      location: newLoc,
+                      quantity: 1,
+                      maxQuantity: teamUnits.length,
+                      selectedSerials: [],
+                    }));
+                  }}
+                  className={formInputStyle + " text-sm py-2 font-medium"}
+                  required
+                >
+                  <option value="" disabled>Select giving team / surveyor...</option>
+                  {teamsHoldingSelectedAssignedItem.map(th => (
+                    <option key={th.teamName} value={th.teamName}>
+                      {th.teamName} ({th.count} units held)
+                    </option>
+                  ))}
+                </select>
+              )}
+            </div>
+
+            <div>
+              <label htmlFor="transfer-to-team" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                To Team / Surveyor <span className="text-red-500">*</span>
+              </label>
+              <select
+                id="transfer-to-team"
+                value={transferTeamData.toTeam}
+                onChange={(e) => setTransferTeamData(prev => ({ ...prev, toTeam: e.target.value }))}
+                className={formInputStyle + " text-sm py-2 font-medium"}
+                required
+              >
+                <option value="" disabled>Select receiving team / surveyor...</option>
+                {teams
+                  .filter(t => t.name !== transferTeamData.fromTeam)
+                  .map(team => (
+                    <option key={team.id} value={team.name}>
+                      {team.name} ({team.type || 'Team'}) {team.barcode ? `[${team.barcode}]` : ''}
+                    </option>
+                  ))}
+              </select>
+            </div>
           </div>
 
           <div>
@@ -10198,48 +10644,130 @@ const StockManagerApp = ({
               ))}
             </select>
             <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">
-              Keep current storehouse or update to the new team's primary depot.
+              Storehouse associated with this stock movement.
             </p>
           </div>
 
-          {transferTeamData.maxQuantity > 1 && (
-            <div>
-              <div className="flex justify-between items-center mb-1">
-                <label htmlFor="transfer-team-qty" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">
-                  Quantity to Transfer
-                </label>
-                <span className="text-xs text-zinc-500 dark:text-zinc-400">
-                  Max: <strong>{transferTeamData.maxQuantity}</strong>
-                </span>
+          {/* Serial Number Selection or Quantity Input */}
+          {!transferTeamData.specificItem && (() => {
+            const currentItemType = itemTypes.find(it => it.name === transferTeamData.itemName);
+            const isUnique = currentItemType?.is_unique || false;
+            const availableUnits = unitsHeldByFromTeam;
+            const availableSerials = availableUnits.map(u => u.barcode).filter(Boolean);
+            const maxCount = availableUnits.length;
+
+            if (isUnique && availableSerials.length > 0) {
+              const allSelected = transferTeamData.selectedSerials.length === availableSerials.length;
+              return (
+                <div className="space-y-2 pt-1 border-t border-zinc-200 dark:border-zinc-700">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <span className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">
+                        Select Serial Number(s) to Transfer
+                      </span>
+                      <span className="text-xs text-zinc-500 dark:text-zinc-400">
+                        {transferTeamData.selectedSerials.length} of {availableSerials.length} serials selected
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setTransferTeamData(prev => ({
+                            ...prev,
+                            selectedSerials: allSelected ? [] : [...availableSerials],
+                            quantity: allSelected ? 0 : availableSerials.length,
+                          }));
+                        }}
+                        className="px-2 py-1 text-xs font-semibold rounded bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-700 dark:hover:bg-zinc-600 text-zinc-700 dark:text-zinc-200 transition-colors"
+                      >
+                        {allSelected ? 'Deselect All' : `Select All (${availableSerials.length})`}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap gap-1.5 max-h-36 overflow-y-auto p-2 bg-zinc-50 dark:bg-zinc-900/60 rounded-md border border-zinc-200 dark:border-zinc-700 font-mono text-xs">
+                    {availableSerials.map(sn => {
+                      const isSelected = transferTeamData.selectedSerials.includes(sn);
+                      return (
+                        <button
+                          key={sn}
+                          type="button"
+                          onClick={() => {
+                            setTransferTeamData(prev => {
+                              const exists = prev.selectedSerials.includes(sn);
+                              const updated = exists
+                                ? prev.selectedSerials.filter(s => s !== sn)
+                                : [...prev.selectedSerials, sn];
+                              return {
+                                ...prev,
+                                selectedSerials: updated,
+                                quantity: updated.length,
+                              };
+                            });
+                          }}
+                          className={`px-2.5 py-1 rounded border text-xs font-medium transition-colors ${
+                            isSelected
+                              ? 'bg-indigo-600 text-white border-indigo-600 shadow-xs'
+                              : 'bg-white dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 border-zinc-300 dark:border-zinc-700 hover:border-indigo-400'
+                          }`}
+                        >
+                          {isSelected ? '✓ ' : ''}{sn}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            }
+
+            return (
+              <div>
+                <div className="flex justify-between items-center mb-1">
+                  <label htmlFor="transfer-team-qty" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">
+                    Quantity to Transfer
+                  </label>
+                  <span className="text-xs text-zinc-500 dark:text-zinc-400">
+                    Available with {transferTeamData.fromTeam || 'team'}: <strong>{maxCount}</strong>
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    id="transfer-team-qty"
+                    type="number"
+                    min="1"
+                    max={maxCount > 0 ? maxCount : 1}
+                    value={transferTeamData.quantity}
+                    onChange={(e) => setTransferTeamData(prev => ({
+                      ...prev,
+                      quantity: Math.min(maxCount || 1, Math.max(1, parseInt(e.target.value, 10) || 1))
+                    }))}
+                    className={formInputStyle + " text-sm py-2"}
+                    required
+                  />
+                  {maxCount > 1 && (
+                    <button
+                      type="button"
+                      onClick={() => setTransferTeamData(prev => ({ ...prev, quantity: maxCount }))}
+                      className="px-2.5 py-2 bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-700 dark:hover:bg-zinc-600 text-xs font-semibold text-zinc-700 dark:text-zinc-200 rounded whitespace-nowrap transition-colors"
+                    >
+                      Transfer All ({maxCount})
+                    </button>
+                  )}
+                </div>
               </div>
-              <div className="flex items-center gap-2">
-                <input
-                  id="transfer-team-qty"
-                  type="number"
-                  min="1"
-                  max={transferTeamData.maxQuantity}
-                  value={transferTeamData.quantity}
-                  onChange={(e) => setTransferTeamData(prev => ({ ...prev, quantity: Math.min(prev.maxQuantity, Math.max(1, parseInt(e.target.value, 10) || 1)) }))}
-                  className={formInputStyle + " text-sm py-2"}
-                  required
-                />
-                <button
-                  type="button"
-                  onClick={() => setTransferTeamData(prev => ({ ...prev, quantity: prev.maxQuantity }))}
-                  className="px-2.5 py-2 bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-700 dark:hover:bg-zinc-600 text-xs font-semibold text-zinc-700 dark:text-zinc-200 rounded whitespace-nowrap transition-colors"
-                >
-                  Transfer All ({transferTeamData.maxQuantity})
-                </button>
-              </div>
-            </div>
-          )}
+            );
+          })()}
 
           <div className="flex justify-end gap-2 pt-4 border-t border-zinc-200 dark:border-zinc-700">
             <button
               type="button"
               onClick={() => {
                 setIsTransferTeamModalOpen(false);
-                setTransferTeamData({ groupOrItem: null, itemName: '', fromTeam: '', toTeam: '', location: '', quantity: 1, maxQuantity: 1 });
+                setTransferTeamData({ groupOrItem: null, itemName: '', fromTeam: '', toTeam: '', location: '', quantity: 1, maxQuantity: 1, specificItem: null, selectedSerials: [] });
+                setTransferTeamSearchQuery('');
+                setTransferTeamSearchError(null);
+                setIsTransferTeamScanning(false);
               }}
               className="px-4 py-2 bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-600 text-zinc-700 dark:text-zinc-200 rounded-md hover:bg-zinc-50 dark:hover:bg-zinc-600 text-sm font-medium transition-colors"
             >
@@ -10247,7 +10775,13 @@ const StockManagerApp = ({
             </button>
             <button
               type="submit"
-              disabled={isTransferringTeam || !transferTeamData.toTeam || transferTeamData.toTeam === transferTeamData.fromTeam}
+              disabled={
+                isTransferringTeam ||
+                !transferTeamData.toTeam ||
+                !transferTeamData.fromTeam ||
+                transferTeamData.toTeam === transferTeamData.fromTeam ||
+                !transferTeamData.itemName
+              }
               className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-md text-sm font-semibold transition-colors flex items-center gap-1.5 shadow-xs disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {isTransferringTeam && <Spinner className="w-4 h-4 mr-1" />}
@@ -10257,6 +10791,31 @@ const StockManagerApp = ({
           </div>
         </form>
       </Modal>
+
+      {/* --- In-Team-Transfer Scanner Overlay --- */}
+      {isTransferTeamScanning && (
+        scannerPreference === 'camera' ? (
+          <Scanner
+            onScanSuccess={(code) => {
+              handleLookupTeamTransferItem(code);
+              setIsTransferTeamScanning(false);
+            }}
+            onScanError={(err) => {
+              setTransferTeamSearchError(err);
+              setIsTransferTeamScanning(false);
+            }}
+            onCancel={() => setIsTransferTeamScanning(false)}
+          />
+        ) : (
+          <ExternalScannerPage
+            onScanSuccess={(code) => {
+              handleLookupTeamTransferItem(code);
+              setIsTransferTeamScanning(false);
+            }}
+            onCancel={() => setIsTransferTeamScanning(false)}
+          />
+        )
+      )}
     </>
   );
 };

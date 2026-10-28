@@ -295,7 +295,7 @@ export const SettingsView = ({
         {/* Version & Build Info */}
         <div className="pt-2 flex flex-col items-center justify-center text-center space-y-1">
             <span className="px-3.5 py-1 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400 text-xs font-mono rounded-full font-semibold shadow-2xs tracking-wide">
-                Version V0.13
+                Version V0.14
             </span>
             <p className="text-[11px] text-zinc-400 dark:text-zinc-500">
               Bregan MainsFlow Stock Management System
