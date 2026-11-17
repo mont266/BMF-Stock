@@ -1260,7 +1260,8 @@ const StockTakePage = ({
                     : itemTypes.find(it => it.barcode && String(it.barcode).trim().toLowerCase() === lowerScan);
 
                 if (!matchedItemType) {
-                    const stockMatch = stock.find(s => String(s.barcode).trim().toLowerCase() === lowerScan);
+                    const stockMatch = stock.find(s => String(s.barcode).trim().toLowerCase() === lowerScan && isAssignedToTeam(s.assigned_to))
+                        || stock.find(s => String(s.barcode).trim().toLowerCase() === lowerScan);
                     if (stockMatch) {
                         matchedItemType = { name: stockMatch.name, barcode: stockMatch.barcode, price: stockMatch.purchase_price };
                     }
@@ -1281,14 +1282,20 @@ const StockTakePage = ({
                 setStockTakeItems([...trainingManager.getStockTakeItems(activeStockTakeRef.current.id)]);
                 if (typeof refetchStock === 'function') refetchStock();
 
+                const itemDisplayName = res.item.stock_items?.name || matchedItemType.name;
                 const returnedTeam = isAssignedToTeam(res.item.stock_items?.assigned_to) ? res.item.stock_items.assigned_to : null;
+                if (returnedTeam) {
+                    setExpandedActiveTypes(prev => ({ ...prev, [itemDisplayName]: true }));
+                }
+                playBeep(returnedTeam ? 'warn' : 'success');
                 setLastScanned({
                     success: true,
+                    variant: returnedTeam ? 'warning' : 'success',
                     message: returnedTeam
-                        ? `↩️ Returned item counted: ${res.item.stock_items?.name || matchedItemType.name} (${rawBarcode}) — currently signed out to ${returnedTeam}. Will return to stock on finalise.`
-                        : `Counted 1x ${res.item.stock_items?.name || matchedItemType.name} (Count: ${res.item.counted_quantity})`
+                        ? `↩️ Due to Return to System: ${itemDisplayName} (${rawBarcode}) is signed out to ${returnedTeam} and is marked to be returned to ${currentTargetLocation} stock when you finalise.`
+                        : `Counted 1x ${itemDisplayName} (Count: ${res.item.counted_quantity})`
                 });
-                setTimeout(() => setLastScanned(null), 4000);
+                setTimeout(() => setLastScanned(null), returnedTeam ? 8000 : 4000);
             } catch (err) {
                 console.error(err);
                 setLastScanned({ success: false, message: "Scan error: " + err.message });
@@ -1313,9 +1320,10 @@ const StockTakePage = ({
             let baseBarcode = matchedItemType?.barcode || rawBarcode;
             let matchedPhysicalSerialItem = null;
 
-            // 2. If not matched yet, check stock prop or database
+            // 2. Check stock prop (preferring team-assigned rows if duplicates exist)
             if (!matchedItemName) {
-                const stockMatch = stock.find(s => String(s.barcode).trim().toLowerCase() === lowerScan);
+                const stockMatch = stock.find(s => String(s.barcode).trim().toLowerCase() === lowerScan && isAssignedToTeam(s.assigned_to))
+                    || stock.find(s => String(s.barcode).trim().toLowerCase() === lowerScan);
                 if (stockMatch) {
                     matchedItemName = stockMatch.name;
                     baseBarcode = stockMatch.barcode;
@@ -1323,8 +1331,27 @@ const StockTakePage = ({
                 }
             }
 
+            // 2b. Always verify live DB stock_items when the scan wasn't a part number / item_type master barcode
+            // so stale cached stock never hides that a serial has been signed out to a team
+            if (!matchedItemType) {
+                const { data: liveStockMatches } = await supabase
+                    .from('stock_items')
+                    .select('*')
+                    .ilike('barcode', rawBarcode)
+                    .limit(10);
+
+                if (liveStockMatches && liveStockMatches.length > 0) {
+                    const preferred = liveStockMatches.find(r => isAssignedToTeam(r.assigned_to))
+                        || liveStockMatches.find(r => r.location === currentTargetLocation)
+                        || liveStockMatches[0];
+                    matchedPhysicalSerialItem = preferred;
+                    matchedItemName = matchedItemName || preferred.name;
+                    baseBarcode = preferred.barcode || baseBarcode;
+                }
+            }
+
             if (!matchedItemName) {
-                // Query database for part number / barcode / stock_items
+                // Query database for part number / item_type barcode
                 const { data: partData } = await supabase
                     .from('item_supplier_part_numbers')
                     .select('*, item_types(id, name)')
@@ -1342,17 +1369,6 @@ const StockTakePage = ({
                     if (typeData && typeData.length > 0) {
                         matchedItemName = typeData[0].name;
                         baseBarcode = typeData[0].barcode || rawBarcode;
-                    } else {
-                        const { data: stockData } = await supabase
-                            .from('stock_items')
-                            .select('*')
-                            .ilike('barcode', rawBarcode)
-                            .limit(1);
-                        if (stockData && stockData.length > 0) {
-                            matchedItemName = stockData[0].name;
-                            baseBarcode = stockData[0].barcode || rawBarcode;
-                            matchedPhysicalSerialItem = stockData[0];
-                        }
                     }
                 }
             }
@@ -1369,41 +1385,67 @@ const StockTakePage = ({
             const spPart = Array.isArray(supplierPartNumbers) ? supplierPartNumbers.find(p => (meta.id && p.item_type_id === meta.id) || p.item_name === matchedItemName || p.item_types?.name === matchedItemName) : null;
             const itemPrice = parseFloat(spPart?.purchase_price ?? 0) || 0;
 
-            // If it's a unique item type (serialized item or meter)
+            // If it's a unique item type (serialized item or meter) OR matched a specific physical serial row in stock_items
             const isUniqueType = !!(meta.is_unique || (meta.category && meta.category.toLowerCase().includes('meter')) || matchedItemName.toLowerCase().includes('meter'));
-            if (isUniqueType) {
-                // 1. Check if the scanned barcode matches an exact serial number in the current stock take
+            const isPartOrMasterBarcode = !!(partLookup || (meta.barcode && String(meta.barcode).trim().toLowerCase() === lowerScan));
+            const isSpecificPhysicalSerial = Boolean(matchedPhysicalSerialItem && (!isPartOrMasterBarcode || isAssignedToTeam(matchedPhysicalSerialItem.assigned_to)));
+
+            if (isUniqueType || isSpecificPhysicalSerial) {
+                // 1. Check if the scanned barcode matches an exact serial number already in the current stock take
                 const serialLower = lowerScan;
+                const matchedNameLower = matchedItemName.trim().toLowerCase();
                 const specificSerialItem = stockTakeItemsRef.current.find(sti => {
-                    const name = sti.stock_items?.name || stockMap.get(sti.item_id)?.name;
-                    if (name !== matchedItemName) return false;
+                    if (matchedPhysicalSerialItem && sti.item_id === matchedPhysicalSerialItem.id) return true;
+                    const name = (sti.stock_items?.name || stockMap.get(sti.item_id)?.name || '').trim().toLowerCase();
+                    if (name !== matchedNameLower) return false;
                     return (sti.stock_items?.barcode || '').trim().toLowerCase() === serialLower;
                 });
 
                 if (specificSerialItem) {
+                    const existingAssigned = matchedPhysicalSerialItem?.assigned_to ?? specificSerialItem.stock_items?.assigned_to ?? stockMap.get(specificSerialItem.item_id)?.assigned_to;
+                    const returnedTeam = isAssignedToTeam(existingAssigned) ? existingAssigned : null;
+
                     if ((specificSerialItem.counted_quantity || 0) > 0) {
+                        if (matchedPhysicalSerialItem) {
+                            setStockTakeItems(prev => prev.map(i => i.id === specificSerialItem.id ? { ...i, stock_items: matchedPhysicalSerialItem } : i));
+                        }
+                        if (returnedTeam) {
+                            setExpandedActiveTypes(prev => ({ ...prev, [matchedItemName]: true }));
+                            setLastScanned({
+                                success: true,
+                                variant: 'warning',
+                                message: `↩️ Due to Return to System: ${matchedItemName} (${rawBarcode}) is signed out to ${returnedTeam} and is already marked to be returned to ${currentTargetLocation} stock on finalise.`
+                            });
+                            playBeep('warn');
+                            setTimeout(() => setLastScanned(null), 8000);
+                            return;
+                        }
                         setLastScanned({ success: false, message: `Serial "${rawBarcode}" for ${matchedItemName} is already counted.` });
                         playBeep('warn');
                         return;
                     }
-                    if (isTrainingMode) {
-                        setStockTakeItems(prev => prev.map(i => i.id === specificSerialItem.id ? { ...i, counted_quantity: 1, status: 'COUNTED' } : i));
-                    } else {
-                        const { error: updErr } = await supabase
-                            .from('stock_take_items')
-                            .update({ counted_quantity: 1, status: 'COUNTED' })
-                            .eq('id', specificSerialItem.id);
-                        if (updErr) throw updErr;
 
-                        setStockTakeItems(prev => prev.map(i => i.id === specificSerialItem.id ? { ...i, counted_quantity: 1, status: 'COUNTED' } : i));
+                    const { error: updErr } = await supabase
+                        .from('stock_take_items')
+                        .update({ counted_quantity: 1, status: 'COUNTED' })
+                        .eq('id', specificSerialItem.id);
+                    if (updErr) throw updErr;
+
+                    setStockTakeItems(prev => prev.map(i => i.id === specificSerialItem.id ? {
+                        ...i,
+                        counted_quantity: 1,
+                        status: 'COUNTED',
+                        stock_items: matchedPhysicalSerialItem || i.stock_items
+                    } : i));
+
+                    if (returnedTeam) {
+                        setExpandedActiveTypes(prev => ({ ...prev, [matchedItemName]: true }));
                     }
-                    const existingAssigned = specificSerialItem.stock_items?.assigned_to ?? stockMap.get(specificSerialItem.item_id)?.assigned_to;
-                    const returnedTeam = isAssignedToTeam(existingAssigned) ? existingAssigned : null;
                     setLastScanned({
                         success: true,
                         variant: returnedTeam ? 'warning' : 'success',
                         message: returnedTeam
-                            ? `↩️ Signed Out to ${returnedTeam}: ${matchedItemName} (${rawBarcode}) has been counted and will be returned to ${currentTargetLocation} stock before finalising.`
+                            ? `↩️ Due to Return to System: ${matchedItemName} (${rawBarcode}) is signed out to ${returnedTeam} and is marked to be returned to ${currentTargetLocation} stock when you finalise.`
                             : `Scanned ${matchedItemName} (Serial ${rawBarcode}) (+1 Counted)`
                     });
                     playBeep(returnedTeam ? 'warn' : 'success');
@@ -1411,9 +1453,8 @@ const StockTakePage = ({
                     return;
                 }
 
-                // 1b. If the scanned code matches a specific physical serial in stock_items (e.g. signed out to a team, or in a rolling stock take), count it directly!
-                const isPartOrMasterBarcode = !!(partLookup || (meta.barcode && String(meta.barcode).trim().toLowerCase() === lowerScan));
-                if (!isPartOrMasterBarcode && matchedPhysicalSerialItem) {
+                // 1b. If the scanned code matches a specific physical serial in stock_items (e.g. signed out to a team, or in a rolling stock take), record it directly!
+                if (isSpecificPhysicalSerial) {
                     const wasInStockBefore = matchedPhysicalSerialItem.location === currentTargetLocation && !isAssignedToTeam(matchedPhysicalSerialItem.assigned_to);
                     const { data: insertedTakeItem, error: takeInsertError } = await supabase
                         .from('stock_take_items')
@@ -1431,11 +1472,14 @@ const StockTakePage = ({
                     setStockTakeItems(prev => [...prev, { ...insertedTakeItem, stock_items: insertedTakeItem.stock_items || matchedPhysicalSerialItem }]);
 
                     const returnedTeam = isAssignedToTeam(matchedPhysicalSerialItem.assigned_to) ? matchedPhysicalSerialItem.assigned_to : null;
+                    if (returnedTeam) {
+                        setExpandedActiveTypes(prev => ({ ...prev, [matchedItemName]: true }));
+                    }
                     setLastScanned({
                         success: true,
                         variant: returnedTeam ? 'warning' : 'success',
                         message: returnedTeam
-                            ? `↩️ Signed Out to ${returnedTeam}: ${matchedItemName} (${rawBarcode}) has been counted and will be returned to ${currentTargetLocation} stock before finalising.`
+                            ? `↩️ Due to Return to System: ${matchedItemName} (${rawBarcode}) is signed out to ${returnedTeam} and is marked to be returned to ${currentTargetLocation} stock when you finalise.`
                             : `Scanned ${matchedItemName} (Serial ${rawBarcode}) (+1 Counted)`
                     });
                     playBeep(returnedTeam ? 'warn' : 'success');
@@ -2469,6 +2513,11 @@ const StockTakePage = ({
                                         <p className="text-2xl font-bold text-blue-600 dark:text-blue-400">
                                             {stockTakeItems.reduce((acc, i) => acc + (i.counted_quantity || 0), 0)}
                                         </p>
+                                        {returnedUniqueItems.length > 0 && (
+                                            <p className="text-xs font-semibold text-amber-600 dark:text-amber-400 mt-0.5">
+                                                ↩️ {returnedUniqueItems.length} due to return to system
+                                            </p>
+                                        )}
                                     </div>
                                     <div className="p-4 bg-zinc-50 dark:bg-zinc-700/50 rounded-lg border border-zinc-200 dark:border-zinc-700">
                                         <p className="text-sm text-zinc-500 dark:text-zinc-400">Total Variance</p>
@@ -2500,12 +2549,12 @@ const StockTakePage = ({
                                             <span className="text-lg leading-none mt-0.5">↩️</span>
                                             <div>
                                                 <p className="font-bold text-sm text-amber-950 dark:text-amber-100">
-                                                    Pending Return to System ({returnedUniqueItems.length} signed-out {returnedUniqueItems.length === 1 ? 'serial' : 'serials'} scanned)
+                                                    Items Due to Return to System ({returnedUniqueItems.length} signed-out {returnedUniqueItems.length === 1 ? 'serial' : 'serials'})
                                                 </p>
                                                 <p className="mt-1 text-amber-800 dark:text-amber-300">
                                                     {returnedUniqueItems.length === 1 ? 'This scanned serial is' : 'These scanned serials are'} currently signed out to{' '}
                                                     <strong>{Array.from(new Set(returnedUniqueItems.map(r => r.fromTeam))).join(', ')}</strong>.{' '}
-                                                    They are marked for return and will automatically be returned back into{' '}
+                                                    They are marked as due for return and will automatically be returned back into{' '}
                                                     <strong>{activeStockTake.location || 'storehouse'}</strong> system stock when you finalise the stock counts.
                                                 </p>
                                             </div>
@@ -2519,7 +2568,7 @@ const StockTakePage = ({
                                             }}
                                             className="shrink-0 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-semibold text-xs transition-colors self-start sm:self-center"
                                         >
-                                            Show Pending Returns
+                                            Show Due Returns
                                         </button>
                                     </div>
                                 )}
@@ -2671,7 +2720,7 @@ const StockTakePage = ({
                                                                             )}
                                                                             {group.returnedCount > 0 && (
                                                                                 <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-200 dark:border-amber-800" title={`Signed out to: ${group.returnedTeams.join(', ')}. Will return to stock on finalise.`}>
-                                                                                    ↩️ {group.returnedCount} Pending Return ({group.returnedTeams.join(', ')})
+                                                                                    ↩️ {group.returnedCount} Due to Return ({group.returnedTeams.join(', ')})
                                                                                 </span>
                                                                             )}
                                                                         </div>
@@ -2711,10 +2760,22 @@ const StockTakePage = ({
                                                                         <span className="block text-[10px] uppercase font-bold text-zinc-400 tracking-wider">Expected</span>
                                                                         <span className="text-sm font-mono font-bold text-zinc-700 dark:text-zinc-300">{group.expected_quantity}</span>
                                                                     </div>
-                                                                    <div className="bg-blue-50/70 dark:bg-blue-950/40 p-2 rounded-lg text-center border border-blue-100 dark:border-blue-900/50">
-                                                                        <span className="block text-[10px] uppercase font-bold text-blue-500 tracking-wider">Counted</span>
-                                                                        <span className="text-sm font-mono font-bold text-blue-700 dark:text-blue-300">{group.counted_quantity}</span>
-                                                                    </div>
+                                                                    {group.returnedCount > 0 && group.returnedCount === group.counted_quantity ? (
+                                                                        <div className="bg-amber-50/80 dark:bg-amber-950/40 p-2 rounded-lg text-center border border-amber-200 dark:border-amber-800/60">
+                                                                            <span className="block text-[10px] uppercase font-bold text-amber-600 dark:text-amber-400 tracking-wider">Due Return</span>
+                                                                            <span className="text-sm font-mono font-bold text-amber-700 dark:text-amber-300">↩️ {group.returnedCount}</span>
+                                                                        </div>
+                                                                    ) : (
+                                                                        <div className="bg-blue-50/70 dark:bg-blue-950/40 p-2 rounded-lg text-center border border-blue-100 dark:border-blue-900/50">
+                                                                            <span className="block text-[10px] uppercase font-bold text-blue-500 tracking-wider">Counted</span>
+                                                                            <span className="text-sm font-mono font-bold text-blue-700 dark:text-blue-300">{group.counted_quantity}</span>
+                                                                            {group.returnedCount > 0 && (
+                                                                                <span className="block text-[9px] font-semibold text-amber-600 dark:text-amber-400">
+                                                                                    ({group.returnedCount} due return)
+                                                                                </span>
+                                                                            )}
+                                                                        </div>
+                                                                    )}
                                                                     <div className={`p-2 rounded-lg text-center border ${
                                                                         hasDiscrepancy
                                                                             ? group.variance > 0
@@ -2819,7 +2880,7 @@ const StockTakePage = ({
                                                                                         </span>
                                                                                         {raw.returnedFromTeam ? (
                                                                                             <span className="px-2 py-0.5 rounded text-[10px] font-sans font-bold bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-300 dark:border-amber-700">
-                                                                                                ↩️ Signed Out ({raw.returnedFromTeam}) — Will Return
+                                                                                                ↩️ Due to Return ({raw.returnedFromTeam})
                                                                                             </span>
                                                                                         ) : (
                                                                                             <span className={`px-2 py-0.5 rounded text-[10px] font-sans font-bold ${
@@ -2887,7 +2948,7 @@ const StockTakePage = ({
                                                                                 )}
                                                                                 {group.returnedCount > 0 && (
                                                                                     <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-200 dark:border-amber-800" title={`Signed out to: ${group.returnedTeams.join(', ')}. Will return to stock on finalise.`}>
-                                                                                        ↩️ {group.returnedCount} Pending Return ({group.returnedTeams.join(', ')})
+                                                                                        ↩️ {group.returnedCount} Due to Return ({group.returnedTeams.join(', ')})
                                                                                     </span>
                                                                                 )}
                                                                             </div>
@@ -2897,7 +2958,20 @@ const StockTakePage = ({
                                                                         </td>
                                                                         <td className="px-4 py-3 whitespace-nowrap text-sm text-zinc-500">£{group.price.toFixed(2)}</td>
                                                                         <td className="px-4 py-3 whitespace-nowrap text-sm font-semibold text-zinc-600 dark:text-zinc-400">{group.expected_quantity}</td>
-                                                                        <td className="px-4 py-3 whitespace-nowrap text-sm font-bold text-blue-600 dark:text-blue-400">{group.counted_quantity}</td>
+                                                                        <td className="px-4 py-3 whitespace-nowrap text-sm font-bold text-blue-600 dark:text-blue-400">
+                                                                            {group.returnedCount > 0 && group.returnedCount === group.counted_quantity ? (
+                                                                                <span className="text-amber-600 dark:text-amber-400">↩️ {group.returnedCount} Due Return</span>
+                                                                            ) : (
+                                                                                <>
+                                                                                    <span>{group.counted_quantity}</span>
+                                                                                    {group.returnedCount > 0 && (
+                                                                                        <span className="block text-[10px] font-semibold text-amber-600 dark:text-amber-400">
+                                                                                            ({group.returnedCount} due return)
+                                                                                        </span>
+                                                                                    )}
+                                                                                </>
+                                                                            )}
+                                                                        </td>
                                                                         <td className={`px-4 py-3 whitespace-nowrap text-sm font-bold ${hasDiscrepancy ? (group.variance > 0 ? 'text-green-600' : 'text-red-600') : 'text-zinc-500'}`}>
                                                                             {group.variance > 0 ? `+${group.variance}` : group.variance}
                                                                         </td>
@@ -2969,11 +3043,15 @@ const StockTakePage = ({
                                                                                                     </div>
                                                                                                     <div className="flex items-center gap-2.5">
                                                                                                         <span className="text-zinc-500 font-sans text-xs">
-                                                                                                            Counted: <strong>{raw.counted_quantity || 0}</strong> / Expected: {raw.expected_quantity ?? 1}
+                                                                                                            {raw.returnedFromTeam ? (
+                                                                                                                <>Due Return: <strong>{raw.counted_quantity || 0}</strong> / Expected: {raw.expected_quantity ?? 1}</>
+                                                                                                            ) : (
+                                                                                                                <>Counted: <strong>{raw.counted_quantity || 0}</strong> / Expected: {raw.expected_quantity ?? 1}</>
+                                                                                                            )}
                                                                                                         </span>
                                                                                                         {raw.returnedFromTeam ? (
                                                                                                             <span className="px-2 py-0.5 rounded text-[11px] font-sans font-semibold bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-300 dark:border-amber-700">
-                                                                                                                ↩️ Signed Out to {raw.returnedFromTeam} — Will Return to System
+                                                                                                                ↩️ Due to Return to System (from {raw.returnedFromTeam})
                                                                                                             </span>
                                                                                                         ) : (
                                                                                                             <span className={`px-2 py-0.5 rounded text-[11px] font-sans font-medium ${isCounted ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300' : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'}`}>

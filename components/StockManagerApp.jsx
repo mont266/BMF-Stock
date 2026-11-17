@@ -5565,7 +5565,11 @@ const StockManagerApp = ({
                               <div className="flex items-start">
                                   <div className="flex-shrink-0">
                                       {toast.type === 'success' ? (
-                                          <CheckCircleIcon className="h-6 w-6 text-green-400" aria-hidden="true" />
+                                          <CheckCircleIcon className="h-6 w-6 text-green-500 dark:text-green-400" aria-hidden="true" />
+                                      ) : toast.type === 'info' ? (
+                                          <InformationCircleIcon className="h-6 w-6 text-blue-500 dark:text-blue-400" aria-hidden="true" />
+                                      ) : toast.type === 'warning' ? (
+                                          <AlertTriangleIcon className="h-6 w-6 text-amber-500 dark:text-amber-400" aria-hidden="true" />
                                       ) : (
                                           <XCircleIcon className="h-6 w-6 text-red-400" aria-hidden="true" />
                                       )}
