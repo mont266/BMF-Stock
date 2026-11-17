@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { supabase } from '../lib/supabaseClient';
 import { Page, Spinner, EmptyState, formInputStyle } from './StockManagerApp';
 import Modal from './Modal';
-import { PlusCircleIcon, ClipboardCheckIcon, ArchiveIcon, ChartBarIcon, TrashIcon, BuildingStoreIcon, ChevronDownIcon, TagIcon, BarcodeIcon, SearchIcon } from './Icons';
+import { PlusCircleIcon, ClipboardCheckIcon, ArchiveIcon, ChartBarIcon, TrashIcon, BuildingStoreIcon, ChevronDownIcon, TagIcon, BarcodeIcon, SearchIcon, CheckCircleIcon, BoxIcon } from './Icons';
 import { trainingManager } from '../lib/trainingEnvironment';
 import { Team, Location } from '../types';
 
@@ -61,6 +61,32 @@ const expandRange = (start, end) => {
     return { result: results };
 };
 
+const calculateEndSerial = (start, count) => {
+    if (!start) return '';
+    const numCount = parseInt(count, 10);
+    if (isNaN(numCount) || numCount < 1) return '';
+    const parts = parseSerial(start.trim());
+    if (!parts) return '';
+    const startNum = parseInt(parts.numStr, 10);
+    const endNum = startNum + numCount - 1;
+    if (endNum < startNum) return '';
+    const padLen = Math.max(parts.numStr.length, String(endNum).length);
+    const paddedEndNum = String(endNum).padStart(parts.numStr.length, '0');
+    return `${parts.prefix}${paddedEndNum}${parts.suffix}`;
+};
+
+const calculateRangeQuantity = (start, end) => {
+    if (!start || !end) return '';
+    const sParts = parseSerial(start.trim());
+    const eParts = parseSerial(end.trim());
+    if (!sParts || !eParts) return '';
+    if (sParts.prefix !== eParts.prefix || sParts.suffix !== eParts.suffix) return '';
+    const sNum = parseInt(sParts.numStr, 10);
+    const eNum = parseInt(eParts.numStr, 10);
+    if (isNaN(sNum) || isNaN(eNum) || eNum < sNum) return '';
+    return String(eNum - sNum + 1);
+};
+
 const StockTakePage = ({ 
     stock = [], 
     setStock, 
@@ -114,11 +140,49 @@ const StockTakePage = ({
     const [quantityItem, setQuantityItem] = useState(null);
     const [quantityInput, setQuantityInput] = useState('1');
 
-    // --- Range Count State ---
+    // --- Enhanced Range Count State ---
     const [isRangeCountModalOpen, setIsRangeCountModalOpen] = useState(false);
-    const [rangeCountDetails, setRangeCountDetails] = useState({ firstSerial: '', lastSerial: '', selectedItemType: '' });
+    const [rangeCountDetails, setRangeCountDetails] = useState({ 
+        firstSerial: '', 
+        lastSerial: '', 
+        quantityCount: '',
+        selectedItemType: '',
+        selectedPartNumber: ''
+    });
+    const [rangeInputMode, setRangeInputMode] = useState('endSerial'); // 'endSerial' | 'quantity'
+    const [showRangeSerialsPreview, setShowRangeSerialsPreview] = useState(false);
     const [rangeCountSubmitting, setRangeCountSubmitting] = useState(false);
     const [rangeCountError, setRangeCountError] = useState('');
+    const [rangeItemSearchQuery, setRangeItemSearchQuery] = useState('');
+
+    const playBeep = useCallback((type = 'success') => {
+        try {
+            const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+            if (!AudioContextClass) return;
+            const audioCtx = new AudioContextClass();
+            const oscillator = audioCtx.createOscillator();
+            const gainNode = audioCtx.createGain();
+            oscillator.connect(gainNode);
+            gainNode.connect(audioCtx.destination);
+            gainNode.gain.value = 0.08;
+            if (type === 'success') {
+                oscillator.frequency.value = 880;
+                oscillator.type = 'sine';
+                oscillator.start();
+                oscillator.stop(audioCtx.currentTime + 0.12);
+            } else if (type === 'warn') {
+                oscillator.frequency.value = 440;
+                oscillator.type = 'triangle';
+                oscillator.start();
+                oscillator.stop(audioCtx.currentTime + 0.15);
+            } else {
+                oscillator.frequency.value = 220;
+                oscillator.type = 'square';
+                oscillator.start();
+                oscillator.stop(audioCtx.currentTime + 0.2);
+            }
+        } catch (_) {}
+    }, []);
     
     const [historicalTakes, setHistoricalTakes] = useState([]);
     const [historyLoading, setHistoryLoading] = useState(false);
@@ -131,12 +195,20 @@ const StockTakePage = ({
     const stockTakeItemsRef = useRef(stockTakeItems);
     const activeStockTakeRef = useRef(activeStockTake);
     const scanModeRef = useRef(scanMode);
+    const isRangeCountModalOpenRef = useRef(isRangeCountModalOpen);
+    const isQuantityModalOpenRef = useRef(isQuantityModalOpen);
+    const rangeCountDetailsRef = useRef(rangeCountDetails);
+    const rangeInputModeRef = useRef(rangeInputMode);
     
     useEffect(() => {
         stockTakeItemsRef.current = stockTakeItems;
         activeStockTakeRef.current = activeStockTake;
         scanModeRef.current = scanMode;
-    }, [stockTakeItems, activeStockTake, scanMode]);
+        isRangeCountModalOpenRef.current = isRangeCountModalOpen;
+        isQuantityModalOpenRef.current = isQuantityModalOpen;
+        rangeCountDetailsRef.current = rangeCountDetails;
+        rangeInputModeRef.current = rangeInputMode;
+    }, [stockTakeItems, activeStockTake, scanMode, isRangeCountModalOpen, isQuantityModalOpen, rangeCountDetails, rangeInputMode]);
 
     useEffect(() => {
         if (!activeStockTake) {
@@ -195,6 +267,88 @@ const StockTakePage = ({
         }
         return map;
     }, [supplierPartNumbers, itemTypes]);
+
+    const uniqueItemTypes = useMemo(() => {
+        return itemTypes.filter(it => it.is_unique || (it.category && it.category.toLowerCase().includes('meter')) || (it.name && it.name.toLowerCase().includes('meter')));
+    }, [itemTypes]);
+
+    const resolveUniqueItemType = useCallback((query) => {
+        if (!query || !query.trim()) return null;
+        const q = query.trim().toLowerCase();
+
+        // 1. Exact check in partNumberLookupMap
+        const partMatch = partNumberLookupMap[q];
+        if (partMatch) {
+            const it = itemTypes.find(t =>
+                (partMatch.itemTypeId != null && t.id === partMatch.itemTypeId) ||
+                (partMatch.itemTypeName && t.name === partMatch.itemTypeName)
+            );
+            if (it) return it;
+        }
+
+        // 2. Exact match in supplierPartNumbers
+        if (Array.isArray(supplierPartNumbers)) {
+            const spExact = supplierPartNumbers.find(sp => 
+                (sp.part_number && String(sp.part_number).trim().toLowerCase() === q) ||
+                (sp.barcode && String(sp.barcode).trim().toLowerCase() === q)
+            );
+            if (spExact) {
+                const it = itemTypes.find(t =>
+                    (spExact.item_type_id != null && t.id === spExact.item_type_id) ||
+                    (spExact.item_types?.name && t.name === spExact.item_types.name) ||
+                    (spExact.item_name && t.name === spExact.item_name)
+                );
+                if (it) return it;
+            }
+        }
+
+        // 3. Exact match in itemTypes by barcode or exact name (never substring includes)
+        const typeMatch = itemTypes.find(it => 
+            (it.barcode && String(it.barcode).trim().toLowerCase() === q) ||
+            (it.name && it.name.trim().toLowerCase() === q)
+        );
+        if (typeMatch) return typeMatch;
+
+        return null;
+    }, [partNumberLookupMap, supplierPartNumbers, itemTypes]);
+
+    const hasLongerRangeCandidate = useCallback((query) => {
+        if (!query || !query.trim()) return false;
+        const q = query.trim().toLowerCase();
+        if (Array.isArray(supplierPartNumbers)) {
+            const longerSp = supplierPartNumbers.some(sp => {
+                const pn = sp.part_number ? String(sp.part_number).trim().toLowerCase() : '';
+                const bc = sp.barcode ? String(sp.barcode).trim().toLowerCase() : '';
+                return (pn.length > q.length && pn.startsWith(q)) || (bc.length > q.length && bc.startsWith(q));
+            });
+            if (longerSp) return true;
+        }
+        return itemTypes.some(it => {
+            const bc = it.barcode ? String(it.barcode).trim().toLowerCase() : '';
+            const nm = it.name ? it.name.trim().toLowerCase() : '';
+            return (bc.length > q.length && bc.startsWith(q)) || (nm.length > q.length && nm.startsWith(q));
+        });
+    }, [supplierPartNumbers, itemTypes]);
+
+    const selectResolvedRangeProduct = useCallback((resolvedItemType, rawQuery = '') => {
+        if (!resolvedItemType) return;
+        const q = String(rawQuery || '').trim().toLowerCase();
+        const exactSp = q && Array.isArray(supplierPartNumbers)
+            ? supplierPartNumbers.find(p =>
+                ((resolvedItemType.id != null && p.item_type_id === resolvedItemType.id) || p.item_name === resolvedItemType.name || p.item_types?.name === resolvedItemType.name) &&
+                ((p.part_number && String(p.part_number).trim().toLowerCase() === q) || (p.barcode && String(p.barcode).trim().toLowerCase() === q))
+            )
+            : null;
+        const fallbackSp = !exactSp && Array.isArray(supplierPartNumbers)
+            ? supplierPartNumbers.find(p => (resolvedItemType.id != null && p.item_type_id === resolvedItemType.id) || p.item_name === resolvedItemType.name || p.item_types?.name === resolvedItemType.name)
+            : null;
+        const matchedSp = exactSp || fallbackSp;
+        setRangeCountDetails(prev => ({
+            ...prev,
+            selectedItemType: resolvedItemType.name,
+            selectedPartNumber: matchedSp?.part_number || ''
+        }));
+    }, [supplierPartNumbers]);
     
     const fetchActiveStockTake = useCallback(async () => {
         if (isTrainingMode) {
@@ -256,6 +410,15 @@ const StockTakePage = ({
         }
     }, [isTrainingMode]);
 
+    const isAssignedToTeam = useCallback((assignedTo) => {
+        return !!(
+            assignedTo &&
+            assignedTo !== 'Unassigned' &&
+            assignedTo !== Team.UNASSIGNED &&
+            assignedTo !== 'Stock Take Discrepancy (Missing)'
+        );
+    }, []);
+
     // Robust grouping by Item Type with full fallbacks
     const groupStockTakeByItemType = useCallback((items) => {
         if (!items || items.length === 0) return [];
@@ -278,7 +441,14 @@ const StockTakePage = ({
                 ? supplierPurchasePrice 
                 : (parseFloat(item.stock_items?.purchase_price ?? stockItemFallback?.purchase_price ?? 0) || 0);
             const defaultBarcode = item.stock_items?.barcode || stockItemFallback?.barcode || meta.barcode || '';
-            const isItemUnique = !!(meta.is_unique || item.stock_items?.is_unique || stockItemFallback?.is_unique || item.is_unique);
+            const isItemUnique = !!(
+                meta.is_unique ||
+                item.stock_items?.is_unique ||
+                stockItemFallback?.is_unique ||
+                item.is_unique ||
+                (itemCategory && itemCategory.toLowerCase().includes('meter')) ||
+                (itemTypeName && itemTypeName.toLowerCase().includes('meter'))
+            );
 
             if (!groups[itemTypeName]) {
                 groups[itemTypeName] = {
@@ -289,6 +459,8 @@ const StockTakePage = ({
                     is_unique: isItemUnique,
                     expected_quantity: 0,
                     counted_quantity: 0,
+                    returnedCount: 0,
+                    returnedTeams: [],
                     rawItems: [],
                     status: 'PENDING'
                 };
@@ -304,10 +476,20 @@ const StockTakePage = ({
                 ? 0 
                 : (typeof item.expected_quantity === 'number' ? item.expected_quantity : 1);
             const cnt = typeof item.counted_quantity === 'number' ? item.counted_quantity : 0;
+            const assignedTo = item.stock_items?.assigned_to ?? stockItemFallback?.assigned_to;
+            const returnedFromTeam = (isItemUnique && cnt > 0 && isAssignedToTeam(assignedTo)) ? assignedTo : null;
+
             groups[itemTypeName].expected_quantity += exp;
             groups[itemTypeName].counted_quantity += cnt;
+            if (returnedFromTeam) {
+                groups[itemTypeName].returnedCount += 1;
+                if (!groups[itemTypeName].returnedTeams.includes(returnedFromTeam)) {
+                    groups[itemTypeName].returnedTeams.push(returnedFromTeam);
+                }
+            }
             groups[itemTypeName].rawItems.push({
                 ...item,
+                returnedFromTeam,
                 expected_quantity: wasCreatedDuringTake ? 0 : (item.expected_quantity ?? 1),
                 stock_items: item.stock_items || stockItemFallback || {
                     id: item.item_id,
@@ -336,11 +518,28 @@ const StockTakePage = ({
                 value_variance: (g.counted_quantity - g.expected_quantity) * g.price
             };
         });
-    }, [itemTypesMap, itemTypes, stockMap, activeStockTake?.created_at]);
+    }, [itemTypesMap, itemTypes, stockMap, supplierPartNumbers, activeStockTake?.created_at, isAssignedToTeam]);
 
     const activeGroupedItems = useMemo(() => {
         return groupStockTakeByItemType(stockTakeItems);
     }, [stockTakeItems, groupStockTakeByItemType]);
+
+    const returnedUniqueItems = useMemo(() => {
+        const list = [];
+        activeGroupedItems.forEach(g => {
+            g.rawItems.forEach(raw => {
+                if (raw.returnedFromTeam) {
+                    list.push({
+                        id: raw.item_id || raw.id,
+                        name: g.name,
+                        barcode: raw.stock_items?.barcode || 'N/A',
+                        fromTeam: raw.returnedFromTeam
+                    });
+                }
+            });
+        });
+        return list;
+    }, [activeGroupedItems]);
 
     const activeAvailableCategories = useMemo(() => {
         const cats = new Set();
@@ -657,6 +856,7 @@ const StockTakePage = ({
                 : groupedTakeItems.filter(g => (g.counted_quantity || 0) > 0 || g.rawItems.some(i => (i.counted_quantity || 0) > 0));
 
             let reconciledCount = 0;
+            let returnedCount = 0;
 
             // 4. Update live stock counts in stock_items at targetLocation for each audited item type
             for (const group of itemsToReconcile) {
@@ -666,6 +866,11 @@ const StockTakePage = ({
                     : (group.rawItems.find(r => r.stock_items?.location)?.stock_items?.location || targetLocation);
 
                 const rawItemIds = group.rawItems.map(r => r.item_id).filter(Boolean);
+                const countedItemIds = new Set(
+                    group.rawItems
+                        .filter(r => (r.counted_quantity || 0) > 0 && r.item_id)
+                        .map(r => r.item_id)
+                );
 
                 // Fetch current live stock items for this group by recorded IDs and by Name/Location
                 let dbItemsById = [];
@@ -677,6 +882,71 @@ const StockTakePage = ({
                     if (!byIdError && byIdData) {
                         dbItemsById = byIdData;
                     }
+                }
+
+                // 4a. Return any counted unique items that are still assigned to a team back to storehouse stock
+                const meta = itemTypesMap[group.name] || (Array.isArray(itemTypes) ? itemTypes.find(it => it.name === group.name) : null) || {};
+                const isUniqueGroup = !!(
+                    group.is_unique ||
+                    meta.is_unique ||
+                    (group.category && group.category.toLowerCase().includes('meter')) ||
+                    (group.name && group.name.toLowerCase().includes('meter'))
+                );
+                const itemsToReturn = isUniqueGroup
+                    ? dbItemsById.filter(item => countedItemIds.has(item.id) && isAssignedToTeam(item.assigned_to))
+                    : [];
+
+                if (itemsToReturn.length > 0) {
+                    const returnIds = itemsToReturn.map(i => i.id);
+                    const { error: returnError } = await supabase
+                        .from('stock_items')
+                        .update({
+                            assigned_to: Team.UNASSIGNED,
+                            location: groupLoc,
+                            assigned_at: null,
+                            assigned_by: null
+                        })
+                        .in('id', returnIds);
+
+                    if (returnError) {
+                        console.error(`Failed to return counted items for ${group.name}:`, returnError);
+                        throw returnError;
+                    }
+
+                    if (typeof setStock === 'function') {
+                        setStock(prev => prev.map(item => {
+                            if (returnIds.includes(item.id)) {
+                                return {
+                                    ...item,
+                                    assigned_to: Team.UNASSIGNED,
+                                    location: groupLoc,
+                                    assigned_at: null,
+                                    assigned_by: null
+                                };
+                            }
+                            return item;
+                        }));
+                    }
+
+                    const returnMovements = itemsToReturn.map(item => ({
+                        item_id: item.id,
+                        item_barcode: item.barcode || group.barcodeDisplay || 'N/A',
+                        item_name: item.name || group.name,
+                        movement_type: 'IN',
+                        location_from: item.assigned_to,
+                        location_to: groupLoc,
+                        user_id: user?.id || null,
+                        username: auditorName
+                    }));
+                    await supabase.from('stock_movements').insert(returnMovements);
+
+                    const returnIdSet = new Set(returnIds);
+                    dbItemsById = dbItemsById.map(item =>
+                        returnIdSet.has(item.id)
+                            ? { ...item, assigned_to: Team.UNASSIGNED, location: groupLoc, assigned_at: null, assigned_by: null }
+                            : item
+                    );
+                    returnedCount += itemsToReturn.length;
                 }
 
                 let dbItemsByName = [];
@@ -707,12 +977,12 @@ const StockTakePage = ({
 
                 if (diff > 0) {
                     // Scanned more than on record: ADD diff items to stock_items
-                    const meta = itemTypesMap[group.name] || (Array.isArray(itemTypes) ? itemTypes.find(it => it.name === group.name) : null) || {};
                     const template = currentDbItems?.[0] || group.rawItems?.find(r => r.stock_items)?.stock_items || {};
                     const spPart = Array.isArray(supplierPartNumbers) ? supplierPartNumbers.find(p => (meta.id && p.item_type_id === meta.id) || p.item_name === group.name || p.item_types?.name === group.name) : null;
                     const spPrice = parseFloat(spPart?.purchase_price) || 0;
                     const purchasePrice = spPrice > 0 ? spPrice : (parseFloat(template.purchase_price ?? group.price ?? 0) || 0);
                     const desc = meta.description || template.description || null;
+                    const baseBarcode = meta.barcode || template.barcode || '';
 
                     const newItems = [];
                     for (let i = 0; i < diff; i++) {
@@ -841,7 +1111,7 @@ const StockTakePage = ({
             // Feedback toast
             setLastScanned({
                 success: true,
-                message: `Stock take finalised! Inventory counts for ${reconciledCount} product types at ${targetLocation} have been updated to match what was scanned.`
+                message: `Stock take finalised! Inventory counts for ${reconciledCount} product types at ${targetLocation} have been updated to match what was scanned.${returnedCount > 0 ? ` ${returnedCount} returned unique item(s) signed back into stock.` : ''}`
             });
             setTimeout(() => setLastScanned(null), 5000);
 
@@ -862,18 +1132,70 @@ const StockTakePage = ({
             setActiveStockTake(null);
             setStockTakeItems([]);
             setLoading(false);
+            if (typeof refetchStock === 'function') {
+                await refetchStock();
+            }
             return;
         }
         try {
+            // 1. Find all stock_take_items for this active stock take to detect items created during the uncompleted take
+            const { data: takeItems } = await supabase
+                .from('stock_take_items')
+                .select('id, item_id, expected_quantity, stock_items(id, created_at)')
+                .eq('stock_take_id', activeStockTake.id);
+
+            const takeCreatedAt = activeStockTake.created_at ? new Date(activeStockTake.created_at).getTime() : 0;
+            const itemsToDeleteFromStock = [];
+
+            if (takeItems && takeItems.length > 0) {
+                takeItems.forEach(ti => {
+                    const itemCreated = ti.stock_items?.created_at ? new Date(ti.stock_items.created_at).getTime() : 0;
+                    // Items added during this uncompleted take have expected_quantity = 0 or were created during the active stock take
+                    if (ti.expected_quantity === 0 || (itemCreated > 0 && takeCreatedAt > 0 && itemCreated >= (takeCreatedAt - 3000))) {
+                        if (ti.item_id) itemsToDeleteFromStock.push(ti.item_id);
+                    }
+                });
+            }
+
+            // 1b. Explicitly delete stock_take_items first to prevent foreign key errors
+            await supabase
+                .from('stock_take_items')
+                .delete()
+                .eq('stock_take_id', activeStockTake.id);
+
+            // 2. Delete the active stock take
             const { error } = await supabase
                 .from('stock_takes')
                 .delete()
                 .eq('id', activeStockTake.id);
                 
             if (error) throw error;
+
+            // 3. Delete any newly created stock_items that were created during this uncompleted take
+            if (itemsToDeleteFromStock.length > 0) {
+                await supabase
+                    .from('stock_items')
+                    .delete()
+                    .in('id', itemsToDeleteFromStock);
+            }
+
+            // 4. Reset local state
+            setActiveStockTake(null);
+            setStockTakeItems([]);
             await fetchActiveStockTake();
+
+            // 5. Refetch live inventory so counts immediately revert cleanly in dashboard and reports
+            if (typeof refetchStock === 'function') {
+                await refetchStock();
+            }
+
+            setLastScanned({
+                success: true,
+                message: "Stock take cancelled. All counts reverted and no changes were made to live stock."
+            });
+            setTimeout(() => setLastScanned(null), 4000);
         } catch(err) {
-            console.error(err);
+            console.error("Error cancelling stock take:", err);
             setError(err.message);
         } finally {
             setLoading(false);
@@ -966,11 +1288,14 @@ const StockTakePage = ({
                 setStockTakeItems([...trainingManager.getStockTakeItems(activeStockTakeRef.current.id)]);
                 if (typeof refetchStock === 'function') refetchStock();
 
+                const returnedTeam = isAssignedToTeam(res.item.stock_items?.assigned_to) ? res.item.stock_items.assigned_to : null;
                 setLastScanned({
                     success: true,
-                    message: `Counted 1x ${res.item.stock_items?.name || matchedItemType.name} (Count: ${res.item.counted_quantity})`
+                    message: returnedTeam
+                        ? `↩️ Returned item counted: ${res.item.stock_items?.name || matchedItemType.name} (${rawBarcode}) — currently signed out to ${returnedTeam}. Will return to stock on finalise.`
+                        : `Counted 1x ${res.item.stock_items?.name || matchedItemType.name} (Count: ${res.item.counted_quantity})`
                 });
-                setTimeout(() => setLastScanned(null), 3000);
+                setTimeout(() => setLastScanned(null), 4000);
             } catch (err) {
                 console.error(err);
                 setLastScanned({ success: false, message: "Scan error: " + err.message });
@@ -993,6 +1318,7 @@ const StockTakePage = ({
 
             let matchedItemName = matchedItemType?.name || null;
             let baseBarcode = matchedItemType?.barcode || rawBarcode;
+            let matchedPhysicalSerialItem = null;
 
             // 2. If not matched yet, check stock prop or database
             if (!matchedItemName) {
@@ -1000,6 +1326,7 @@ const StockTakePage = ({
                 if (stockMatch) {
                     matchedItemName = stockMatch.name;
                     baseBarcode = stockMatch.barcode;
+                    matchedPhysicalSerialItem = stockMatch;
                 }
             }
 
@@ -1031,6 +1358,7 @@ const StockTakePage = ({
                         if (stockData && stockData.length > 0) {
                             matchedItemName = stockData[0].name;
                             baseBarcode = stockData[0].barcode || rawBarcode;
+                            matchedPhysicalSerialItem = stockData[0];
                         }
                     }
                 }
@@ -1048,7 +1376,98 @@ const StockTakePage = ({
             const spPart = Array.isArray(supplierPartNumbers) ? supplierPartNumbers.find(p => (meta.id && p.item_type_id === meta.id) || p.item_name === matchedItemName || p.item_types?.name === matchedItemName) : null;
             const itemPrice = parseFloat(spPart?.purchase_price ?? 0) || 0;
 
-            // 3. Find or inject stock_take_items for this item at target storehouse
+            // If it's a unique item type (serialized item or meter)
+            const isUniqueType = !!(meta.is_unique || (meta.category && meta.category.toLowerCase().includes('meter')) || matchedItemName.toLowerCase().includes('meter'));
+            if (isUniqueType) {
+                // 1. Check if the scanned barcode matches an exact serial number in the current stock take
+                const serialLower = lowerScan;
+                const specificSerialItem = stockTakeItemsRef.current.find(sti => {
+                    const name = sti.stock_items?.name || stockMap.get(sti.item_id)?.name;
+                    if (name !== matchedItemName) return false;
+                    return (sti.stock_items?.barcode || '').trim().toLowerCase() === serialLower;
+                });
+
+                if (specificSerialItem) {
+                    if ((specificSerialItem.counted_quantity || 0) > 0) {
+                        setLastScanned({ success: false, message: `Serial "${rawBarcode}" for ${matchedItemName} is already counted.` });
+                        playBeep('warn');
+                        return;
+                    }
+                    if (isTrainingMode) {
+                        setStockTakeItems(prev => prev.map(i => i.id === specificSerialItem.id ? { ...i, counted_quantity: 1, status: 'COUNTED' } : i));
+                    } else {
+                        const { error: updErr } = await supabase
+                            .from('stock_take_items')
+                            .update({ counted_quantity: 1, status: 'COUNTED' })
+                            .eq('id', specificSerialItem.id);
+                        if (updErr) throw updErr;
+
+                        setStockTakeItems(prev => prev.map(i => i.id === specificSerialItem.id ? { ...i, counted_quantity: 1, status: 'COUNTED' } : i));
+                    }
+                    const existingAssigned = specificSerialItem.stock_items?.assigned_to ?? stockMap.get(specificSerialItem.item_id)?.assigned_to;
+                    const returnedTeam = isAssignedToTeam(existingAssigned) ? existingAssigned : null;
+                    setLastScanned({
+                        success: true,
+                        message: returnedTeam
+                            ? `↩️ Returned item counted: ${matchedItemName} (${rawBarcode}) — was assigned to ${returnedTeam}. Will return to ${currentTargetLocation} stock on finalise.`
+                            : `Scanned ${matchedItemName} (Serial ${rawBarcode}) (+1 Counted)`
+                    });
+                    playBeep(returnedTeam ? 'warn' : 'success');
+                    setTimeout(() => setLastScanned(null), 4000);
+                    return;
+                }
+
+                // 1b. If the scanned code matches a specific physical serial in stock_items (e.g. signed out to a team, or in a rolling stock take), count it directly!
+                const isPartOrMasterBarcode = !!(partLookup || (meta.barcode && String(meta.barcode).trim().toLowerCase() === lowerScan));
+                if (!isPartOrMasterBarcode && matchedPhysicalSerialItem) {
+                    const wasInStockBefore = matchedPhysicalSerialItem.location === currentTargetLocation && !isAssignedToTeam(matchedPhysicalSerialItem.assigned_to);
+                    const { data: insertedTakeItem, error: takeInsertError } = await supabase
+                        .from('stock_take_items')
+                        .insert([{
+                            stock_take_id: activeStockTakeRef.current.id,
+                            item_id: matchedPhysicalSerialItem.id,
+                            expected_quantity: wasInStockBefore ? 1 : 0,
+                            counted_quantity: 1,
+                            status: 'COUNTED'
+                        }])
+                        .select('*, stock_items(id, name, barcode, purchase_price, description, location, assigned_to, created_at)')
+                        .single();
+
+                    if (takeInsertError) throw takeInsertError;
+                    setStockTakeItems(prev => [...prev, insertedTakeItem]);
+
+                    const returnedTeam = isAssignedToTeam(matchedPhysicalSerialItem.assigned_to) ? matchedPhysicalSerialItem.assigned_to : null;
+                    setLastScanned({
+                        success: true,
+                        message: returnedTeam
+                            ? `↩️ Returned item counted: ${matchedItemName} (${rawBarcode}) — signed out to ${returnedTeam}. Will be returned to ${currentTargetLocation} stock on finalise.`
+                            : `Scanned ${matchedItemName} (Serial ${rawBarcode}) (+1 Counted)`
+                    });
+                    playBeep(returnedTeam ? 'warn' : 'success');
+                    setTimeout(() => setLastScanned(null), 4000);
+                    return;
+                }
+
+                // 2. The scanned code was the PART NUMBER, model barcode, or a serialized product: Open Range Count!
+                setRangeCountError('');
+                setRangeCountDetails({
+                    firstSerial: '',
+                    lastSerial: '',
+                    quantityCount: '',
+                    selectedItemType: matchedItemName,
+                    selectedPartNumber: partLookup?.partNumber || spPart?.part_number || ''
+                });
+                setRangeItemSearchQuery(matchedItemName);
+                setIsRangeCountModalOpen(true);
+                setLastScanned({
+                    success: true,
+                    message: `Part Number matched: ${matchedItemName}. Range Count opened.`
+                });
+                setTimeout(() => setLastScanned(null), 3000);
+                return;
+            }
+
+            // 3. Find or inject stock_take_items for this non-unique item at target storehouse
             const currentStockTakeItems = stockTakeItemsRef.current;
             let takeItemsForProduct = currentStockTakeItems.filter(i => {
                 const itemFallback = stockMap.get(i.item_id);
@@ -1240,26 +1659,191 @@ const StockTakePage = ({
         }
     };
 
-    // Range Count Calculation Memo
+    // Filtered item types for Range Count Modal based on part number, barcode, or name
+    const filteredRangeItemTypes = useMemo(() => {
+        if (!rangeItemSearchQuery.trim()) return itemTypes;
+        const q = rangeItemSearchQuery.trim().toLowerCase();
+        return itemTypes.filter(it => {
+            if (it.name && it.name.toLowerCase().includes(q)) return true;
+            if (it.category && it.category.toLowerCase().includes(q)) return true;
+            if (it.barcode && String(it.barcode).toLowerCase().includes(q)) return true;
+            if (Array.isArray(supplierPartNumbers)) {
+                const matchPart = supplierPartNumbers.some(sp => 
+                    ((it.id != null && sp.item_type_id === it.id) || sp.item_name === it.name || sp.item_types?.name === it.name) &&
+                    ((sp.part_number && String(sp.part_number).toLowerCase().includes(q)) || 
+                     (sp.barcode && String(sp.barcode).toLowerCase().includes(q)))
+                );
+                if (matchPart) return true;
+            }
+            return false;
+        });
+    }, [itemTypes, supplierPartNumbers, rangeItemSearchQuery]);
+
+    // Meta for currently selected item type in Range Count Modal
+    const selectedRangeProductMeta = useMemo(() => {
+        if (!rangeCountDetails.selectedItemType) return null;
+        const it = itemTypes.find(t => t.name === rangeCountDetails.selectedItemType || t.id === rangeCountDetails.selectedItemType);
+        const spPart = Array.isArray(supplierPartNumbers)
+            ? (
+                (rangeCountDetails.selectedPartNumber && supplierPartNumbers.find(sp =>
+                    ((it?.id != null && sp.item_type_id === it.id) || sp.item_name === rangeCountDetails.selectedItemType || sp.item_types?.name === rangeCountDetails.selectedItemType) &&
+                    String(sp.part_number || '').trim().toLowerCase() === String(rangeCountDetails.selectedPartNumber).trim().toLowerCase()
+                )) ||
+                supplierPartNumbers.find(sp => (it?.id != null && sp.item_type_id === it.id) || sp.item_name === rangeCountDetails.selectedItemType || sp.item_types?.name === rangeCountDetails.selectedItemType)
+            )
+            : null;
+        const partNumber = rangeCountDetails.selectedPartNumber || spPart?.part_number || null;
+        const price = parseFloat(spPart?.purchase_price ?? it?.purchase_price ?? 0) || 0;
+        
+        // Expected items at active storehouse for this product
+        const loc = activeStockTake?.location;
+        const expectedItems = stockTakeItems.filter(sti => {
+            const name = sti.stock_items?.name || stockMap.get(sti.item_id)?.name;
+            return name === rangeCountDetails.selectedItemType;
+        });
+        const expectedCount = expectedItems.reduce((acc, curr) => acc + (curr.expected_quantity ?? 1), 0);
+        const countedCount = expectedItems.reduce((acc, curr) => acc + (curr.counted_quantity || 0), 0);
+
+        return {
+            itemType: it || { name: rangeCountDetails.selectedItemType },
+            supplierPart: spPart,
+            partNumber: partNumber,
+            supplierName: spPart?.suppliers?.name || null,
+            barcode: it?.barcode || spPart?.barcode || null,
+            price: price,
+            category: it?.category || 'Meters',
+            location: loc,
+            expectedCount,
+            countedCount
+        };
+    }, [rangeCountDetails.selectedItemType, rangeCountDetails.selectedPartNumber, itemTypes, supplierPartNumbers, activeStockTake, stockTakeItems, stockMap]);
+
+    // Enhanced Range Count Calculation & Mindful Inventory Analysis
     const rangeCountProcessingResult = useMemo(() => {
         const { firstSerial, lastSerial } = rangeCountDetails;
         const start = firstSerial?.trim();
         const end = lastSerial?.trim();
 
-        if (!start || !end) return { serials: [], error: null };
+        if (!start || !end) {
+            return { 
+                serials: [], 
+                count: 0, 
+                error: null, 
+                inventoryStats: null,
+                serialDetails: []
+            };
+        }
 
         const expansion = expandRange(start, end);
         if (expansion.error) {
-            return { serials: [], error: expansion.error };
+            return { 
+                serials: [], 
+                count: 0, 
+                error: expansion.error, 
+                inventoryStats: null,
+                serialDetails: []
+            };
         }
 
         const expanded = expansion.result;
         if (expanded.length > 1000) {
-            return { serials: [], error: `Range is too large. A maximum of 1000 items can be counted at once, but this range contains ${expanded.length}.` };
+            return { 
+                serials: [], 
+                count: 0, 
+                error: `Range is too large. A maximum of 1000 items can be counted at once, but this range contains ${expanded.length}.`, 
+                inventoryStats: null,
+                serialDetails: []
+            };
         }
 
-        return { serials: expanded, error: null };
-    }, [rangeCountDetails.firstSerial, rangeCountDetails.lastSerial]);
+        // Analyze serials against existing stock items and active stock take items
+        const targetName = rangeCountDetails.selectedItemType;
+        const existingStockBarcodes = new Set();
+        const assignedSerialMap = new Map();
+        const takeItemsForTarget = stockTakeItems.filter(sti => {
+            const name = sti.stock_items?.name || stockMap.get(sti.item_id)?.name;
+            return !targetName || name === targetName;
+        });
+
+        const alreadyCountedSet = new Set();
+        takeItemsForTarget.forEach(ti => {
+            const bc = (ti.stock_items?.barcode || '').trim().toLowerCase();
+            if (bc) {
+                const assignedTo = ti.stock_items?.assigned_to ?? stockMap.get(ti.item_id)?.assigned_to;
+                if (isAssignedToTeam(assignedTo)) {
+                    assignedSerialMap.set(bc, assignedTo);
+                } else {
+                    existingStockBarcodes.add(bc);
+                }
+                if ((ti.counted_quantity || 0) > 0) {
+                    alreadyCountedSet.add(bc);
+                }
+            }
+        });
+
+        if (Array.isArray(stock)) {
+            stock.forEach(s => {
+                if (!targetName || s.name === targetName) {
+                    const bc = (s.barcode || '').trim().toLowerCase();
+                    if (bc) {
+                        if (isAssignedToTeam(s.assigned_to)) {
+                            assignedSerialMap.set(bc, s.assigned_to);
+                        } else {
+                            existingStockBarcodes.add(bc);
+                        }
+                    }
+                }
+            });
+        }
+
+        let existingCount = 0;
+        let returnedCount = 0;
+        let newCount = 0;
+        let alreadyCountedCount = 0;
+        const returnedTeamsSet = new Set();
+
+        const serialDetails = expanded.map(s => {
+            const sLower = s.toLowerCase();
+            const isAlreadyCounted = alreadyCountedSet.has(sLower);
+            const assignedTo = assignedSerialMap.get(sLower) || null;
+            const isReturned = Boolean(assignedTo);
+            const isExisting = existingStockBarcodes.has(sLower);
+            const isNew = !isExisting && !isReturned;
+
+            if (isAlreadyCounted) alreadyCountedCount++;
+            if (isReturned) {
+                returnedCount++;
+                returnedTeamsSet.add(assignedTo);
+            } else if (isExisting) {
+                existingCount++;
+            }
+            if (isNew) newCount++;
+
+            return {
+                serial: s,
+                isExisting,
+                isReturned,
+                assignedTo,
+                isNew,
+                isAlreadyCounted
+            };
+        });
+
+        return {
+            serials: expanded,
+            serialDetails,
+            count: expanded.length,
+            error: null,
+            inventoryStats: {
+                total: expanded.length,
+                existingCount,
+                returnedCount,
+                returnedTeams: Array.from(returnedTeamsSet),
+                newCount,
+                alreadyCountedCount
+            }
+        };
+    }, [rangeCountDetails.firstSerial, rangeCountDetails.lastSerial, rangeCountDetails.selectedItemType, stockTakeItems, stock, stockMap, isAssignedToTeam]);
 
     // Handle Range Count Submission
     const handleRangeCountSubmit = async (e) => {
@@ -1301,10 +1885,6 @@ const StockTakePage = ({
                     }
                 }
                 if (!targetTypeName) {
-                    const meterType = itemTypes.find(it => (it.category && it.category.toLowerCase().includes('meter')) || it.is_unique || (it.name && it.name.toLowerCase().includes('meter')));
-                    if (meterType) targetTypeName = meterType.name;
-                }
-                if (!targetTypeName) {
                     setRangeCountError("Please select the product type for this serial number range.");
                     setRangeCountSubmitting(false);
                     return;
@@ -1329,7 +1909,9 @@ const StockTakePage = ({
                 setTimeout(() => setLastScanned(null), 4000);
 
                 setIsRangeCountModalOpen(false);
-                setRangeCountDetails({ firstSerial: '', lastSerial: '', selectedItemType: '' });
+                setRangeCountDetails({ firstSerial: '', lastSerial: '', quantityCount: '', selectedItemType: '', selectedPartNumber: '' });
+                setShowRangeSerialsPreview(false);
+                setRangeItemSearchQuery('');
             } catch (rangeErr) {
                 console.error(rangeErr);
                 setRangeCountError(rangeErr.message);
@@ -1363,18 +1945,6 @@ const StockTakePage = ({
                             targetTypeName = stockMatch.name;
                         }
                     }
-                }
-            }
-
-            // Fallback: check if any serialized meter item type exists
-            if (!targetTypeName) {
-                const meterType = itemTypes.find(it => 
-                    (it.category && it.category.toLowerCase().includes('meter')) || 
-                    it.is_unique || 
-                    (it.name && it.name.toLowerCase().includes('meter'))
-                );
-                if (meterType) {
-                    targetTypeName = meterType.name;
                 }
             }
 
@@ -1436,9 +2006,6 @@ const StockTakePage = ({
                 if (createdItems) {
                     createdItems.forEach(ci => newlyCreatedIds.add(ci.id));
                     resolvedStockItems.push(...createdItems);
-                    if (typeof setStock === 'function') {
-                        setStock(prev => [...prev, ...createdItems]);
-                    }
                 }
             }
 
@@ -1512,14 +2079,19 @@ const StockTakePage = ({
                 return [...updatedList, ...insertedTakeItems];
             });
 
+            const returnedInRange = resolvedStockItems.filter(s => isAssignedToTeam(s.assigned_to));
             setLastScanned({
                 success: true,
-                message: `Successfully counted serial range (${serials.length} units of ${targetTypeName})`
+                message: returnedInRange.length > 0
+                    ? `Counted serial range (${serials.length} units of ${targetTypeName}). Note: ${returnedInRange.length} returned item(s) signed out to teams will be returned to stock on finalise.`
+                    : `Successfully counted serial range (${serials.length} units of ${targetTypeName})`
             });
             setTimeout(() => setLastScanned(null), 5000);
 
             setIsRangeCountModalOpen(false);
-            setRangeCountDetails({ firstSerial: '', lastSerial: '', selectedItemType: '' });
+            setRangeCountDetails({ firstSerial: '', lastSerial: '', quantityCount: '', selectedItemType: '', selectedPartNumber: '' });
+            setShowRangeSerialsPreview(false);
+            setRangeItemSearchQuery('');
 
         } catch (err) {
             console.error("Error in handleRangeCountSubmit:", err);
@@ -1528,6 +2100,13 @@ const StockTakePage = ({
             setRangeCountSubmitting(false);
         }
     };
+
+    const resolveUniqueItemTypeRef = useRef(resolveUniqueItemType);
+    const selectResolvedRangeProductRef = useRef(selectResolvedRangeProduct);
+    useEffect(() => {
+        resolveUniqueItemTypeRef.current = resolveUniqueItemType;
+        selectResolvedRangeProductRef.current = selectResolvedRangeProduct;
+    }, [resolveUniqueItemType, selectResolvedRangeProduct]);
 
     // Bluetooth Scanner Listener
     useEffect(() => {
@@ -1550,6 +2129,38 @@ const StockTakePage = ({
             if (e.key === 'Enter') {
                 if (barcodeBuffer.length > 2) {
                     e.preventDefault();
+                    if (isQuantityModalOpenRef.current) {
+                        barcodeBuffer = '';
+                        return;
+                    }
+                    if (isRangeCountModalOpenRef.current) {
+                        const scannedCode = barcodeBuffer.trim();
+                        if (!rangeCountDetailsRef.current?.selectedItemType) {
+                            setRangeItemSearchQuery(scannedCode);
+                            const resolved = resolveUniqueItemTypeRef.current(scannedCode);
+                            if (resolved) {
+                                selectResolvedRangeProductRef.current(resolved, scannedCode);
+                            }
+                        } else if (!rangeCountDetailsRef.current?.firstSerial) {
+                            setRangeCountDetails(prev => {
+                                const updated = { ...prev, firstSerial: scannedCode };
+                                if (rangeInputModeRef.current === 'quantity' && prev.quantityCount) {
+                                    updated.lastSerial = calculateEndSerial(scannedCode, prev.quantityCount);
+                                } else if (rangeInputModeRef.current === 'endSerial' && prev.lastSerial) {
+                                    updated.quantityCount = calculateRangeQuantity(scannedCode, prev.lastSerial);
+                                }
+                                return updated;
+                            });
+                        } else if (rangeInputModeRef.current === 'endSerial' && !rangeCountDetailsRef.current?.lastSerial) {
+                            setRangeCountDetails(prev => ({
+                                ...prev,
+                                lastSerial: scannedCode,
+                                quantityCount: calculateRangeQuantity(prev.firstSerial, scannedCode)
+                            }));
+                        }
+                        barcodeBuffer = '';
+                        return;
+                    }
                     handleScan(barcodeBuffer);
                 }
                 barcodeBuffer = '';
@@ -1637,27 +2248,31 @@ const StockTakePage = ({
                                     </div>
                                 )}
                                 
-                                <div className="absolute top-4 right-4 flex bg-white dark:bg-zinc-800 rounded-lg shadow-sm border border-zinc-200 dark:border-zinc-700 p-1">
+                                <div className="absolute top-4 right-4 flex bg-white dark:bg-zinc-800 rounded-lg shadow-sm border border-zinc-200 dark:border-zinc-700 p-1 flex-wrap gap-1">
                                     <button
+                                        type="button"
                                         onClick={() => setScanMode('RAPID')}
                                         className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${scanMode === 'RAPID' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/50 dark:text-blue-300' : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100'}`}
                                     >
                                         Rapid Scan
                                     </button>
                                     <button
+                                        type="button"
                                         onClick={() => setScanMode('QUANTITY')}
                                         className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${scanMode === 'QUANTITY' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/50 dark:text-blue-300' : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100'}`}
                                     >
                                         Quantity Mode
                                     </button>
                                     <button
+                                        type="button"
                                         onClick={() => {
                                             setRangeCountError('');
-                                            setRangeCountDetails({ firstSerial: '', lastSerial: '', selectedItemType: '' });
+                                            setRangeCountDetails({ firstSerial: '', lastSerial: '', quantityCount: '', selectedItemType: '', selectedPartNumber: '' });
+                                            setRangeItemSearchQuery('');
                                             setIsRangeCountModalOpen(true);
                                         }}
-                                        className="px-3 py-1.5 text-xs font-medium rounded-md transition-colors text-blue-700 dark:text-blue-300 hover:bg-blue-50 dark:hover:bg-blue-900/40 flex items-center gap-1 border-l border-zinc-200 dark:border-zinc-700 ml-1 pl-2"
-                                        title="Count a continuous serial number range (e.g. boxed meters)"
+                                        className="px-3 py-1.5 text-xs font-semibold rounded-md transition-colors text-purple-700 dark:text-purple-300 hover:bg-purple-50 dark:hover:bg-purple-900/40 flex items-center gap-1.5 border-l border-zinc-200 dark:border-zinc-700 ml-0.5 pl-2"
+                                        title="Count a continuous serial number range by part number (e.g. boxed meters)"
                                     >
                                         <BarcodeIcon className="w-3.5 h-3.5" />
                                         <span>Range Count</span>
@@ -1729,6 +2344,23 @@ const StockTakePage = ({
                                         </p>
                                     </div>
                                 </div>
+
+                                {returnedUniqueItems.length > 0 && (
+                                    <div className="mt-4 p-3.5 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/70 rounded-lg text-xs text-amber-900 dark:text-amber-200 flex items-start gap-2.5">
+                                        <span className="text-base leading-none mt-0.5">↩️</span>
+                                        <div>
+                                            <p className="font-bold">
+                                                Returned Items Detected ({returnedUniqueItems.length} unique {returnedUniqueItems.length === 1 ? 'item' : 'items'})
+                                            </p>
+                                            <p className="mt-0.5 text-amber-800 dark:text-amber-300">
+                                                {returnedUniqueItems.length === 1 ? 'This counted serial is' : 'These counted serials are'} currently signed out to{' '}
+                                                <strong>{Array.from(new Set(returnedUniqueItems.map(r => r.fromTeam))).join(', ')}</strong>.{' '}
+                                                Finalising this stock take will automatically return {returnedUniqueItems.length === 1 ? 'it' : 'them'} back into{' '}
+                                                <strong>{activeStockTake.location || 'storehouse'}</strong> stock.
+                                            </p>
+                                        </div>
+                                    </div>
+                                )}
 
                                 {/* Live Count Breakdown Section */}
                                 <div className="mt-8">
@@ -1875,6 +2507,11 @@ const StockTakePage = ({
                                                                                     ⚡ Unique
                                                                                 </span>
                                                                             )}
+                                                                            {group.returnedCount > 0 && (
+                                                                                <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-200 dark:border-amber-800" title={`Returned from: ${group.returnedTeams.join(', ')}`}>
+                                                                                    ↩️ {group.returnedCount} Returned
+                                                                                </span>
+                                                                            )}
                                                                         </div>
                                                                         <div className="flex items-center gap-2 mt-1 text-xs text-zinc-500 dark:text-zinc-400 font-mono">
                                                                             <span className="truncate">{group.barcodeDisplay}</span>
@@ -1956,16 +2593,22 @@ const StockTakePage = ({
                                                                                 onClick={(e) => {
                                                                                     e.stopPropagation();
                                                                                     setRangeCountError('');
+                                                                                    const sp = supplierPartNumbers?.find(p => p.item_name === group.name || p.item_types?.name === group.name);
                                                                                     const firstSerial = group.rawItems?.find(r => r.stock_items?.barcode)?.stock_items?.barcode || '';
                                                                                     setRangeCountDetails({
                                                                                         firstSerial: firstSerial,
-                                                                                        lastSerial: firstSerial,
-                                                                                        selectedItemType: group.name
+                                                                                        lastSerial: '',
+                                                                                        quantityCount: '',
+                                                                                        selectedItemType: group.name,
+                                                                                        selectedPartNumber: sp?.part_number || ''
                                                                                     });
+                                                                                    setRangeItemSearchQuery(group.name);
+                                                                                    setRangeInputMode('endSerial');
+                                                                                    setShowRangeSerialsPreview(false);
                                                                                     setIsRangeCountModalOpen(true);
                                                                                 }}
                                                                                 className="text-xs font-semibold px-2.5 py-1.5 bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300 rounded-lg hover:bg-purple-200 dark:hover:bg-purple-800 transition-colors flex items-center gap-1 touch-manipulation"
-                                                                                title="Count a range of serial numbers"
+                                                                                title="Count a serial number range for this product"
                                                                             >
                                                                                 <BarcodeIcon className="w-3.5 h-3.5" />
                                                                                 <span>Range</span>
@@ -2012,6 +2655,11 @@ const StockTakePage = ({
                                                                                         <span className="text-zinc-500 font-sans text-[11px]">
                                                                                             {raw.counted_quantity || 0} / {raw.expected_quantity ?? 1}
                                                                                         </span>
+                                                                                        {raw.returnedFromTeam && (
+                                                                                            <span className="px-2 py-0.5 rounded text-[10px] font-sans font-bold bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-200 dark:border-amber-800">
+                                                                                                ↩️ Returned (from {raw.returnedFromTeam})
+                                                                                            </span>
+                                                                                        )}
                                                                                         <span className={`px-2 py-0.5 rounded text-[10px] font-sans font-bold ${
                                                                                             isCounted
                                                                                                 ? 'bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300'
@@ -2074,6 +2722,11 @@ const StockTakePage = ({
                                                                                         Unique
                                                                                     </span>
                                                                                 )}
+                                                                                {group.returnedCount > 0 && (
+                                                                                    <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-200 dark:border-amber-800" title={`Returned from: ${group.returnedTeams.join(', ')}`}>
+                                                                                        ↩️ {group.returnedCount} Returned ({group.returnedTeams.join(', ')})
+                                                                                    </span>
+                                                                                )}
                                                                             </div>
                                                                         </td>
                                                                         <td className="px-4 py-3 whitespace-nowrap text-sm font-mono text-zinc-500">
@@ -2095,16 +2748,22 @@ const StockTakePage = ({
                                                                                         type="button"
                                                                                         onClick={() => {
                                                                                             setRangeCountError('');
+                                                                                            const sp = supplierPartNumbers?.find(p => p.item_name === group.name || p.item_types?.name === group.name);
                                                                                             const firstSerial = group.rawItems?.find(r => r.stock_items?.barcode)?.stock_items?.barcode || '';
                                                                                             setRangeCountDetails({
                                                                                                 firstSerial: firstSerial,
-                                                                                                lastSerial: firstSerial,
-                                                                                                selectedItemType: group.name
+                                                                                                lastSerial: '',
+                                                                                                quantityCount: '',
+                                                                                                selectedItemType: group.name,
+                                                                                                selectedPartNumber: sp?.part_number || ''
                                                                                             });
+                                                                                            setRangeItemSearchQuery(group.name);
+                                                                                            setRangeInputMode('endSerial');
+                                                                                            setShowRangeSerialsPreview(false);
                                                                                             setIsRangeCountModalOpen(true);
                                                                                         }}
                                                                                         className="text-xs font-semibold px-2.5 py-1 bg-purple-50 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 rounded hover:bg-purple-100 dark:hover:bg-purple-800 transition-colors flex items-center gap-1"
-                                                                                        title="Count a range of serial numbers for this product"
+                                                                                        title="Count a serial number range for this product"
                                                                                     >
                                                                                         <BarcodeIcon className="w-3 h-3" />
                                                                                         <span>Range</span>
@@ -2145,10 +2804,15 @@ const StockTakePage = ({
                                                                                                             {raw.stock_items?.barcode || 'No Barcode'}
                                                                                                         </span>
                                                                                                     </div>
-                                                                                                    <div className="flex items-center gap-3">
+                                                                                                    <div className="flex items-center gap-2.5">
                                                                                                         <span className="text-zinc-500 font-sans text-xs">
                                                                                                             Counted: <strong>{raw.counted_quantity || 0}</strong> / Expected: {raw.expected_quantity ?? 1}
                                                                                                         </span>
+                                                                                                        {raw.returnedFromTeam && (
+                                                                                                            <span className="px-2 py-0.5 rounded text-[11px] font-sans font-semibold bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-200 dark:border-amber-800">
+                                                                                                                ↩️ Returned (from {raw.returnedFromTeam})
+                                                                                                            </span>
+                                                                                                        )}
                                                                                                         <span className={`px-2 py-0.5 rounded text-[11px] font-sans font-medium ${isCounted ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300' : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'}`}>
                                                                                                             {isCounted ? 'Counted' : 'Missing'}
                                                                                                         </span>
@@ -2746,6 +3410,24 @@ const StockTakePage = ({
                     <div className="p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-md text-xs text-blue-800 dark:text-blue-200">
                         <strong>Stock Count Reconciliation:</strong> Finalising will archive the permanent variance audit in History and automatically reconcile the live in-stock counts at <strong>{activeStockTake?.location}</strong> for all audited item types to match what was scanned.
                     </div>
+                    {returnedUniqueItems.length > 0 && (
+                        <div className="p-3 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-md text-xs text-amber-900 dark:text-amber-200 space-y-1.5">
+                            <p className="font-bold">
+                                ↩️ Returned Unique Items ({returnedUniqueItems.length})
+                            </p>
+                            <p>
+                                The following counted serials are currently signed out to teams and will be automatically <strong>returned back to {activeStockTake?.location || 'storehouse'} stock</strong>:
+                            </p>
+                            <div className="max-h-28 overflow-y-auto space-y-1 pt-1 font-mono text-[11px]">
+                                {returnedUniqueItems.map((r, idx) => (
+                                    <div key={r.id || idx} className="flex items-center justify-between gap-2 bg-white/70 dark:bg-zinc-900/50 px-2 py-1 rounded border border-amber-200/70 dark:border-amber-800/50">
+                                        <span className="truncate font-semibold">{r.barcode} ({r.name})</span>
+                                        <span className="font-sans text-[10px] shrink-0 text-amber-800 dark:text-amber-300">from {r.fromTeam}</span>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
                     <div className="flex justify-end gap-3 mt-4">
                         <button onClick={() => setIsFinaliseModalOpen(false)} className="px-4 py-2 bg-zinc-200 dark:bg-zinc-700 text-zinc-800 dark:text-zinc-200 rounded-md font-medium text-sm">
                             Keep Counting
@@ -2824,97 +3506,429 @@ const StockTakePage = ({
                 )}
             </Modal>
 
-            {/* Serial Number Range Count Modal */}
+            {/* Enhanced Serial Number Range Count Modal */}
             <Modal 
                 isOpen={isRangeCountModalOpen} 
                 onClose={() => { 
                     setIsRangeCountModalOpen(false); 
                     setRangeCountError(''); 
+                    setShowRangeSerialsPreview(false);
                 }} 
-                title="Count Serial Number Range"
+                title="Serial Number Range Count"
+                maxWidth="max-w-2xl"
             >
                 <form onSubmit={handleRangeCountSubmit} className="space-y-4">
-                    <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                        Quickly count an entire boxed set of serialized meters by entering the first and last serial number.
-                    </p>
+                    {/* Header Storehouse & Scope Banner */}
+                    <div className="flex items-center justify-between p-3 bg-zinc-50 dark:bg-zinc-900/60 rounded-lg border border-zinc-200 dark:border-zinc-700/80 text-xs">
+                        <div className="flex items-center gap-2">
+                            <span className="font-semibold text-zinc-700 dark:text-zinc-300">
+                                📍 Storehouse:
+                            </span>
+                            <span className="px-2 py-0.5 rounded-full font-medium bg-blue-100 dark:bg-blue-900/40 text-blue-800 dark:text-blue-300">
+                                {activeStockTake?.location || 'Storehouse'}
+                            </span>
+                        </div>
+                        <span className="text-zinc-500 dark:text-zinc-400 text-[11px]">
+                            {activeStockTake?.type === 'FULL' ? 'Full Store Audit' : 'Rolling Audit'}
+                        </span>
+                    </div>
 
-                    <div>
-                        <label htmlFor="range-item-type" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">
-                            Product Type
-                        </label>
-                        <select
-                            id="range-item-type"
-                            value={rangeCountDetails.selectedItemType}
-                            onChange={(e) => setRangeCountDetails(prev => ({ ...prev, selectedItemType: e.target.value }))}
-                            className={formInputStyle}
-                        >
-                            <option value="">-- Auto-detect from serial / Select product --</option>
-                            {itemTypes.map(it => (
-                                <option key={it.id || it.name} value={it.name}>
-                                    {it.name} {it.category ? `(${it.category})` : ''}
-                                </option>
+                    {/* Section 1: Product & Part Number Identification */}
+                    <div className="space-y-2">
+                        <div className="flex items-center justify-between">
+                            <label className="block text-sm font-semibold text-zinc-800 dark:text-zinc-200">
+                                Product & Part Number
+                            </label>
+                            {selectedRangeProductMeta && (
+                                <button
+                                    type="button"
+                                    onClick={() => {
+                                        setRangeCountDetails(prev => ({ ...prev, selectedItemType: '', selectedPartNumber: '' }));
+                                        setRangeItemSearchQuery('');
+                                    }}
+                                    className="text-xs text-blue-600 dark:text-blue-400 hover:underline"
+                                >
+                                    Change Product
+                                </button>
+                            )}
+                        </div>
+
+                        {selectedRangeProductMeta ? (
+                            /* Selected Product Card Banner with Part Number Highlighted */
+                            <div className="p-3.5 bg-gradient-to-r from-purple-50/60 to-blue-50/60 dark:from-purple-950/30 dark:to-blue-950/30 rounded-xl border border-purple-200/80 dark:border-purple-800/60">
+                                <div className="flex items-start justify-between gap-3">
+                                    <div className="min-w-0">
+                                        <div className="flex items-center gap-2 flex-wrap">
+                                            <h4 className="font-bold text-base text-zinc-900 dark:text-white">
+                                                {selectedRangeProductMeta.itemType.name}
+                                            </h4>
+                                            {selectedRangeProductMeta.category && (
+                                                <span className="text-xs px-2 py-0.5 rounded-full bg-white dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 border border-zinc-200 dark:border-zinc-700 font-medium">
+                                                    {selectedRangeProductMeta.category}
+                                                </span>
+                                            )}
+                                        </div>
+
+                                        <div className="flex items-center gap-3 mt-1.5 flex-wrap text-xs font-mono">
+                                            {selectedRangeProductMeta.partNumber ? (
+                                                <span className="inline-flex items-center gap-1 font-bold px-2 py-0.5 rounded bg-purple-100 text-purple-800 dark:bg-purple-900/60 dark:text-purple-300 border border-purple-300 dark:border-purple-700">
+                                                    <TagIcon className="w-3.5 h-3.5" />
+                                                    Part #: {selectedRangeProductMeta.partNumber}
+                                                </span>
+                                            ) : (
+                                                <span className="text-zinc-500 font-sans italic">
+                                                    No supplier part # configured
+                                                </span>
+                                            )}
+                                            {selectedRangeProductMeta.supplierName && (
+                                                <span className="text-zinc-600 dark:text-zinc-300 font-sans">
+                                                    Supplier: <strong>{selectedRangeProductMeta.supplierName}</strong>
+                                                </span>
+                                            )}
+                                            {selectedRangeProductMeta.price > 0 && (
+                                                <span className="text-zinc-600 dark:text-zinc-300 font-sans">
+                                                    £{selectedRangeProductMeta.price.toFixed(2)}/ea
+                                                </span>
+                                            )}
+                                        </div>
+                                    </div>
+                                    <div className="text-right shrink-0">
+                                        <span className="block text-[10px] uppercase font-bold text-zinc-400">Current Stock Take</span>
+                                        <span className="text-xs font-mono font-bold text-zinc-700 dark:text-zinc-300">
+                                            {selectedRangeProductMeta.countedCount} / {selectedRangeProductMeta.expectedCount} Counted
+                                        </span>
+                                    </div>
+                                </div>
+                            </div>
+                        ) : (
+                            /* Product / Part Number Search & Dropdown */
+                            <div className="space-y-2">
+                                <div className="relative">
+                                    <SearchIcon className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400 pointer-events-none" />
+                                    <input
+                                        type="text"
+                                        value={rangeItemSearchQuery}
+                                        onChange={(e) => {
+                                            const val = e.target.value;
+                                            setRangeItemSearchQuery(val);
+                                            if (val.trim().length >= 2 && !hasLongerRangeCandidate(val)) {
+                                                const resolved = resolveUniqueItemType(val);
+                                                if (resolved) {
+                                                    selectResolvedRangeProduct(resolved, val);
+                                                }
+                                            }
+                                        }}
+                                        onKeyDown={(e) => {
+                                            if (e.key === 'Enter') {
+                                                e.preventDefault();
+                                                const resolved = resolveUniqueItemType(rangeItemSearchQuery);
+                                                if (resolved) {
+                                                    selectResolvedRangeProduct(resolved, rangeItemSearchQuery);
+                                                } else if (filteredRangeItemTypes.length === 1) {
+                                                    selectResolvedRangeProduct(filteredRangeItemTypes[0], rangeItemSearchQuery);
+                                                }
+                                            }
+                                        }}
+                                        placeholder="Scan or type Part Number (e.g. PN-EMLITE-01), Barcode, or Product Name..."
+                                        className={`${formInputStyle} pl-9 text-sm font-mono`}
+                                        autoFocus
+                                    />
+                                    {rangeItemSearchQuery && (
+                                        <button
+                                            type="button"
+                                            onClick={() => setRangeItemSearchQuery('')}
+                                            className="absolute right-2.5 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600 text-sm p-0.5"
+                                        >
+                                            &times;
+                                        </button>
+                                    )}
+                                </div>
+
+                                <select
+                                    id="range-item-type"
+                                    value={rangeCountDetails.selectedItemType}
+                                    onChange={(e) => {
+                                        const name = e.target.value;
+                                        const selectedIt = itemTypes.find(t => t.name === name);
+                                        const sp = supplierPartNumbers?.find(p => (selectedIt?.id != null && p.item_type_id === selectedIt.id) || p.item_name === name || p.item_types?.name === name);
+                                        setRangeCountDetails(prev => ({ 
+                                            ...prev, 
+                                            selectedItemType: name,
+                                            selectedPartNumber: sp?.part_number || ''
+                                        }));
+                                    }}
+                                    className={formInputStyle}
+                                >
+                                    <option value="">-- Select Product / Part Number --</option>
+                                    {filteredRangeItemTypes.map(it => {
+                                        const partInfo = supplierPartNumbers?.find(sp => (it.id != null && sp.item_type_id === it.id) || sp.item_name === it.name || sp.item_types?.name === it.name);
+                                        const partNum = partInfo?.part_number ? ` [Part #: ${partInfo.part_number}]` : '';
+                                        const bc = it.barcode ? ` [BC: ${it.barcode}]` : '';
+                                        return (
+                                            <option key={it.id || it.name} value={it.name}>
+                                                {it.name}{partNum}{bc} {it.category ? `(${it.category})` : ''}
+                                            </option>
+                                        );
+                                    })}
+                                </select>
+                                {filteredRangeItemTypes.length === 0 && rangeItemSearchQuery && (
+                                    <p className="text-xs text-amber-600 dark:text-amber-400">
+                                        No items or part numbers matched "{rangeItemSearchQuery}".
+                                    </p>
+                                )}
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Section 2: Range Input Controls (Dual Mode: By End Serial vs By Box Quantity) */}
+                    <div className="space-y-3 pt-2 border-t border-zinc-200 dark:border-zinc-700">
+                        <div className="flex items-center justify-between">
+                            <span className="text-sm font-semibold text-zinc-800 dark:text-zinc-200">
+                                Serial Number Range
+                            </span>
+                            {/* Mode switcher tabs */}
+                            <div className="flex items-center bg-zinc-100 dark:bg-zinc-800 p-0.5 rounded-lg border border-zinc-200 dark:border-zinc-700 text-xs">
+                                <button
+                                    type="button"
+                                    onClick={() => setRangeInputMode('endSerial')}
+                                    className={`px-2.5 py-1 rounded font-semibold transition-colors ${
+                                        rangeInputMode === 'endSerial'
+                                            ? 'bg-white dark:bg-zinc-700 text-blue-600 dark:text-blue-400 shadow-2xs'
+                                            : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900'
+                                    }`}
+                                >
+                                    By End Serial
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => setRangeInputMode('quantity')}
+                                    className={`px-2.5 py-1 rounded font-semibold transition-colors ${
+                                        rangeInputMode === 'quantity'
+                                            ? 'bg-white dark:bg-zinc-700 text-blue-600 dark:text-blue-400 shadow-2xs'
+                                            : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900'
+                                    }`}
+                                >
+                                    By Box Quantity
+                                </button>
+                            </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <div>
+                                <label htmlFor="range-first-serial" className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                                    First Serial Number
+                                </label>
+                                <input
+                                    type="text"
+                                    id="range-first-serial"
+                                    value={rangeCountDetails.firstSerial}
+                                    onChange={(e) => {
+                                        const start = e.target.value;
+                                        setRangeCountDetails(prev => {
+                                            const updated = { ...prev, firstSerial: start };
+                                            if (rangeInputMode === 'quantity' && prev.quantityCount) {
+                                                updated.lastSerial = calculateEndSerial(start, prev.quantityCount);
+                                            } else if (rangeInputMode === 'endSerial' && prev.lastSerial) {
+                                                updated.quantityCount = calculateRangeQuantity(start, prev.lastSerial);
+                                            }
+                                            return updated;
+                                        });
+                                    }}
+                                    placeholder="e.g. MTR-2024-001"
+                                    className={`${formInputStyle} font-mono text-sm`}
+                                    required
+                                />
+                            </div>
+
+                            {rangeInputMode === 'endSerial' ? (
+                                <div>
+                                    <label htmlFor="range-last-serial" className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                                        Last Serial Number
+                                    </label>
+                                    <input
+                                        type="text"
+                                        id="range-last-serial"
+                                        value={rangeCountDetails.lastSerial}
+                                        onChange={(e) => {
+                                            const end = e.target.value;
+                                            setRangeCountDetails(prev => ({
+                                                ...prev,
+                                                lastSerial: end,
+                                                quantityCount: calculateRangeQuantity(prev.firstSerial, end)
+                                            }));
+                                        }}
+                                        placeholder="e.g. MTR-2024-050"
+                                        className={`${formInputStyle} font-mono text-sm`}
+                                        required
+                                    />
+                                </div>
+                            ) : (
+                                <div>
+                                    <label htmlFor="range-quantity" className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                                        Box Quantity (Units)
+                                    </label>
+                                    <input
+                                        type="number"
+                                        id="range-quantity"
+                                        min="1"
+                                        max="1000"
+                                        value={rangeCountDetails.quantityCount}
+                                        onChange={(e) => {
+                                            const qty = e.target.value;
+                                            setRangeCountDetails(prev => ({
+                                                ...prev,
+                                                quantityCount: qty,
+                                                lastSerial: calculateEndSerial(prev.firstSerial, qty)
+                                            }));
+                                        }}
+                                        placeholder="e.g. 50"
+                                        className={`${formInputStyle} font-mono text-sm`}
+                                        required
+                                    />
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Quick Box Quantity Shortcut Chips */}
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="text-[11px] text-zinc-400 font-medium">Quick Box Size:</span>
+                            {[10, 20, 25, 50, 100].map(qty => (
+                                <button
+                                    key={qty}
+                                    type="button"
+                                    onClick={() => {
+                                        setRangeCountDetails(prev => ({
+                                            ...prev,
+                                            quantityCount: String(qty),
+                                            lastSerial: calculateEndSerial(prev.firstSerial, qty)
+                                        }));
+                                    }}
+                                    className="px-2 py-0.5 text-xs font-semibold rounded bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-700 dark:hover:bg-zinc-600 text-zinc-700 dark:text-zinc-200 transition-colors"
+                                >
+                                    +{qty}
+                                </button>
                             ))}
-                        </select>
-                    </div>
-
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                        <div>
-                            <label htmlFor="range-first-serial" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">
-                                First Serial Number
-                            </label>
-                            <input
-                                type="text"
-                                id="range-first-serial"
-                                value={rangeCountDetails.firstSerial}
-                                onChange={(e) => setRangeCountDetails(prev => ({ ...prev, firstSerial: e.target.value }))}
-                                placeholder="e.g. MTR-2024-001"
-                                className={`${formInputStyle} font-mono`}
-                                required
-                                autoFocus
-                            />
-                        </div>
-                        <div>
-                            <label htmlFor="range-last-serial" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">
-                                Last Serial Number
-                            </label>
-                            <input
-                                type="text"
-                                id="range-last-serial"
-                                value={rangeCountDetails.lastSerial}
-                                onChange={(e) => setRangeCountDetails(prev => ({ ...prev, lastSerial: e.target.value }))}
-                                placeholder="e.g. MTR-2024-050"
-                                className={`${formInputStyle} font-mono`}
-                                required
-                            />
                         </div>
                     </div>
 
-                    {/* Preview or Error Box */}
+                    {/* Section 3: Error or Mindful Range Inventory Preview */}
                     {rangeCountError ? (
-                        <div className="p-3 bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300 rounded-md text-xs border border-red-200 dark:border-red-800">
+                        <div className="p-3 bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300 rounded-lg text-xs border border-red-200 dark:border-red-800">
                             {rangeCountError}
                         </div>
                     ) : rangeCountProcessingResult.error ? (
-                        <div className="p-3 bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300 rounded-md text-xs border border-red-200 dark:border-red-800">
+                        <div className="p-3 bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300 rounded-lg text-xs border border-red-200 dark:border-red-800">
                             {rangeCountProcessingResult.error}
                         </div>
                     ) : rangeCountProcessingResult.serials.length > 0 ? (
-                        <div className="p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-md text-xs text-blue-800 dark:text-blue-200">
-                            <p className="font-semibold">
-                                ✓ Valid Range: {rangeCountProcessingResult.serials.length} serial numbers will be counted
-                            </p>
-                            <p className="mt-1 text-[11px] font-mono text-zinc-600 dark:text-zinc-400 truncate">
-                                Range: {rangeCountProcessingResult.serials[0]} &rarr; {rangeCountProcessingResult.serials[rangeCountProcessingResult.serials.length - 1]}
-                            </p>
+                        <div className="p-3.5 bg-zinc-50 dark:bg-zinc-900/70 border border-blue-200 dark:border-blue-900/60 rounded-xl space-y-2.5">
+                            <div className="flex items-center justify-between flex-wrap gap-2">
+                                <div className="flex items-center gap-2">
+                                    <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-blue-600 text-white text-xs font-bold">
+                                        ✓
+                                    </span>
+                                    <span className="font-bold text-sm text-zinc-900 dark:text-zinc-100">
+                                        Valid Range: {rangeCountProcessingResult.count} Units
+                                    </span>
+                                </div>
+                                <span className="font-mono text-xs text-zinc-500 dark:text-zinc-400">
+                                    {rangeCountProcessingResult.serials[0]} &rarr; {rangeCountProcessingResult.serials[rangeCountProcessingResult.serials.length - 1]}
+                                </span>
+                            </div>
+
+                            {/* Mindful Inventory Breakdown */}
+                            {rangeCountProcessingResult.inventoryStats && (
+                                <div className={`grid ${rangeCountProcessingResult.inventoryStats.returnedCount > 0 ? 'grid-cols-2 sm:grid-cols-4' : 'grid-cols-3'} gap-2 pt-1 text-center text-xs`}>
+                                    <div className="bg-white dark:bg-zinc-800 p-2 rounded-lg border border-zinc-200 dark:border-zinc-700">
+                                        <span className="block text-[10px] uppercase font-bold text-emerald-600 dark:text-emerald-400">Existing In Stock</span>
+                                        <span className="font-mono font-bold text-zinc-800 dark:text-zinc-200">
+                                            {rangeCountProcessingResult.inventoryStats.existingCount} units
+                                        </span>
+                                    </div>
+                                    {rangeCountProcessingResult.inventoryStats.returnedCount > 0 && (
+                                        <div className="bg-white dark:bg-zinc-800 p-2 rounded-lg border border-amber-200 dark:border-amber-800/60">
+                                            <span className="block text-[10px] uppercase font-bold text-amber-600 dark:text-amber-400">Returned (Team)</span>
+                                            <span className="font-mono font-bold text-amber-700 dark:text-amber-300">
+                                                ↩️ {rangeCountProcessingResult.inventoryStats.returnedCount} units
+                                            </span>
+                                        </div>
+                                    )}
+                                    <div className="bg-white dark:bg-zinc-800 p-2 rounded-lg border border-purple-200 dark:border-purple-800/60">
+                                        <span className="block text-[10px] uppercase font-bold text-purple-600 dark:text-purple-400">New for Part #</span>
+                                        <span className="font-mono font-bold text-purple-700 dark:text-purple-300">
+                                            +{rangeCountProcessingResult.inventoryStats.newCount} new
+                                        </span>
+                                    </div>
+                                    <div className="bg-white dark:bg-zinc-800 p-2 rounded-lg border border-zinc-200 dark:border-zinc-700">
+                                        <span className="block text-[10px] uppercase font-bold text-zinc-400">Already Counted</span>
+                                        <span className="font-mono font-bold text-zinc-600 dark:text-zinc-400">
+                                            {rangeCountProcessingResult.inventoryStats.alreadyCountedCount} units
+                                        </span>
+                                    </div>
+                                </div>
+                            )}
+
+                            {rangeCountProcessingResult.inventoryStats?.returnedCount > 0 && (
+                                <p className="text-[11px] text-amber-800 dark:text-amber-200 bg-amber-50 dark:bg-amber-950/40 p-2 rounded-md border border-amber-200 dark:border-amber-800/50">
+                                    ↩️ <strong>Returned Items Note:</strong> {rangeCountProcessingResult.inventoryStats.returnedCount} serial(s) in this range are currently signed out to{' '}
+                                    <strong>{rangeCountProcessingResult.inventoryStats.returnedTeams.join(', ')}</strong>. Counting them marks them as returned items and will automatically return them back to{' '}
+                                    <strong>{activeStockTake?.location || 'this storehouse'}</strong> stock when you finalise.
+                                </p>
+                            )}
+
+                            {/* Mindful Context Callout */}
+                            {rangeCountProcessingResult.inventoryStats?.newCount > 0 && selectedRangeProductMeta && (
+                                <p className="text-[11px] text-purple-700 dark:text-purple-300 bg-purple-50 dark:bg-purple-950/40 p-2 rounded-md border border-purple-200 dark:border-purple-800/40">
+                                    ✨ <strong>Part Number Association:</strong> {rangeCountProcessingResult.inventoryStats.newCount} unrecognised serials will automatically be registered as new inventory under Part Number <strong>{selectedRangeProductMeta.partNumber || selectedRangeProductMeta.itemType.name}</strong> at {activeStockTake?.location || 'this storehouse'}.
+                                </p>
+                            )}
+
+                            {/* Toggleable Serials Preview List */}
+                            <div className="pt-1">
+                                <button
+                                    type="button"
+                                    onClick={() => setShowRangeSerialsPreview(prev => !prev)}
+                                    className="text-xs font-semibold text-blue-600 dark:text-blue-400 hover:underline flex items-center gap-1"
+                                >
+                                    <ChevronDownIcon className={`w-3.5 h-3.5 transition-transform ${showRangeSerialsPreview ? 'rotate-180' : '-rotate-90'}`} />
+                                    <span>{showRangeSerialsPreview ? 'Hide Serial Numbers' : `Preview All ${rangeCountProcessingResult.count} Serials`}</span>
+                                </button>
+
+                                {showRangeSerialsPreview && (
+                                    <div className="mt-2 max-h-48 overflow-y-auto space-y-1 pr-1 border border-zinc-200 dark:border-zinc-700 rounded-lg p-2 bg-white dark:bg-zinc-800">
+                                        {rangeCountProcessingResult.serialDetails.map((s, idx) => (
+                                            <div key={s.serial} className="flex items-center justify-between text-xs font-mono py-1 px-1.5 rounded hover:bg-zinc-50 dark:hover:bg-zinc-700/50">
+                                                <div className="flex items-center gap-2">
+                                                    <span className="text-[10px] text-zinc-400 font-sans w-5">#{idx + 1}</span>
+                                                    <span className="font-medium text-zinc-800 dark:text-zinc-200">{s.serial}</span>
+                                                </div>
+                                                <span className={`text-[10px] font-sans px-1.5 py-0.5 rounded font-bold ${
+                                                    s.isAlreadyCounted
+                                                        ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300'
+                                                        : s.isReturned
+                                                            ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300'
+                                                            : s.isNew
+                                                                ? 'bg-purple-100 text-purple-800 dark:bg-purple-900/40 dark:text-purple-300'
+                                                                : 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300'
+                                                }`}>
+                                                    {s.isAlreadyCounted ? 'Already Counted' : s.isReturned ? `↩️ Returned (${s.assignedTo})` : s.isNew ? '✨ New Serial' : '✓ In Stock'}
+                                                </span>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
                         </div>
                     ) : null}
 
-                    <div className="flex justify-end space-x-3 pt-4 border-t border-zinc-200 dark:border-zinc-700">
+                    {/* Section 4: Modal Actions */}
+                    <div className="flex justify-end space-x-3 pt-3 border-t border-zinc-200 dark:border-zinc-700">
                         <button
                             type="button"
                             onClick={() => {
                                 setIsRangeCountModalOpen(false);
                                 setRangeCountError('');
+                                setShowRangeSerialsPreview(false);
                             }}
                             className="px-4 py-2 bg-zinc-200 dark:bg-zinc-700 text-zinc-800 dark:text-zinc-200 rounded-md text-sm font-medium hover:bg-zinc-300 dark:hover:bg-zinc-600"
                         >
@@ -2923,10 +3937,12 @@ const StockTakePage = ({
                         <button
                             type="submit"
                             disabled={rangeCountSubmitting || !!rangeCountProcessingResult.error || rangeCountProcessingResult.serials.length === 0}
-                            className="px-4 py-2 bg-blue-600 text-white rounded-md text-sm font-medium hover:bg-blue-700 disabled:bg-blue-400 dark:disabled:bg-blue-800 disabled:cursor-not-allowed flex items-center justify-center min-w-[140px]"
+                            className="px-5 py-2 bg-blue-600 text-white rounded-md text-sm font-semibold hover:bg-blue-700 disabled:bg-blue-300 dark:disabled:bg-blue-900/40 disabled:cursor-not-allowed flex items-center justify-center min-w-[150px] shadow-xs"
                         >
                             {rangeCountSubmitting ? <Spinner className="w-4 h-4 mr-2" /> : null}
-                            {rangeCountSubmitting ? 'Counting...' : `Count ${rangeCountProcessingResult.serials.length || 0} Units`}
+                            {rangeCountSubmitting 
+                                ? 'Counting...' 
+                                : `Count ${rangeCountProcessingResult.count || 0} Units ${selectedRangeProductMeta?.partNumber ? `(PN: ${selectedRangeProductMeta.partNumber})` : ''}`}
                         </button>
                     </div>
                 </form>
