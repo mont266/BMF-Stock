@@ -154,6 +154,7 @@ const StockTakePage = ({
     const [rangeCountSubmitting, setRangeCountSubmitting] = useState(false);
     const [rangeCountError, setRangeCountError] = useState('');
     const [rangeItemSearchQuery, setRangeItemSearchQuery] = useState('');
+    const [rangeLiveDbStockMap, setRangeLiveDbStockMap] = useState(new Map());
 
     const playBeep = useCallback((type = 'success') => {
         try {
@@ -477,7 +478,7 @@ const StockTakePage = ({
                 : (typeof item.expected_quantity === 'number' ? item.expected_quantity : 1);
             const cnt = typeof item.counted_quantity === 'number' ? item.counted_quantity : 0;
             const assignedTo = item.stock_items?.assigned_to ?? stockItemFallback?.assigned_to;
-            const returnedFromTeam = (isItemUnique && cnt > 0 && isAssignedToTeam(assignedTo)) ? assignedTo : null;
+            const returnedFromTeam = (cnt > 0 && isAssignedToTeam(assignedTo)) ? assignedTo : null;
 
             groups[itemTypeName].expected_quantity += exp;
             groups[itemTypeName].counted_quantity += cnt;
@@ -884,17 +885,9 @@ const StockTakePage = ({
                     }
                 }
 
-                // 4a. Return any counted unique items that are still assigned to a team back to storehouse stock
+                // 4a. Return any counted items that are still assigned to a team back to storehouse stock
                 const meta = itemTypesMap[group.name] || (Array.isArray(itemTypes) ? itemTypes.find(it => it.name === group.name) : null) || {};
-                const isUniqueGroup = !!(
-                    group.is_unique ||
-                    meta.is_unique ||
-                    (group.category && group.category.toLowerCase().includes('meter')) ||
-                    (group.name && group.name.toLowerCase().includes('meter'))
-                );
-                const itemsToReturn = isUniqueGroup
-                    ? dbItemsById.filter(item => countedItemIds.has(item.id) && isAssignedToTeam(item.assigned_to))
-                    : [];
+                const itemsToReturn = dbItemsById.filter(item => countedItemIds.has(item.id) && isAssignedToTeam(item.assigned_to));
 
                 if (itemsToReturn.length > 0) {
                     const returnIds = itemsToReturn.map(i => i.id);
@@ -1353,7 +1346,7 @@ const StockTakePage = ({
                         const { data: stockData } = await supabase
                             .from('stock_items')
                             .select('*')
-                            .eq('barcode', rawBarcode)
+                            .ilike('barcode', rawBarcode)
                             .limit(1);
                         if (stockData && stockData.length > 0) {
                             matchedItemName = stockData[0].name;
@@ -1408,12 +1401,13 @@ const StockTakePage = ({
                     const returnedTeam = isAssignedToTeam(existingAssigned) ? existingAssigned : null;
                     setLastScanned({
                         success: true,
+                        variant: returnedTeam ? 'warning' : 'success',
                         message: returnedTeam
-                            ? `↩️ Returned item counted: ${matchedItemName} (${rawBarcode}) — was assigned to ${returnedTeam}. Will return to ${currentTargetLocation} stock on finalise.`
+                            ? `↩️ Signed Out to ${returnedTeam}: ${matchedItemName} (${rawBarcode}) has been counted and will be returned to ${currentTargetLocation} stock before finalising.`
                             : `Scanned ${matchedItemName} (Serial ${rawBarcode}) (+1 Counted)`
                     });
                     playBeep(returnedTeam ? 'warn' : 'success');
-                    setTimeout(() => setLastScanned(null), 4000);
+                    setTimeout(() => setLastScanned(null), returnedTeam ? 8000 : 4000);
                     return;
                 }
 
@@ -1434,17 +1428,18 @@ const StockTakePage = ({
                         .single();
 
                     if (takeInsertError) throw takeInsertError;
-                    setStockTakeItems(prev => [...prev, insertedTakeItem]);
+                    setStockTakeItems(prev => [...prev, { ...insertedTakeItem, stock_items: insertedTakeItem.stock_items || matchedPhysicalSerialItem }]);
 
                     const returnedTeam = isAssignedToTeam(matchedPhysicalSerialItem.assigned_to) ? matchedPhysicalSerialItem.assigned_to : null;
                     setLastScanned({
                         success: true,
+                        variant: returnedTeam ? 'warning' : 'success',
                         message: returnedTeam
-                            ? `↩️ Returned item counted: ${matchedItemName} (${rawBarcode}) — signed out to ${returnedTeam}. Will be returned to ${currentTargetLocation} stock on finalise.`
+                            ? `↩️ Signed Out to ${returnedTeam}: ${matchedItemName} (${rawBarcode}) has been counted and will be returned to ${currentTargetLocation} stock before finalising.`
                             : `Scanned ${matchedItemName} (Serial ${rawBarcode}) (+1 Counted)`
                     });
                     playBeep(returnedTeam ? 'warn' : 'success');
-                    setTimeout(() => setLastScanned(null), 4000);
+                    setTimeout(() => setLastScanned(null), returnedTeam ? 8000 : 4000);
                     return;
                 }
 
@@ -1756,13 +1751,13 @@ const StockTakePage = ({
             };
         }
 
-        // Analyze serials against existing stock items and active stock take items
-        const targetName = rangeCountDetails.selectedItemType;
+        // Analyze serials against existing stock items, live DB lookups, and active stock take items
+        const targetNameNorm = (rangeCountDetails.selectedItemType || '').trim().toLowerCase();
         const existingStockBarcodes = new Set();
         const assignedSerialMap = new Map();
         const takeItemsForTarget = stockTakeItems.filter(sti => {
-            const name = sti.stock_items?.name || stockMap.get(sti.item_id)?.name;
-            return !targetName || name === targetName;
+            const name = (sti.stock_items?.name || stockMap.get(sti.item_id)?.name || '').trim().toLowerCase();
+            return !targetNameNorm || name === targetNameNorm;
         });
 
         const alreadyCountedSet = new Set();
@@ -1781,17 +1776,34 @@ const StockTakePage = ({
             }
         });
 
+        const absorbStockRow = (s, requireNameMatch = true) => {
+            if (!s) return;
+            const bc = (s.barcode || '').trim().toLowerCase();
+            if (!bc) return;
+            const sNameNorm = (s.name || '').trim().toLowerCase();
+            if (requireNameMatch && targetNameNorm && sNameNorm !== targetNameNorm) return;
+
+            if (isAssignedToTeam(s.assigned_to)) {
+                assignedSerialMap.set(bc, s.assigned_to);
+            } else if (!assignedSerialMap.has(bc)) {
+                existingStockBarcodes.add(bc);
+            }
+        };
+
         if (Array.isArray(stock)) {
+            stock.forEach(s => absorbStockRow(s, true));
+            // Fallback pass: if a serial in stock is signed out to a team regardless of minor product name differences
             stock.forEach(s => {
-                if (!targetName || s.name === targetName) {
-                    const bc = (s.barcode || '').trim().toLowerCase();
-                    if (bc) {
-                        if (isAssignedToTeam(s.assigned_to)) {
-                            assignedSerialMap.set(bc, s.assigned_to);
-                        } else {
-                            existingStockBarcodes.add(bc);
-                        }
-                    }
+                if (isAssignedToTeam(s.assigned_to)) absorbStockRow(s, false);
+            });
+        }
+
+        if (rangeLiveDbStockMap && rangeLiveDbStockMap.size > 0) {
+            rangeLiveDbStockMap.forEach(s => {
+                if (isAssignedToTeam(s.assigned_to)) {
+                    absorbStockRow(s, false);
+                } else {
+                    absorbStockRow(s, true);
                 }
             });
         }
@@ -1843,7 +1855,75 @@ const StockTakePage = ({
                 alreadyCountedCount
             }
         };
-    }, [rangeCountDetails.firstSerial, rangeCountDetails.lastSerial, rangeCountDetails.selectedItemType, stockTakeItems, stock, stockMap, isAssignedToTeam]);
+    }, [rangeCountDetails.firstSerial, rangeCountDetails.lastSerial, rangeCountDetails.selectedItemType, stockTakeItems, stock, stockMap, rangeLiveDbStockMap, isAssignedToTeam]);
+
+    // Live DB verification for Range Count serials so stale local stock never hides signed-out items
+    useEffect(() => {
+        if (!isRangeCountModalOpen || isTrainingMode) {
+            setRangeLiveDbStockMap(new Map());
+            return;
+        }
+        const start = rangeCountDetails.firstSerial?.trim();
+        const end = rangeCountDetails.lastSerial?.trim();
+        if (!start || !end) {
+            setRangeLiveDbStockMap(new Map());
+            return;
+        }
+        const expansion = expandRange(start, end);
+        if (expansion.error || !expansion.result || expansion.result.length === 0 || expansion.result.length > 1000) {
+            setRangeLiveDbStockMap(new Map());
+            return;
+        }
+
+        let cancelled = false;
+        const timer = setTimeout(async () => {
+            try {
+                const serialsList = expansion.result;
+                // Include case-matched barcodes from local stock prop too
+                const querySet = new Set(serialsList);
+                const lowerSet = new Set(serialsList.map(s => s.trim().toLowerCase()));
+                if (Array.isArray(stock)) {
+                    stock.forEach(s => {
+                        const bc = (s.barcode || '').trim();
+                        if (bc && lowerSet.has(bc.toLowerCase())) {
+                            querySet.add(bc);
+                        }
+                    });
+                }
+                const allQueryBarcodes = Array.from(querySet);
+                const liveMap = new Map();
+                const chunkSize = 150;
+                for (let i = 0; i < allQueryBarcodes.length; i += chunkSize) {
+                    if (cancelled) return;
+                    const chunk = allQueryBarcodes.slice(i, i + chunkSize);
+                    const { data, error } = await supabase
+                        .from('stock_items')
+                        .select('id, name, barcode, location, assigned_to')
+                        .in('barcode', chunk);
+                    if (!error && Array.isArray(data)) {
+                        data.forEach(row => {
+                            const key = String(row.barcode || '').trim().toLowerCase();
+                            if (!key) return;
+                            const prev = liveMap.get(key);
+                            if (!prev || (isAssignedToTeam(row.assigned_to) && !isAssignedToTeam(prev.assigned_to))) {
+                                liveMap.set(key, row);
+                            }
+                        });
+                    }
+                }
+                if (!cancelled) {
+                    setRangeLiveDbStockMap(liveMap);
+                }
+            } catch (err) {
+                console.warn('Range live DB lookup warning:', err);
+            }
+        }, 150);
+
+        return () => {
+            cancelled = true;
+            clearTimeout(timer);
+        };
+    }, [isRangeCountModalOpen, isTrainingMode, rangeCountDetails.firstSerial, rangeCountDetails.lastSerial, stock, isAssignedToTeam]);
 
     // Handle Range Count Submission
     const handleRangeCountSubmit = async (e) => {
@@ -1902,11 +1982,23 @@ const StockTakePage = ({
                 setStockTakeItems([...trainingManager.getStockTakeItems(activeStockTakeRef.current.id)]);
                 if (typeof refetchStock === 'function') refetchStock();
 
+                const returnedItems = res.returnedItems || [];
+                const returnedTeams = Array.from(new Set(returnedItems.map(r => r.fromTeam)));
+                if (returnedItems.length > 0) {
+                    playBeep('warn');
+                    setExpandedActiveTypes(prev => ({ ...prev, [targetTypeName]: true }));
+                } else {
+                    playBeep('success');
+                }
+
                 setLastScanned({
                     success: true,
-                    message: `Counted range of ${res.count} items (${serials[0]} - ${serials[serials.length - 1]}) for ${targetTypeName}`
+                    variant: returnedItems.length > 0 ? 'warning' : 'success',
+                    message: returnedItems.length > 0
+                        ? `↩️ Signed Out Serials Scanned (${returnedItems.length} of ${res.count} ${targetTypeName}): Currently signed out to ${returnedTeams.join(', ')} — marked as pending return and will be returned to ${currentTargetLocation} stock when you finalise.`
+                        : `Counted range of ${res.count} items (${serials[0]} - ${serials[serials.length - 1]}) for ${targetTypeName}`
                 });
-                setTimeout(() => setLastScanned(null), 4000);
+                setTimeout(() => setLastScanned(null), returnedItems.length > 0 ? 8000 : 4000);
 
                 setIsRangeCountModalOpen(false);
                 setRangeCountDetails({ firstSerial: '', lastSerial: '', quantityCount: '', selectedItemType: '', selectedPartNumber: '' });
@@ -1958,17 +2050,39 @@ const StockTakePage = ({
             const spPart = Array.isArray(supplierPartNumbers) ? supplierPartNumbers.find(p => (meta.id && p.item_type_id === meta.id) || p.item_name === targetTypeName || p.item_types?.name === targetTypeName) : null;
             const itemPrice = parseFloat(spPart?.purchase_price ?? 0) || 0;
 
-            // Look up existing stock items in database matching these serials
-            const { data: dbMatchedStock, error: dbStockError } = await supabase
-                .from('stock_items')
-                .select('*')
-                .in('barcode', serials);
+            // Look up existing stock items in database matching these serials (chunked, including any case variants from stock prop)
+            const queryBarcodeSet = new Set(serials);
+            const serialLowerSet = new Set(serials.map(s => s.trim().toLowerCase()));
+            if (Array.isArray(stock)) {
+                stock.forEach(s => {
+                    const bc = (s.barcode || '').trim();
+                    if (bc && serialLowerSet.has(bc.toLowerCase())) {
+                        queryBarcodeSet.add(bc);
+                    }
+                });
+            }
+            const queryBarcodes = Array.from(queryBarcodeSet);
+            const dbMatchedStock = [];
+            const queryChunkSize = 150;
+            for (let i = 0; i < queryBarcodes.length; i += queryChunkSize) {
+                const chunk = queryBarcodes.slice(i, i + queryChunkSize);
+                const { data: chunkData, error: dbStockError } = await supabase
+                    .from('stock_items')
+                    .select('*')
+                    .in('barcode', chunk);
+                if (dbStockError) throw dbStockError;
+                if (chunkData) dbMatchedStock.push(...chunkData);
+            }
 
-            if (dbStockError) throw dbStockError;
-
-            const existingByBarcode = new Map();
-            (dbMatchedStock || []).forEach(item => {
-                if (item.barcode) existingByBarcode.set(item.barcode, item);
+            const existingByBarcodeLower = new Map();
+            dbMatchedStock.forEach(item => {
+                if (item.barcode) {
+                    const key = String(item.barcode).trim().toLowerCase();
+                    const prev = existingByBarcodeLower.get(key);
+                    if (!prev || (isAssignedToTeam(item.assigned_to) && !isAssignedToTeam(prev.assigned_to)) || (!isAssignedToTeam(prev.assigned_to) && item.location === currentTargetLocation && prev.location !== currentTargetLocation)) {
+                        existingByBarcodeLower.set(key, item);
+                    }
+                }
             });
 
             // For each serial in the range, find or create the physical stock_item
@@ -1977,7 +2091,7 @@ const StockTakePage = ({
             const newlyCreatedBarcodes = new Set();
 
             for (const serial of serials) {
-                const existing = existingByBarcode.get(serial);
+                const existing = existingByBarcodeLower.get(serial.trim().toLowerCase());
                 if (existing) {
                     resolvedStockItems.push(existing);
                 } else {
@@ -2009,8 +2123,12 @@ const StockTakePage = ({
                 }
             }
 
+            const resolvedByItemId = new Map();
+            resolvedStockItems.forEach(s => {
+                if (s && s.id) resolvedByItemId.set(s.id, s);
+            });
+
             // Fetch or match stock_take_items for these stock item IDs
-            const stockItemIds = resolvedStockItems.map(i => i.id);
             const currentStockTakeItems = stockTakeItemsRef.current;
             const existingTakeItemsMap = new Map();
             currentStockTakeItems.forEach(sti => {
@@ -2054,7 +2172,10 @@ const StockTakePage = ({
                     .select('*, stock_items(id, name, barcode, purchase_price, description, location, assigned_to, created_at)');
 
                 if (takeInsertError) throw takeInsertError;
-                insertedTakeItems = inserted || [];
+                insertedTakeItems = (inserted || []).map(row => ({
+                    ...row,
+                    stock_items: row.stock_items || resolvedByItemId.get(row.item_id)
+                }));
             }
 
             // Update existing stock_take_items to counted_quantity = 1, status = 'COUNTED'
@@ -2067,12 +2188,17 @@ const StockTakePage = ({
                 if (takeUpdateError) throw takeUpdateError;
             }
 
-            // Update local stockTakeItems state
+            // Update local stockTakeItems state (including fresh stock_items metadata)
             const updatedIdsSet = new Set(takeItemIdsToUpdate);
             setStockTakeItems(prev => {
                 const updatedList = prev.map(item => {
                     if (updatedIdsSet.has(item.id)) {
-                        return { ...item, counted_quantity: 1, status: 'COUNTED' };
+                        return {
+                            ...item,
+                            counted_quantity: 1,
+                            status: 'COUNTED',
+                            stock_items: resolvedByItemId.get(item.item_id) || item.stock_items
+                        };
                     }
                     return item;
                 });
@@ -2080,13 +2206,22 @@ const StockTakePage = ({
             });
 
             const returnedInRange = resolvedStockItems.filter(s => isAssignedToTeam(s.assigned_to));
+            const returnedTeams = Array.from(new Set(returnedInRange.map(s => s.assigned_to)));
+            if (returnedInRange.length > 0) {
+                playBeep('warn');
+                setExpandedActiveTypes(prev => ({ ...prev, [targetTypeName]: true }));
+            } else {
+                playBeep('success');
+            }
+
             setLastScanned({
                 success: true,
+                variant: returnedInRange.length > 0 ? 'warning' : 'success',
                 message: returnedInRange.length > 0
-                    ? `Counted serial range (${serials.length} units of ${targetTypeName}). Note: ${returnedInRange.length} returned item(s) signed out to teams will be returned to stock on finalise.`
+                    ? `↩️ Signed Out Serials Scanned (${returnedInRange.length} of ${serials.length} ${targetTypeName}): Currently signed out to ${returnedTeams.join(', ')} — marked as pending return and will be returned to ${currentTargetLocation} stock when you finalise.`
                     : `Successfully counted serial range (${serials.length} units of ${targetTypeName})`
             });
-            setTimeout(() => setLastScanned(null), 5000);
+            setTimeout(() => setLastScanned(null), returnedInRange.length > 0 ? 8000 : 5000);
 
             setIsRangeCountModalOpen(false);
             setRangeCountDetails({ firstSerial: '', lastSerial: '', quantityCount: '', selectedItemType: '', selectedPartNumber: '' });
@@ -2240,15 +2375,29 @@ const StockTakePage = ({
                                 </div>
                             )}
 
-                            <div className="border-2 border-dashed border-zinc-300 dark:border-zinc-700 rounded-lg p-12 flex flex-col items-center justify-center bg-zinc-50 dark:bg-zinc-800/50 relative overflow-hidden">
+                            <div className="border-2 border-dashed border-zinc-300 dark:border-zinc-700 rounded-lg p-6 sm:p-10 flex flex-col items-center justify-center bg-zinc-50 dark:bg-zinc-800/50 relative overflow-hidden">
                                 
                                 {lastScanned && (
-                                    <div className={`absolute top-0 left-0 right-0 p-3 text-sm font-medium text-white transition-all ${lastScanned.success ? 'bg-green-600' : 'bg-red-600'}`}>
-                                        {lastScanned.message}
+                                    <div className={`w-full mb-5 px-4 py-3 rounded-lg text-sm font-medium text-white shadow-sm flex items-center justify-between gap-3 z-20 ${
+                                        !lastScanned.success
+                                            ? 'bg-red-600'
+                                            : lastScanned.variant === 'warning'
+                                                ? 'bg-amber-600'
+                                                : 'bg-green-600'
+                                    }`}>
+                                        <span className="text-left">{lastScanned.message}</span>
+                                        <button
+                                            type="button"
+                                            onClick={() => setLastScanned(null)}
+                                            className="shrink-0 text-white/80 hover:text-white font-bold text-base leading-none px-1"
+                                            aria-label="Dismiss scan notification"
+                                        >
+                                            &times;
+                                        </button>
                                     </div>
                                 )}
                                 
-                                <div className="absolute top-4 right-4 flex bg-white dark:bg-zinc-800 rounded-lg shadow-sm border border-zinc-200 dark:border-zinc-700 p-1 flex-wrap gap-1">
+                                <div className="self-end mb-4 sm:mb-2 flex bg-white dark:bg-zinc-800 rounded-lg shadow-sm border border-zinc-200 dark:border-zinc-700 p-1 flex-wrap gap-1">
                                     <button
                                         type="button"
                                         onClick={() => setScanMode('RAPID')}
@@ -2346,19 +2495,32 @@ const StockTakePage = ({
                                 </div>
 
                                 {returnedUniqueItems.length > 0 && (
-                                    <div className="mt-4 p-3.5 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/70 rounded-lg text-xs text-amber-900 dark:text-amber-200 flex items-start gap-2.5">
-                                        <span className="text-base leading-none mt-0.5">↩️</span>
-                                        <div>
-                                            <p className="font-bold">
-                                                Returned Items Detected ({returnedUniqueItems.length} unique {returnedUniqueItems.length === 1 ? 'item' : 'items'})
-                                            </p>
-                                            <p className="mt-0.5 text-amber-800 dark:text-amber-300">
-                                                {returnedUniqueItems.length === 1 ? 'This counted serial is' : 'These counted serials are'} currently signed out to{' '}
-                                                <strong>{Array.from(new Set(returnedUniqueItems.map(r => r.fromTeam))).join(', ')}</strong>.{' '}
-                                                Finalising this stock take will automatically return {returnedUniqueItems.length === 1 ? 'it' : 'them'} back into{' '}
-                                                <strong>{activeStockTake.location || 'storehouse'}</strong> stock.
-                                            </p>
+                                    <div className="mt-4 p-4 bg-amber-50 dark:bg-amber-950/30 border border-amber-300 dark:border-amber-700/80 rounded-xl text-xs text-amber-900 dark:text-amber-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                                        <div className="flex items-start gap-2.5">
+                                            <span className="text-lg leading-none mt-0.5">↩️</span>
+                                            <div>
+                                                <p className="font-bold text-sm text-amber-950 dark:text-amber-100">
+                                                    Pending Return to System ({returnedUniqueItems.length} signed-out {returnedUniqueItems.length === 1 ? 'serial' : 'serials'} scanned)
+                                                </p>
+                                                <p className="mt-1 text-amber-800 dark:text-amber-300">
+                                                    {returnedUniqueItems.length === 1 ? 'This scanned serial is' : 'These scanned serials are'} currently signed out to{' '}
+                                                    <strong>{Array.from(new Set(returnedUniqueItems.map(r => r.fromTeam))).join(', ')}</strong>.{' '}
+                                                    They are marked for return and will automatically be returned back into{' '}
+                                                    <strong>{activeStockTake.location || 'storehouse'}</strong> system stock when you finalise the stock counts.
+                                                </p>
+                                            </div>
                                         </div>
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                const next = { ...expandedActiveTypes };
+                                                returnedUniqueItems.forEach(r => { next[r.name] = true; });
+                                                setExpandedActiveTypes(next);
+                                            }}
+                                            className="shrink-0 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-semibold text-xs transition-colors self-start sm:self-center"
+                                        >
+                                            Show Pending Returns
+                                        </button>
                                     </div>
                                 )}
 
@@ -2508,8 +2670,8 @@ const StockTakePage = ({
                                                                                 </span>
                                                                             )}
                                                                             {group.returnedCount > 0 && (
-                                                                                <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-200 dark:border-amber-800" title={`Returned from: ${group.returnedTeams.join(', ')}`}>
-                                                                                    ↩️ {group.returnedCount} Returned
+                                                                                <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-200 dark:border-amber-800" title={`Signed out to: ${group.returnedTeams.join(', ')}. Will return to stock on finalise.`}>
+                                                                                    ↩️ {group.returnedCount} Pending Return ({group.returnedTeams.join(', ')})
                                                                                 </span>
                                                                             )}
                                                                         </div>
@@ -2655,18 +2817,19 @@ const StockTakePage = ({
                                                                                         <span className="text-zinc-500 font-sans text-[11px]">
                                                                                             {raw.counted_quantity || 0} / {raw.expected_quantity ?? 1}
                                                                                         </span>
-                                                                                        {raw.returnedFromTeam && (
-                                                                                            <span className="px-2 py-0.5 rounded text-[10px] font-sans font-bold bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-200 dark:border-amber-800">
-                                                                                                ↩️ Returned (from {raw.returnedFromTeam})
+                                                                                        {raw.returnedFromTeam ? (
+                                                                                            <span className="px-2 py-0.5 rounded text-[10px] font-sans font-bold bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-300 dark:border-amber-700">
+                                                                                                ↩️ Signed Out ({raw.returnedFromTeam}) — Will Return
+                                                                                            </span>
+                                                                                        ) : (
+                                                                                            <span className={`px-2 py-0.5 rounded text-[10px] font-sans font-bold ${
+                                                                                                isCounted
+                                                                                                    ? 'bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300'
+                                                                                                    : 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300'
+                                                                                            }`}>
+                                                                                                {isCounted ? 'Counted' : 'Missing'}
                                                                                             </span>
                                                                                         )}
-                                                                                        <span className={`px-2 py-0.5 rounded text-[10px] font-sans font-bold ${
-                                                                                            isCounted
-                                                                                                ? 'bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300'
-                                                                                                : 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300'
-                                                                                        }`}>
-                                                                                            {isCounted ? 'Counted' : 'Missing'}
-                                                                                        </span>
                                                                                     </div>
                                                                                 </div>
                                                                             );
@@ -2723,8 +2886,8 @@ const StockTakePage = ({
                                                                                     </span>
                                                                                 )}
                                                                                 {group.returnedCount > 0 && (
-                                                                                    <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-200 dark:border-amber-800" title={`Returned from: ${group.returnedTeams.join(', ')}`}>
-                                                                                        ↩️ {group.returnedCount} Returned ({group.returnedTeams.join(', ')})
+                                                                                    <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-200 dark:border-amber-800" title={`Signed out to: ${group.returnedTeams.join(', ')}. Will return to stock on finalise.`}>
+                                                                                        ↩️ {group.returnedCount} Pending Return ({group.returnedTeams.join(', ')})
                                                                                     </span>
                                                                                 )}
                                                                             </div>
@@ -2808,14 +2971,15 @@ const StockTakePage = ({
                                                                                                         <span className="text-zinc-500 font-sans text-xs">
                                                                                                             Counted: <strong>{raw.counted_quantity || 0}</strong> / Expected: {raw.expected_quantity ?? 1}
                                                                                                         </span>
-                                                                                                        {raw.returnedFromTeam && (
-                                                                                                            <span className="px-2 py-0.5 rounded text-[11px] font-sans font-semibold bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-200 dark:border-amber-800">
-                                                                                                                ↩️ Returned (from {raw.returnedFromTeam})
+                                                                                                        {raw.returnedFromTeam ? (
+                                                                                                            <span className="px-2 py-0.5 rounded text-[11px] font-sans font-semibold bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-300 dark:border-amber-700">
+                                                                                                                ↩️ Signed Out to {raw.returnedFromTeam} — Will Return to System
+                                                                                                            </span>
+                                                                                                        ) : (
+                                                                                                            <span className={`px-2 py-0.5 rounded text-[11px] font-sans font-medium ${isCounted ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300' : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'}`}>
+                                                                                                                {isCounted ? 'Counted' : 'Missing'}
                                                                                                             </span>
                                                                                                         )}
-                                                                                                        <span className={`px-2 py-0.5 rounded text-[11px] font-sans font-medium ${isCounted ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300' : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'}`}>
-                                                                                                            {isCounted ? 'Counted' : 'Missing'}
-                                                                                                        </span>
                                                                                                     </div>
                                                                                                 </div>
                                                                                             );
@@ -3847,7 +4011,7 @@ const StockTakePage = ({
                                     </div>
                                     {rangeCountProcessingResult.inventoryStats.returnedCount > 0 && (
                                         <div className="bg-white dark:bg-zinc-800 p-2 rounded-lg border border-amber-200 dark:border-amber-800/60">
-                                            <span className="block text-[10px] uppercase font-bold text-amber-600 dark:text-amber-400">Returned (Team)</span>
+                                            <span className="block text-[10px] uppercase font-bold text-amber-600 dark:text-amber-400">Pending Return</span>
                                             <span className="font-mono font-bold text-amber-700 dark:text-amber-300">
                                                 ↩️ {rangeCountProcessingResult.inventoryStats.returnedCount} units
                                             </span>
@@ -3869,10 +4033,10 @@ const StockTakePage = ({
                             )}
 
                             {rangeCountProcessingResult.inventoryStats?.returnedCount > 0 && (
-                                <p className="text-[11px] text-amber-800 dark:text-amber-200 bg-amber-50 dark:bg-amber-950/40 p-2 rounded-md border border-amber-200 dark:border-amber-800/50">
-                                    ↩️ <strong>Returned Items Note:</strong> {rangeCountProcessingResult.inventoryStats.returnedCount} serial(s) in this range are currently signed out to{' '}
-                                    <strong>{rangeCountProcessingResult.inventoryStats.returnedTeams.join(', ')}</strong>. Counting them marks them as returned items and will automatically return them back to{' '}
-                                    <strong>{activeStockTake?.location || 'this storehouse'}</strong> stock when you finalise.
+                                <p className="text-[11px] text-amber-800 dark:text-amber-200 bg-amber-50 dark:bg-amber-950/40 p-2.5 rounded-md border border-amber-300 dark:border-amber-700/70">
+                                    ↩️ <strong>Signed Out Items Detected:</strong> {rangeCountProcessingResult.inventoryStats.returnedCount} serial(s) in this range are currently signed out to{' '}
+                                    <strong>{rangeCountProcessingResult.inventoryStats.returnedTeams.join(', ')}</strong>. Scanning them marks them as pending return so they will be returned back to{' '}
+                                    <strong>{activeStockTake?.location || 'this storehouse'}</strong> system stock when you finalise.
                                 </p>
                             )}
 
@@ -3903,15 +4067,21 @@ const StockTakePage = ({
                                                     <span className="font-medium text-zinc-800 dark:text-zinc-200">{s.serial}</span>
                                                 </div>
                                                 <span className={`text-[10px] font-sans px-1.5 py-0.5 rounded font-bold ${
-                                                    s.isAlreadyCounted
-                                                        ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300'
-                                                        : s.isReturned
+                                                    s.isReturned
+                                                        ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-300 dark:border-amber-700'
+                                                        : s.isAlreadyCounted
                                                             ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300'
                                                             : s.isNew
                                                                 ? 'bg-purple-100 text-purple-800 dark:bg-purple-900/40 dark:text-purple-300'
                                                                 : 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300'
                                                 }`}>
-                                                    {s.isAlreadyCounted ? 'Already Counted' : s.isReturned ? `↩️ Returned (${s.assignedTo})` : s.isNew ? '✨ New Serial' : '✓ In Stock'}
+                                                    {s.isReturned
+                                                        ? `↩️ Signed Out (${s.assignedTo}) — Will Return`
+                                                        : s.isAlreadyCounted
+                                                            ? 'Already Counted'
+                                                            : s.isNew
+                                                                ? '✨ New Serial'
+                                                                : '✓ In Stock'}
                                                 </span>
                                             </div>
                                         ))}
@@ -3942,7 +4112,7 @@ const StockTakePage = ({
                             {rangeCountSubmitting ? <Spinner className="w-4 h-4 mr-2" /> : null}
                             {rangeCountSubmitting 
                                 ? 'Counting...' 
-                                : `Count ${rangeCountProcessingResult.count || 0} Units ${selectedRangeProductMeta?.partNumber ? `(PN: ${selectedRangeProductMeta.partNumber})` : ''}`}
+                                : `Count ${rangeCountProcessingResult.count || 0} Units${rangeCountProcessingResult.inventoryStats?.returnedCount > 0 ? ` (${rangeCountProcessingResult.inventoryStats.returnedCount} Return to Stock)` : ''}${selectedRangeProductMeta?.partNumber ? ` (PN: ${selectedRangeProductMeta.partNumber})` : ''}`}
                         </button>
                     </div>
                 </form>
