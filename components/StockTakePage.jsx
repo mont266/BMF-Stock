@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { supabase } from '../lib/supabaseClient';
 import { Page, Spinner, EmptyState, formInputStyle } from './StockManagerApp';
 import Modal from './Modal';
-import { PlusCircleIcon, ClipboardCheckIcon, ArchiveIcon, ChartBarIcon, TrashIcon, BuildingStoreIcon, ChevronDownIcon, TagIcon, BarcodeIcon } from './Icons';
+import { PlusCircleIcon, ClipboardCheckIcon, ArchiveIcon, ChartBarIcon, TrashIcon, BuildingStoreIcon, ChevronDownIcon, TagIcon, BarcodeIcon, SearchIcon } from './Icons';
 import { trainingManager } from '../lib/trainingEnvironment';
 import { Team, Location } from '../types';
 
@@ -94,10 +94,12 @@ const StockTakePage = ({
     const [activeSearchTerm, setActiveSearchTerm] = useState('');
     const [activeCategoryFilter, setActiveCategoryFilter] = useState('All');
     const [expandedActiveTypes, setExpandedActiveTypes] = useState({});
+    const [activeMobileViewMode, setActiveMobileViewMode] = useState('cards'); // 'cards' | 'table'
 
     const [historySearchTerm, setHistorySearchTerm] = useState('');
     const [historyCategoryFilter, setHistoryCategoryFilter] = useState('All');
     const [expandedHistoryTypes, setExpandedHistoryTypes] = useState({});
+    const [historyMobileViewMode, setHistoryMobileViewMode] = useState('cards'); // 'cards' | 'table'
     
     const [isInitiateModalOpen, setIsInitiateModalOpen] = useState(false);
     const [stockTakeType, setStockTakeType] = useState('FULL');
@@ -267,22 +269,31 @@ const StockTakePage = ({
 
             const itemTypeName = rawName || matchedType?.name || item.name || 'Uncategorised Item';
             const meta = matchedType || itemTypesMap[itemTypeName] || {};
-            const category = meta.category || stockItemFallback?.category || 'General';
-            const price = parseFloat(item.stock_items?.purchase_price ?? stockItemFallback?.purchase_price ?? meta.price ?? 0) || 0;
+            const itemCategory = meta.category || item.category || item.stock_items?.category || 'General';
+            const spPart = Array.isArray(supplierPartNumbers)
+                ? supplierPartNumbers.find(sp => (meta.id && sp.item_type_id === meta.id) || sp.item_name === itemTypeName || sp.item_types?.name === itemTypeName)
+                : null;
+            const supplierPurchasePrice = parseFloat(spPart?.purchase_price) || 0;
+            const price = supplierPurchasePrice > 0 
+                ? supplierPurchasePrice 
+                : (parseFloat(item.stock_items?.purchase_price ?? stockItemFallback?.purchase_price ?? 0) || 0);
             const defaultBarcode = item.stock_items?.barcode || stockItemFallback?.barcode || meta.barcode || '';
+            const isItemUnique = !!(meta.is_unique || item.stock_items?.is_unique || stockItemFallback?.is_unique || item.is_unique);
 
             if (!groups[itemTypeName]) {
                 groups[itemTypeName] = {
                     key: itemTypeName,
                     name: itemTypeName,
-                    category: category,
+                    category: itemCategory,
                     price: price,
-                    is_unique: !!meta.is_unique,
+                    is_unique: isItemUnique,
                     expected_quantity: 0,
                     counted_quantity: 0,
                     rawItems: [],
                     status: 'PENDING'
                 };
+            } else if (isItemUnique) {
+                groups[itemTypeName].is_unique = true;
             }
             // If the physical item was created during/after the stock take started, it was not in the system at the start
             const takeCreatedAt = activeStockTake?.created_at ? new Date(activeStockTake.created_at).getTime() : 0;
@@ -415,7 +426,11 @@ const StockTakePage = ({
                         id: item.item_id,
                         name: rawName || meta.name || 'Uncategorised Item',
                         barcode: stockItemFallback?.barcode || meta.barcode || '',
-                        purchase_price: stockItemFallback?.purchase_price ?? meta.price ?? 0,
+                        purchase_price: (() => {
+                            const sp = Array.isArray(supplierPartNumbers) ? supplierPartNumbers.find(p => (meta.id && p.item_type_id === meta.id) || p.item_name === rawName || p.item_types?.name === rawName) : null;
+                            const spPrice = parseFloat(sp?.purchase_price) || 0;
+                            return spPrice > 0 ? spPrice : (parseFloat(stockItemFallback?.purchase_price) || 0);
+                        })(),
                         location: stockItemFallback?.location || st.location || 'Flamstead',
                         assigned_to: stockItemFallback?.assigned_to || 'Unassigned'
                     }
@@ -442,7 +457,7 @@ const StockTakePage = ({
     }, [historyGroupedItems]);
 
     const filteredHistoryGroups = useMemo(() => {
-        return historyGroupedItems.filter(g => {
+        const filtered = historyGroupedItems.filter(g => {
             const matchesCat = historyCategoryFilter === 'All' || g.category === historyCategoryFilter;
             if (!matchesCat) return false;
             if (!historySearchTerm.trim()) return true;
@@ -451,6 +466,15 @@ const StockTakePage = ({
             const matchesCatText = (g.category || '').toLowerCase().includes(term);
             const matchesBarcode = g.rawItems.some(i => (i.stock_items?.barcode || '').toLowerCase().includes(term));
             return matchesName || matchesCatText || matchesBarcode;
+        });
+        return filtered.sort((a, b) => {
+            const vA = Math.abs(a.value_variance);
+            const vB = Math.abs(b.value_variance);
+            if (vB !== vA) return vB - vA;
+            const uA = Math.abs(a.variance);
+            const uB = Math.abs(b.variance);
+            if (uB !== uA) return uB - uA;
+            return a.name.localeCompare(b.name);
         });
     }, [historyGroupedItems, historyCategoryFilter, historySearchTerm]);
 
@@ -685,8 +709,9 @@ const StockTakePage = ({
                     // Scanned more than on record: ADD diff items to stock_items
                     const meta = itemTypesMap[group.name] || (Array.isArray(itemTypes) ? itemTypes.find(it => it.name === group.name) : null) || {};
                     const template = currentDbItems?.[0] || group.rawItems?.find(r => r.stock_items)?.stock_items || {};
-                    const baseBarcode = meta.barcode || template.barcode || (group.uniqueBarcodes?.length === 1 ? group.uniqueBarcodes[0] : (group.barcodeDisplay !== '—' && !group.barcodeDisplay?.includes('serials') ? group.barcodeDisplay : ''));
-                    const purchasePrice = parseFloat(meta.price ?? template.purchase_price ?? group.price ?? 0) || 0;
+                    const spPart = Array.isArray(supplierPartNumbers) ? supplierPartNumbers.find(p => (meta.id && p.item_type_id === meta.id) || p.item_name === group.name || p.item_types?.name === group.name) : null;
+                    const spPrice = parseFloat(spPart?.purchase_price) || 0;
+                    const purchasePrice = spPrice > 0 ? spPrice : (parseFloat(template.purchase_price ?? group.price ?? 0) || 0);
                     const desc = meta.description || template.description || null;
 
                     const newItems = [];
@@ -1020,7 +1045,8 @@ const StockTakePage = ({
             }
 
             const meta = itemTypesMap[matchedItemName] || (Array.isArray(itemTypes) ? itemTypes.find(it => it.name === matchedItemName) : null) || {};
-            const itemPrice = parseFloat(meta.price ?? 0) || 0;
+            const spPart = Array.isArray(supplierPartNumbers) ? supplierPartNumbers.find(p => (meta.id && p.item_type_id === meta.id) || p.item_name === matchedItemName || p.item_types?.name === matchedItemName) : null;
+            const itemPrice = parseFloat(spPart?.purchase_price ?? 0) || 0;
 
             // 3. Find or inject stock_take_items for this item at target storehouse
             const currentStockTakeItems = stockTakeItemsRef.current;
@@ -1105,7 +1131,8 @@ const StockTakePage = ({
                 takeItemToUpdate = takeItemsForProduct[0];
             }
 
-            if (scanModeRef.current === 'QUANTITY') {
+            const isScannedItemUnique = !!(meta.is_unique || takeItemToUpdate?.stock_items?.is_unique);
+            if (scanModeRef.current === 'QUANTITY' && !isScannedItemUnique) {
                 setQuantityItem(takeItemToUpdate);
                 setQuantityInput('1');
                 setIsQuantityModalOpen(true);
@@ -1358,7 +1385,8 @@ const StockTakePage = ({
             }
 
             const meta = itemTypesMap[targetTypeName] || (Array.isArray(itemTypes) ? itemTypes.find(it => it.name === targetTypeName) : null) || {};
-            const itemPrice = parseFloat(meta.price ?? 0) || 0;
+            const spPart = Array.isArray(supplierPartNumbers) ? supplierPartNumbers.find(p => (meta.id && p.item_type_id === meta.id) || p.item_name === targetTypeName || p.item_types?.name === targetTypeName) : null;
+            const itemPrice = parseFloat(spPart?.purchase_price ?? 0) || 0;
 
             // Look up existing stock items in database matching these serials
             const { data: dbMatchedStock, error: dbStockError } = await supabase
@@ -1702,44 +1730,91 @@ const StockTakePage = ({
                                     </div>
                                 </div>
 
-                                {/* Live Count Breakdown Table */}
+                                {/* Live Count Breakdown Section */}
                                 <div className="mt-8">
                                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
                                         <div>
-                                            <h3 className="text-lg font-bold text-zinc-900 dark:text-zinc-100">Live Count Breakdown</h3>
-                                            <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                                                Grouped by product type &bull; Click any item to view recorded scans
+                                            <div className="flex items-center gap-2">
+                                                <h3 className="text-lg font-bold text-zinc-900 dark:text-zinc-100">Live Count Breakdown</h3>
+                                                {filteredActiveGroups.length > 0 && (
+                                                    <span className="text-xs font-mono font-bold px-2 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/40 text-blue-800 dark:text-blue-300">
+                                                        {filteredActiveGroups.length} {filteredActiveGroups.length === 1 ? 'item' : 'items'}
+                                                    </span>
+                                                )}
+                                            </div>
+                                            <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">
+                                                Grouped by product type &bull; Tap any item to inspect recorded scans
                                             </p>
                                         </div>
+
                                         {activeGroupedItems.length > 0 && (
-                                            <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
-                                                {activeAvailableCategories.length > 2 && (
-                                                    <select
-                                                        value={activeCategoryFilter}
-                                                        onChange={(e) => setActiveCategoryFilter(e.target.value)}
-                                                        className={formInputStyle + " text-xs py-1.5 w-auto"}
+                                            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                                                {/* Mobile View Toggle: Cards vs Table */}
+                                                <div className="flex items-center bg-zinc-100 dark:bg-zinc-800 p-0.5 rounded-lg border border-zinc-200 dark:border-zinc-700 sm:hidden self-start">
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setActiveMobileViewMode('cards')}
+                                                        className={`px-2.5 py-1 text-xs font-bold rounded-md transition-all ${
+                                                            activeMobileViewMode === 'cards'
+                                                                ? 'bg-white dark:bg-zinc-700 text-blue-600 dark:text-blue-400 shadow-xs'
+                                                                : 'text-zinc-500 dark:text-zinc-400 hover:text-zinc-800'
+                                                        }`}
                                                     >
-                                                        {activeAvailableCategories.map(cat => (
-                                                            <option key={cat} value={cat}>{cat === 'All' ? 'All Categories' : cat}</option>
-                                                        ))}
-                                                    </select>
-                                                )}
-                                                <div className="w-full sm:w-56">
-                                                    <input 
-                                                        type="text" 
-                                                        placeholder="Search items or barcodes..." 
-                                                        value={activeSearchTerm}
-                                                        onChange={(e) => setActiveSearchTerm(e.target.value)}
-                                                        className={formInputStyle + " text-xs py-1.5"}
-                                                    />
+                                                        🗂️ Cards
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setActiveMobileViewMode('table')}
+                                                        className={`px-2.5 py-1 text-xs font-bold rounded-md transition-all ${
+                                                            activeMobileViewMode === 'table'
+                                                                ? 'bg-white dark:bg-zinc-700 text-blue-600 dark:text-blue-400 shadow-xs'
+                                                                : 'text-zinc-500 dark:text-zinc-400 hover:text-zinc-800'
+                                                        }`}
+                                                    >
+                                                        📊 Table
+                                                    </button>
                                                 </div>
-                                                <button
-                                                    type="button"
-                                                    onClick={toggleAllActiveGroups}
-                                                    className="text-xs font-semibold px-2.5 py-1.5 bg-zinc-100 dark:bg-zinc-700 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-600 rounded transition-colors whitespace-nowrap"
-                                                >
-                                                    {filteredActiveGroups.length > 0 && filteredActiveGroups.every(g => expandedActiveTypes[g.name]) ? 'Collapse All' : 'Expand All'}
-                                                </button>
+
+                                                <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
+                                                    {activeAvailableCategories.length > 2 && (
+                                                        <select
+                                                            value={activeCategoryFilter}
+                                                            onChange={(e) => setActiveCategoryFilter(e.target.value)}
+                                                            className={formInputStyle + " text-xs py-1.5 w-full sm:w-auto"}
+                                                        >
+                                                            {activeAvailableCategories.map(cat => (
+                                                                <option key={cat} value={cat}>{cat === 'All' ? 'All Categories' : cat}</option>
+                                                            ))}
+                                                        </select>
+                                                    )}
+                                                    <div className="relative w-full sm:w-56">
+                                                        <SearchIcon className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-400 pointer-events-none" />
+                                                        <input 
+                                                            type="text" 
+                                                            placeholder="Search items or barcodes..." 
+                                                            value={activeSearchTerm}
+                                                            onChange={(e) => setActiveSearchTerm(e.target.value)}
+                                                            className={formInputStyle + " text-xs py-1.5 pl-8 pr-7"}
+                                                        />
+                                                        {activeSearchTerm && (
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => setActiveSearchTerm('')}
+                                                                className="absolute right-2 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 text-xs p-0.5"
+                                                                title="Clear search"
+                                                            >
+                                                                &times;
+                                                            </button>
+                                                        )}
+                                                    </div>
+                                                    <button
+                                                        type="button"
+                                                        onClick={toggleAllActiveGroups}
+                                                        className="text-xs font-semibold px-2.5 py-1.5 bg-zinc-100 dark:bg-zinc-700 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-600 rounded-lg transition-colors whitespace-nowrap self-start sm:self-auto"
+                                                    >
+                                                        {filteredActiveGroups.length > 0 && filteredActiveGroups.every(g => expandedActiveTypes[g.name]) ? 'Collapse All' : 'Expand All'}
+                                                    </button>
+                                                </div>
                                             </div>
                                         )}
                                     </div>
@@ -1750,147 +1825,349 @@ const StockTakePage = ({
                                             <p className="text-sm text-zinc-600 dark:text-zinc-300 font-medium">No items counted yet.</p>
                                             <p className="text-xs text-zinc-400 mt-1">Scan any item's barcode to add and count it in this {activeStockTake.type.toLowerCase()} stock take.</p>
                                         </div>
+                                    ) : filteredActiveGroups.length === 0 ? (
+                                        <div className="text-center py-8 bg-zinc-50 dark:bg-zinc-800/40 rounded-xl border border-dashed border-zinc-300 dark:border-zinc-700 p-4">
+                                            <SearchIcon className="w-8 h-8 text-zinc-400 mx-auto mb-2" />
+                                            <p className="text-sm font-semibold text-zinc-700 dark:text-zinc-200">No matching items found</p>
+                                            <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">Try adjusting your search query or category filter.</p>
+                                            <button
+                                                type="button"
+                                                onClick={() => { setActiveSearchTerm(''); setActiveCategoryFilter('All'); }}
+                                                className="mt-3 px-3 py-1.5 text-xs font-semibold bg-zinc-200 dark:bg-zinc-700 hover:bg-zinc-300 dark:hover:bg-zinc-600 rounded-lg transition-colors"
+                                            >
+                                                Reset Filters
+                                            </button>
+                                        </div>
                                     ) : (
-                                        <div className="overflow-x-auto border border-zinc-200 dark:border-zinc-700 rounded-lg">
-                                            <table className="min-w-full divide-y divide-zinc-200 dark:divide-zinc-700">
-                                                <thead className="bg-zinc-50 dark:bg-zinc-900/50">
-                                                    <tr>
-                                                        <th className="w-8 px-3 py-3"></th>
-                                                        <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Item Type</th>
-                                                        <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Barcode / Serials</th>
-                                                        <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Price</th>
-                                                        <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Expected</th>
-                                                        <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Counted</th>
-                                                        <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Variance</th>
-                                                        <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Value Var</th>
-                                                        <th className="px-4 py-3 text-right text-xs font-medium text-zinc-500 uppercase tracking-wider">Action</th>
-                                                    </tr>
-                                                </thead>
-                                                <tbody className="bg-white dark:bg-zinc-800 divide-y divide-zinc-200 dark:divide-zinc-700">
-                                                    {filteredActiveGroups.map(group => {
-                                                        const hasDiscrepancy = group.variance !== 0;
-                                                        const isExpanded = !!expandedActiveTypes[group.name];
+                                        <>
+                                            {/* MOBILE VIEW: Item Blocks / Cards */}
+                                            <div className={`${activeMobileViewMode === 'cards' ? 'block' : 'hidden'} sm:hidden space-y-3`}>
+                                                {filteredActiveGroups.map(group => {
+                                                    const hasDiscrepancy = group.variance !== 0;
+                                                    const isExpanded = !!expandedActiveTypes[group.name];
 
-                                                        return (
-                                                            <React.Fragment key={group.key}>
-                                                                <tr 
-                                                                    onClick={() => toggleActiveGroup(group.name)}
-                                                                    className={`cursor-pointer transition-colors hover:bg-zinc-50 dark:hover:bg-zinc-700/40 ${hasDiscrepancy ? 'bg-amber-50/30 dark:bg-amber-900/10' : ''}`}
-                                                                >
-                                                                    <td className="px-3 py-3 text-center text-zinc-400">
-                                                                        <ChevronDownIcon className={`w-4 h-4 transition-transform duration-200 ${isExpanded ? 'transform rotate-180' : '-rotate-90'}`} />
-                                                                    </td>
-                                                                    <td className="px-4 py-3 whitespace-nowrap text-sm font-medium text-zinc-900 dark:text-zinc-100">
-                                                                        <div className="flex items-center gap-2">
-                                                                            <span>{group.name}</span>
+                                                    return (
+                                                        <div 
+                                                            key={group.key}
+                                                            className={`rounded-xl border transition-all shadow-xs overflow-hidden ${
+                                                                hasDiscrepancy
+                                                                    ? group.variance > 0
+                                                                        ? 'border-emerald-200 dark:border-emerald-800/70 bg-emerald-50/20 dark:bg-emerald-950/15'
+                                                                        : 'border-amber-200 dark:border-amber-800/70 bg-amber-50/25 dark:bg-amber-950/20'
+                                                                    : 'border-zinc-200 dark:border-zinc-700/80 bg-white dark:bg-zinc-800/95'
+                                                            }`}
+                                                        >
+                                                            {/* Card Header & Main Info */}
+                                                            <div className="p-3.5 pb-3">
+                                                                <div className="flex items-start justify-between gap-2">
+                                                                    <div className="min-w-0 flex-1">
+                                                                        <div className="flex items-center gap-1.5 flex-wrap">
+                                                                            <h4 className="font-bold text-sm text-zinc-900 dark:text-zinc-100 leading-snug">
+                                                                                {group.name}
+                                                                            </h4>
                                                                             {group.category && group.category !== 'General' && (
-                                                                                <span className="text-[11px] font-normal px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-700 text-zinc-600 dark:text-zinc-300">
+                                                                                <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-700 text-zinc-600 dark:text-zinc-300">
                                                                                     {group.category}
                                                                                 </span>
                                                                             )}
                                                                             {group.is_unique && (
                                                                                 <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-purple-50 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300 border border-purple-200 dark:border-purple-800">
-                                                                                    Unique
+                                                                                    ⚡ Unique
                                                                                 </span>
                                                                             )}
                                                                         </div>
-                                                                    </td>
-                                                                    <td className="px-4 py-3 whitespace-nowrap text-sm font-mono text-zinc-500">
-                                                                        {group.barcodeDisplay}
-                                                                    </td>
-                                                                    <td className="px-4 py-3 whitespace-nowrap text-sm text-zinc-500">£{group.price.toFixed(2)}</td>
-                                                                    <td className="px-4 py-3 whitespace-nowrap text-sm font-semibold text-zinc-600 dark:text-zinc-400">{group.expected_quantity}</td>
-                                                                    <td className="px-4 py-3 whitespace-nowrap text-sm font-bold text-blue-600 dark:text-blue-400">{group.counted_quantity}</td>
-                                                                    <td className={`px-4 py-3 whitespace-nowrap text-sm font-bold ${hasDiscrepancy ? (group.variance > 0 ? 'text-green-600' : 'text-red-600') : 'text-zinc-500'}`}>
-                                                                        {group.variance > 0 ? `+${group.variance}` : group.variance}
-                                                                    </td>
-                                                                    <td className={`px-4 py-3 whitespace-nowrap text-sm font-bold ${hasDiscrepancy ? (group.value_variance > 0 ? 'text-green-600' : 'text-red-600') : 'text-zinc-500'}`}>
-                                                                        {group.value_variance > 0 ? '+' : ''}{group.value_variance < 0 ? '-' : ''}£{Math.abs(group.value_variance).toFixed(2)}
-                                                                    </td>
-                                                                    <td className="px-4 py-3 whitespace-nowrap text-sm text-right" onClick={(e) => e.stopPropagation()}>
-                                                                        <div className="flex items-center justify-end gap-1.5">
-                                                                            {(group.is_unique || (group.category && group.category.toLowerCase().includes('meter')) || group.name.toLowerCase().includes('meter')) && (
-                                                                                <button
-                                                                                    type="button"
-                                                                                    onClick={() => {
-                                                                                        setRangeCountError('');
-                                                                                        const firstSerial = group.rawItems?.find(r => r.stock_items?.barcode)?.stock_items?.barcode || '';
-                                                                                        setRangeCountDetails({
-                                                                                            firstSerial: firstSerial,
-                                                                                            lastSerial: firstSerial,
-                                                                                            selectedItemType: group.name
-                                                                                        });
-                                                                                        setIsRangeCountModalOpen(true);
-                                                                                    }}
-                                                                                    className="text-xs font-semibold px-2.5 py-1 bg-purple-50 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 rounded hover:bg-purple-100 dark:hover:bg-purple-800 transition-colors flex items-center gap-1"
-                                                                                    title="Count a range of serial numbers for this product"
-                                                                                >
-                                                                                    <BarcodeIcon className="w-3 h-3" />
-                                                                                    <span>Range</span>
-                                                                                </button>
-                                                                            )}
+                                                                        <div className="flex items-center gap-2 mt-1 text-xs text-zinc-500 dark:text-zinc-400 font-mono">
+                                                                            <span className="truncate">{group.barcodeDisplay}</span>
+                                                                            <span>&bull;</span>
+                                                                            <span className="shrink-0">£{group.price.toFixed(2)} / ea</span>
+                                                                        </div>
+                                                                    </div>
+
+                                                                    {/* Variance Pill Badge */}
+                                                                    <div className="shrink-0 text-right">
+                                                                        {hasDiscrepancy ? (
+                                                                            <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-bold border ${
+                                                                                group.variance > 0
+                                                                                    ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/60 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800'
+                                                                                    : 'bg-amber-100 text-amber-800 dark:bg-amber-900/60 dark:text-amber-300 border-amber-200 dark:border-amber-800'
+                                                                            }`}>
+                                                                                {group.variance > 0 ? `+${group.variance}` : group.variance} var
+                                                                            </span>
+                                                                        ) : (
+                                                                            <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-zinc-100 text-zinc-600 dark:bg-zinc-700 dark:text-zinc-300">
+                                                                                ✓ Balanced
+                                                                            </span>
+                                                                        )}
+                                                                        {hasDiscrepancy && (
+                                                                            <span className={`block text-[10px] font-bold mt-0.5 ${group.value_variance > 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600 dark:text-amber-400'}`}>
+                                                                                {group.value_variance > 0 ? '+' : ''}{group.value_variance < 0 ? '-' : ''}£{Math.abs(group.value_variance).toFixed(2)}
+                                                                            </span>
+                                                                        )}
+                                                                    </div>
+                                                                </div>
+
+                                                                {/* 3-Box Metrics Grid */}
+                                                                <div className="grid grid-cols-3 gap-2 mt-3 pt-2.5 border-t border-zinc-100 dark:border-zinc-700/60">
+                                                                    <div className="bg-zinc-50 dark:bg-zinc-900/60 p-2 rounded-lg text-center border border-zinc-150 dark:border-zinc-700/50">
+                                                                        <span className="block text-[10px] uppercase font-bold text-zinc-400 tracking-wider">Expected</span>
+                                                                        <span className="text-sm font-mono font-bold text-zinc-700 dark:text-zinc-300">{group.expected_quantity}</span>
+                                                                    </div>
+                                                                    <div className="bg-blue-50/70 dark:bg-blue-950/40 p-2 rounded-lg text-center border border-blue-100 dark:border-blue-900/50">
+                                                                        <span className="block text-[10px] uppercase font-bold text-blue-500 tracking-wider">Counted</span>
+                                                                        <span className="text-sm font-mono font-bold text-blue-700 dark:text-blue-300">{group.counted_quantity}</span>
+                                                                    </div>
+                                                                    <div className={`p-2 rounded-lg text-center border ${
+                                                                        hasDiscrepancy
+                                                                            ? group.variance > 0
+                                                                                ? 'bg-emerald-50/70 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-900/50'
+                                                                                : 'bg-amber-50/70 dark:bg-amber-950/40 border-amber-200 dark:border-amber-900/50'
+                                                                            : 'bg-zinc-50 dark:bg-zinc-900/60 border-zinc-150 dark:border-zinc-700/50'
+                                                                    }`}>
+                                                                        <span className={`block text-[10px] uppercase font-bold tracking-wider ${
+                                                                            hasDiscrepancy
+                                                                                ? group.variance > 0 ? 'text-emerald-600' : 'text-amber-600'
+                                                                                : 'text-zinc-400'
+                                                                        }`}>Variance</span>
+                                                                        <span className={`text-sm font-mono font-bold ${
+                                                                            hasDiscrepancy
+                                                                                ? group.variance > 0 ? 'text-emerald-700 dark:text-emerald-300' : 'text-amber-700 dark:text-amber-300'
+                                                                                : 'text-zinc-600 dark:text-zinc-400'
+                                                                        }`}>
+                                                                            {group.variance > 0 ? `+${group.variance}` : group.variance}
+                                                                        </span>
+                                                                    </div>
+                                                                </div>
+
+                                                                {/* Quick Action Buttons Row */}
+                                                                <div className="flex items-center justify-between gap-2 mt-3 pt-2.5 border-t border-zinc-100 dark:border-zinc-700/60">
+                                                                    <button
+                                                                        type="button"
+                                                                        onClick={() => toggleActiveGroup(group.name)}
+                                                                        className="text-xs font-semibold text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200 flex items-center gap-1.5 py-1 px-1.5 rounded transition-colors touch-manipulation"
+                                                                    >
+                                                                        <ChevronDownIcon className={`w-3.5 h-3.5 transition-transform duration-200 ${isExpanded ? 'rotate-180' : '-rotate-90'}`} />
+                                                                        <span>{group.rawItems.length} Scans / Serials</span>
+                                                                    </button>
+
+                                                                    <div className="flex items-center gap-1.5">
+                                                                        {(group.is_unique || (group.category && group.category.toLowerCase().includes('meter')) || group.name.toLowerCase().includes('meter')) && (
                                                                             <button
                                                                                 type="button"
-                                                                                onClick={() => {
+                                                                                onClick={(e) => {
+                                                                                    e.stopPropagation();
+                                                                                    setRangeCountError('');
+                                                                                    const firstSerial = group.rawItems?.find(r => r.stock_items?.barcode)?.stock_items?.barcode || '';
+                                                                                    setRangeCountDetails({
+                                                                                        firstSerial: firstSerial,
+                                                                                        lastSerial: firstSerial,
+                                                                                        selectedItemType: group.name
+                                                                                    });
+                                                                                    setIsRangeCountModalOpen(true);
+                                                                                }}
+                                                                                className="text-xs font-semibold px-2.5 py-1.5 bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300 rounded-lg hover:bg-purple-200 dark:hover:bg-purple-800 transition-colors flex items-center gap-1 touch-manipulation"
+                                                                                title="Count a range of serial numbers"
+                                                                            >
+                                                                                <BarcodeIcon className="w-3.5 h-3.5" />
+                                                                                <span>Range</span>
+                                                                            </button>
+                                                                        )}
+                                                                        {!group.is_unique && (
+                                                                            <button
+                                                                                type="button"
+                                                                                onClick={(e) => {
+                                                                                    e.stopPropagation();
                                                                                     setQuantityItem(group.rawItems[0]);
                                                                                     setQuantityInput('1');
                                                                                     setIsQuantityModalOpen(true);
                                                                                 }}
-                                                                                className="text-xs font-semibold px-2.5 py-1 bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 rounded hover:bg-blue-100 dark:hover:bg-blue-800 transition-colors"
+                                                                                className="text-xs font-bold px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors shadow-xs flex items-center gap-1 touch-manipulation"
                                                                             >
-                                                                                + Add Qty
+                                                                                <PlusCircleIcon className="w-3.5 h-3.5" />
+                                                                                <span>Add Qty</span>
                                                                             </button>
-                                                                        </div>
-                                                                    </td>
-                                                                </tr>
-                                                                {isExpanded && (
-                                                                    <tr className="bg-zinc-50/70 dark:bg-zinc-900/40">
-                                                                        <td colSpan="9" className="px-6 py-3">
-                                                                            <div className="border border-zinc-200 dark:border-zinc-700 rounded-lg overflow-hidden bg-white dark:bg-zinc-800/80 shadow-xs">
-                                                                                <div className="px-3.5 py-2 bg-zinc-100/80 dark:bg-zinc-700/60 text-xs font-semibold text-zinc-600 dark:text-zinc-300 border-b border-zinc-200 dark:border-zinc-700 flex justify-between items-center">
-                                                                                    <span>Recorded Scans / Serial Numbers ({group.rawItems.length})</span>
-                                                                                    <span>Expected vs Counted</span>
+                                                                        )}
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+
+                                                            {/* Expanded Recorded Scans List */}
+                                                            {isExpanded && (
+                                                                <div className="border-t border-zinc-200 dark:border-zinc-700 bg-zinc-50/80 dark:bg-zinc-900/50 p-3">
+                                                                    <div className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider mb-2 flex justify-between">
+                                                                        <span>Recorded Scans / Serials</span>
+                                                                        <span>Status</span>
+                                                                    </div>
+                                                                    <div className="max-h-56 overflow-y-auto space-y-1.5 pr-1 divide-y divide-zinc-200/50 dark:divide-zinc-700/50">
+                                                                        {group.rawItems.map((raw, idx) => {
+                                                                            const isCounted = (raw.counted_quantity || 0) > 0;
+                                                                            return (
+                                                                                <div key={raw.id || idx} className="pt-1.5 first:pt-0 flex items-center justify-between text-xs font-mono">
+                                                                                    <div className="flex items-center gap-2 min-w-0">
+                                                                                        <span className="text-zinc-400 font-sans text-[10px]">#{idx + 1}</span>
+                                                                                        <span className="text-zinc-800 dark:text-zinc-200 font-medium truncate">
+                                                                                            {raw.stock_items?.barcode || 'No Barcode'}
+                                                                                        </span>
+                                                                                    </div>
+                                                                                    <div className="flex items-center gap-2 shrink-0">
+                                                                                        <span className="text-zinc-500 font-sans text-[11px]">
+                                                                                            {raw.counted_quantity || 0} / {raw.expected_quantity ?? 1}
+                                                                                        </span>
+                                                                                        <span className={`px-2 py-0.5 rounded text-[10px] font-sans font-bold ${
+                                                                                            isCounted
+                                                                                                ? 'bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300'
+                                                                                                : 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300'
+                                                                                        }`}>
+                                                                                            {isCounted ? 'Counted' : 'Missing'}
+                                                                                        </span>
+                                                                                    </div>
                                                                                 </div>
-                                                                                <div className="max-h-56 overflow-y-auto divide-y divide-zinc-100 dark:divide-zinc-700 text-xs">
-                                                                                    {group.rawItems.map((raw, idx) => {
-                                                                                        const isCounted = (raw.counted_quantity || 0) > 0;
-                                                                                        return (
-                                                                                            <div key={raw.id || idx} className="px-3.5 py-2 flex items-center justify-between font-mono">
-                                                                                                <div className="flex items-center gap-2">
-                                                                                                    <span className="text-zinc-400 text-[11px] font-sans">#{idx + 1}</span>
-                                                                                                    <span className="text-zinc-800 dark:text-zinc-200 font-medium">
-                                                                                                        {raw.stock_items?.barcode || 'No Barcode'}
-                                                                                                    </span>
-                                                                                                </div>
-                                                                                                <div className="flex items-center gap-3">
-                                                                                                    <span className="text-zinc-500 font-sans text-xs">
-                                                                                                        Counted: <strong>{raw.counted_quantity || 0}</strong> / Expected: {raw.expected_quantity ?? 1}
-                                                                                                    </span>
-                                                                                                    <span className={`px-2 py-0.5 rounded text-[11px] font-sans font-medium ${isCounted ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300' : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'}`}>
-                                                                                                        {isCounted ? 'Counted' : 'Missing'}
-                                                                                                    </span>
-                                                                                                </div>
-                                                                                            </div>
-                                                                                        );
-                                                                                    })}
-                                                                                </div>
+                                                                            );
+                                                                        })}
+                                                                    </div>
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    );
+                                                })}
+                                            </div>
+
+                                            {/* DESKTOP TABLE VIEW (or Mobile Table if toggled) */}
+                                            <div className={`${activeMobileViewMode === 'table' ? 'block' : 'hidden'} sm:block overflow-x-auto border border-zinc-200 dark:border-zinc-700 rounded-lg`}>
+                                                <table className="min-w-full divide-y divide-zinc-200 dark:divide-zinc-700">
+                                                    <thead className="bg-zinc-50 dark:bg-zinc-900/50">
+                                                        <tr>
+                                                            <th className="w-8 px-3 py-3"></th>
+                                                            <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Item Type</th>
+                                                            <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Barcode / Serials</th>
+                                                            <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Price</th>
+                                                            <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Expected</th>
+                                                            <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Counted</th>
+                                                            <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Variance</th>
+                                                            <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Value Var</th>
+                                                            <th className="px-4 py-3 text-right text-xs font-medium text-zinc-500 uppercase tracking-wider">Action</th>
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody className="bg-white dark:bg-zinc-800 divide-y divide-zinc-200 dark:divide-zinc-700">
+                                                        {filteredActiveGroups.map(group => {
+                                                            const hasDiscrepancy = group.variance !== 0;
+                                                            const isExpanded = !!expandedActiveTypes[group.name];
+
+                                                            return (
+                                                                <React.Fragment key={group.key}>
+                                                                    <tr 
+                                                                        onClick={() => toggleActiveGroup(group.name)}
+                                                                        className={`cursor-pointer transition-colors hover:bg-zinc-50 dark:hover:bg-zinc-700/40 ${hasDiscrepancy ? 'bg-amber-50/30 dark:bg-amber-900/10' : ''}`}
+                                                                    >
+                                                                        <td className="px-3 py-3 text-center text-zinc-400">
+                                                                            <ChevronDownIcon className={`w-4 h-4 transition-transform duration-200 ${isExpanded ? 'transform rotate-180' : '-rotate-90'}`} />
+                                                                        </td>
+                                                                        <td className="px-4 py-3 whitespace-nowrap text-sm font-medium text-zinc-900 dark:text-zinc-100">
+                                                                            <div className="flex items-center gap-2">
+                                                                                <span>{group.name}</span>
+                                                                                {group.category && group.category !== 'General' && (
+                                                                                    <span className="text-[11px] font-normal px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-700 text-zinc-600 dark:text-zinc-300">
+                                                                                        {group.category}
+                                                                                    </span>
+                                                                                )}
+                                                                                {group.is_unique && (
+                                                                                    <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-purple-50 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300 border border-purple-200 dark:border-purple-800">
+                                                                                        Unique
+                                                                                    </span>
+                                                                                )}
+                                                                            </div>
+                                                                        </td>
+                                                                        <td className="px-4 py-3 whitespace-nowrap text-sm font-mono text-zinc-500">
+                                                                            {group.barcodeDisplay}
+                                                                        </td>
+                                                                        <td className="px-4 py-3 whitespace-nowrap text-sm text-zinc-500">£{group.price.toFixed(2)}</td>
+                                                                        <td className="px-4 py-3 whitespace-nowrap text-sm font-semibold text-zinc-600 dark:text-zinc-400">{group.expected_quantity}</td>
+                                                                        <td className="px-4 py-3 whitespace-nowrap text-sm font-bold text-blue-600 dark:text-blue-400">{group.counted_quantity}</td>
+                                                                        <td className={`px-4 py-3 whitespace-nowrap text-sm font-bold ${hasDiscrepancy ? (group.variance > 0 ? 'text-green-600' : 'text-red-600') : 'text-zinc-500'}`}>
+                                                                            {group.variance > 0 ? `+${group.variance}` : group.variance}
+                                                                        </td>
+                                                                        <td className={`px-4 py-3 whitespace-nowrap text-sm font-bold ${hasDiscrepancy ? (group.value_variance > 0 ? 'text-green-600' : 'text-red-600') : 'text-zinc-500'}`}>
+                                                                            {group.value_variance > 0 ? '+' : ''}{group.value_variance < 0 ? '-' : ''}£{Math.abs(group.value_variance).toFixed(2)}
+                                                                        </td>
+                                                                        <td className="px-4 py-3 whitespace-nowrap text-sm text-right" onClick={(e) => e.stopPropagation()}>
+                                                                            <div className="flex items-center justify-end gap-1.5">
+                                                                                {(group.is_unique || (group.category && group.category.toLowerCase().includes('meter')) || group.name.toLowerCase().includes('meter')) && (
+                                                                                    <button
+                                                                                        type="button"
+                                                                                        onClick={() => {
+                                                                                            setRangeCountError('');
+                                                                                            const firstSerial = group.rawItems?.find(r => r.stock_items?.barcode)?.stock_items?.barcode || '';
+                                                                                            setRangeCountDetails({
+                                                                                                firstSerial: firstSerial,
+                                                                                                lastSerial: firstSerial,
+                                                                                                selectedItemType: group.name
+                                                                                            });
+                                                                                            setIsRangeCountModalOpen(true);
+                                                                                        }}
+                                                                                        className="text-xs font-semibold px-2.5 py-1 bg-purple-50 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 rounded hover:bg-purple-100 dark:hover:bg-purple-800 transition-colors flex items-center gap-1"
+                                                                                        title="Count a range of serial numbers for this product"
+                                                                                    >
+                                                                                        <BarcodeIcon className="w-3 h-3" />
+                                                                                        <span>Range</span>
+                                                                                    </button>
+                                                                                )}
+                                                                                {!group.is_unique && (
+                                                                                    <button
+                                                                                        type="button"
+                                                                                        onClick={() => {
+                                                                                            setQuantityItem(group.rawItems[0]);
+                                                                                            setQuantityInput('1');
+                                                                                            setIsQuantityModalOpen(true);
+                                                                                        }}
+                                                                                        className="text-xs font-semibold px-2.5 py-1 bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 rounded hover:bg-blue-100 dark:hover:bg-blue-800 transition-colors"
+                                                                                    >
+                                                                                        + Add Qty
+                                                                                    </button>
+                                                                                )}
                                                                             </div>
                                                                         </td>
                                                                     </tr>
-                                                                )}
-                                                            </React.Fragment>
-                                                        );
-                                                    })}
-                                                    {filteredActiveGroups.length === 0 && (
-                                                        <tr>
-                                                            <td colSpan="9" className="px-4 py-8 text-center text-sm text-zinc-500">
-                                                                {activeSearchTerm ? "No item types match your search." : "No items counted yet."}
-                                                            </td>
-                                                        </tr>
-                                                    )}
-                                                </tbody>
-                                            </table>
-                                        </div>
+                                                                    {isExpanded && (
+                                                                        <tr className="bg-zinc-50/70 dark:bg-zinc-900/40">
+                                                                            <td colSpan="9" className="px-6 py-3">
+                                                                                <div className="border border-zinc-200 dark:border-zinc-700 rounded-lg overflow-hidden bg-white dark:bg-zinc-800/80 shadow-xs">
+                                                                                    <div className="px-3.5 py-2 bg-zinc-100/80 dark:bg-zinc-700/60 text-xs font-semibold text-zinc-600 dark:text-zinc-300 border-b border-zinc-200 dark:border-zinc-700 flex justify-between items-center">
+                                                                                        <span>Recorded Scans / Serial Numbers ({group.rawItems.length})</span>
+                                                                                        <span>Expected vs Counted</span>
+                                                                                    </div>
+                                                                                    <div className="max-h-56 overflow-y-auto divide-y divide-zinc-100 dark:divide-zinc-700 text-xs">
+                                                                                        {group.rawItems.map((raw, idx) => {
+                                                                                            const isCounted = (raw.counted_quantity || 0) > 0;
+                                                                                            return (
+                                                                                                <div key={raw.id || idx} className="px-3.5 py-2 flex items-center justify-between font-mono">
+                                                                                                    <div className="flex items-center gap-2">
+                                                                                                        <span className="text-zinc-400 text-[11px] font-sans">#{idx + 1}</span>
+                                                                                                        <span className="text-zinc-800 dark:text-zinc-200 font-medium">
+                                                                                                            {raw.stock_items?.barcode || 'No Barcode'}
+                                                                                                        </span>
+                                                                                                    </div>
+                                                                                                    <div className="flex items-center gap-3">
+                                                                                                        <span className="text-zinc-500 font-sans text-xs">
+                                                                                                            Counted: <strong>{raw.counted_quantity || 0}</strong> / Expected: {raw.expected_quantity ?? 1}
+                                                                                                        </span>
+                                                                                                        <span className={`px-2 py-0.5 rounded text-[11px] font-sans font-medium ${isCounted ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300' : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'}`}>
+                                                                                                            {isCounted ? 'Counted' : 'Missing'}
+                                                                                                        </span>
+                                                                                                    </div>
+                                                                                                </div>
+                                                                                            );
+                                                                                        })}
+                                                                                    </div>
+                                                                                </div>
+                                                                            </td>
+                                                                        </tr>
+                                                                    )}
+                                                                </React.Fragment>
+                                                            );
+                                                        })}
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        </>
                                     )}
                                 </div>
                             </div>
@@ -1969,154 +2246,360 @@ const StockTakePage = ({
 
                             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
                                 <div>
-                                    <h3 className="text-lg font-bold text-zinc-900 dark:text-zinc-100">Summary by Item Type</h3>
-                                    <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                                        Grouped by product type &bull; Discrepancies highlighted &bull; Click any item to expand scans
+                                    <div className="flex items-center gap-2">
+                                        <h3 className="text-lg font-bold text-zinc-900 dark:text-zinc-100">Summary by Item Type</h3>
+                                        {filteredHistoryGroups.length > 0 && (
+                                            <span className="text-xs font-mono font-bold px-2 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/40 text-blue-800 dark:text-blue-300">
+                                                {filteredHistoryGroups.length} {filteredHistoryGroups.length === 1 ? 'item' : 'items'}
+                                            </span>
+                                        )}
+                                    </div>
+                                    <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">
+                                        Grouped by product type &bull; Discrepancies highlighted &bull; Tap any item to inspect scans
                                     </p>
                                 </div>
-                                <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
-                                    {historyAvailableCategories.length > 2 && (
-                                        <select
-                                            value={historyCategoryFilter}
-                                            onChange={(e) => setHistoryCategoryFilter(e.target.value)}
-                                            className={formInputStyle + " text-xs py-1.5 w-auto"}
+                                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                                    {/* Mobile View Toggle: Cards vs Table */}
+                                    <div className="flex items-center bg-zinc-100 dark:bg-zinc-800 p-0.5 rounded-lg border border-zinc-200 dark:border-zinc-700 sm:hidden self-start">
+                                        <button
+                                            type="button"
+                                            onClick={() => setHistoryMobileViewMode('cards')}
+                                            className={`px-2.5 py-1 text-xs font-bold rounded-md transition-all ${
+                                                historyMobileViewMode === 'cards'
+                                                    ? 'bg-white dark:bg-zinc-700 text-blue-600 dark:text-blue-400 shadow-xs'
+                                                    : 'text-zinc-500 dark:text-zinc-400 hover:text-zinc-800'
+                                            }`}
                                         >
-                                            {historyAvailableCategories.map(cat => (
-                                                <option key={cat} value={cat}>{cat === 'All' ? 'All Categories' : cat}</option>
-                                            ))}
-                                        </select>
-                                    )}
-                                    <div className="w-full sm:w-56">
-                                        <input 
-                                            type="text" 
-                                            placeholder="Search items or barcodes..." 
-                                            value={historySearchTerm}
-                                            onChange={(e) => setHistorySearchTerm(e.target.value)}
-                                            className={formInputStyle + " text-xs py-1.5"}
-                                        />
+                                            🗂️ Cards
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => setHistoryMobileViewMode('table')}
+                                            className={`px-2.5 py-1 text-xs font-bold rounded-md transition-all ${
+                                                historyMobileViewMode === 'table'
+                                                    ? 'bg-white dark:bg-zinc-700 text-blue-600 dark:text-blue-400 shadow-xs'
+                                                    : 'text-zinc-500 dark:text-zinc-400 hover:text-zinc-800'
+                                            }`}
+                                        >
+                                            📊 Table
+                                        </button>
                                     </div>
-                                    <button
-                                        type="button"
-                                        onClick={toggleAllHistoryGroups}
-                                        className="text-xs font-semibold px-2.5 py-1.5 bg-zinc-100 dark:bg-zinc-700 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-600 rounded transition-colors whitespace-nowrap"
-                                    >
-                                        {filteredHistoryGroups.length > 0 && filteredHistoryGroups.every(g => expandedHistoryTypes[g.name]) ? 'Collapse All' : 'Expand All'}
-                                    </button>
+
+                                    <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
+                                        {historyAvailableCategories.length > 2 && (
+                                            <select
+                                                value={historyCategoryFilter}
+                                                onChange={(e) => setHistoryCategoryFilter(e.target.value)}
+                                                className={formInputStyle + " text-xs py-1.5 w-full sm:w-auto"}
+                                            >
+                                                {historyAvailableCategories.map(cat => (
+                                                    <option key={cat} value={cat}>{cat === 'All' ? 'All Categories' : cat}</option>
+                                                ))}
+                                            </select>
+                                        )}
+                                        <div className="relative w-full sm:w-56">
+                                            <SearchIcon className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-400 pointer-events-none" />
+                                            <input 
+                                                type="text" 
+                                                placeholder="Search items or barcodes..." 
+                                                value={historySearchTerm}
+                                                onChange={(e) => setHistorySearchTerm(e.target.value)}
+                                                className={formInputStyle + " text-xs py-1.5 pl-8 pr-7"}
+                                            />
+                                            {historySearchTerm && (
+                                                <button
+                                                    type="button"
+                                                    onClick={() => setHistorySearchTerm('')}
+                                                    className="absolute right-2 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 text-xs p-0.5"
+                                                    title="Clear search"
+                                                >
+                                                    &times;
+                                                </button>
+                                            )}
+                                        </div>
+                                        <button
+                                            type="button"
+                                            onClick={toggleAllHistoryGroups}
+                                            className="text-xs font-semibold px-2.5 py-1.5 bg-zinc-100 dark:bg-zinc-700 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-600 rounded-lg transition-colors whitespace-nowrap"
+                                        >
+                                            {filteredHistoryGroups.length > 0 && filteredHistoryGroups.every(g => expandedHistoryTypes[g.name]) ? 'Collapse All' : 'Expand All'}
+                                        </button>
+                                    </div>
                                 </div>
                             </div>
 
-                            <div className="overflow-x-auto border border-zinc-200 dark:border-zinc-700 rounded-lg">
-                                <table className="min-w-full divide-y divide-zinc-200 dark:divide-zinc-700">
-                                    <thead className="bg-zinc-50 dark:bg-zinc-900/50">
-                                        <tr>
-                                            <th className="w-8 px-3 py-3"></th>
-                                            <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Item Type</th>
-                                            <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Barcode / Serials</th>
-                                            <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Price</th>
-                                            <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Expected</th>
-                                            <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Counted</th>
-                                            <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Variance</th>
-                                            <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Value Var</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody className="bg-white dark:bg-zinc-800 divide-y divide-zinc-200 dark:divide-zinc-700">
-                                        {filteredHistoryGroups.sort((a, b) => {
-                                            const vA = Math.abs(a.value_variance);
-                                            const vB = Math.abs(b.value_variance);
-                                            if (vB !== vA) return vB - vA;
-                                            const uA = Math.abs(a.variance);
-                                            const uB = Math.abs(b.variance);
-                                            if (uB !== uA) return uB - uA;
-                                            return a.name.localeCompare(b.name);
-                                        }).map(item => {
+                            {filteredHistoryGroups.length === 0 ? (
+                                <div className="text-center py-8 bg-zinc-50 dark:bg-zinc-800/40 rounded-xl border border-dashed border-zinc-300 dark:border-zinc-700 p-4">
+                                    <SearchIcon className="w-8 h-8 text-zinc-400 mx-auto mb-2" />
+                                    <p className="text-sm font-semibold text-zinc-700 dark:text-zinc-200">No matching items found</p>
+                                    <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">Try adjusting your search query or category filter.</p>
+                                    <button
+                                        type="button"
+                                        onClick={() => { setHistorySearchTerm(''); setHistoryCategoryFilter('All'); }}
+                                        className="mt-3 px-3 py-1.5 text-xs font-semibold bg-zinc-200 dark:bg-zinc-700 hover:bg-zinc-300 dark:hover:bg-zinc-600 rounded-lg transition-colors"
+                                    >
+                                        Reset Filters
+                                    </button>
+                                </div>
+                            ) : (
+                                <>
+                                    {/* MOBILE VIEW: Item Blocks / Cards */}
+                                    <div className={`${historyMobileViewMode === 'cards' ? 'block' : 'hidden'} sm:hidden space-y-3`}>
+                                        {filteredHistoryGroups.map(item => {
                                             const hasDiscrepancy = item.variance !== 0;
                                             const isExpanded = !!expandedHistoryTypes[item.name];
 
                                             return (
-                                                <React.Fragment key={item.key}>
-                                                    <tr 
-                                                        onClick={() => toggleHistoryGroup(item.name)} 
-                                                        className={`cursor-pointer transition-colors hover:bg-zinc-50 dark:hover:bg-zinc-700/40 ${hasDiscrepancy ? 'bg-amber-50/30 dark:bg-amber-900/10' : ''}`}
-                                                    >
-                                                        <td className="px-3 py-3 text-center text-zinc-400">
-                                                            <ChevronDownIcon className={`w-4 h-4 transition-transform duration-200 ${isExpanded ? 'transform rotate-180' : '-rotate-90'}`} />
-                                                        </td>
-                                                        <td className="px-4 py-3 whitespace-nowrap text-sm font-medium text-zinc-900 dark:text-zinc-100">
-                                                            <div className="flex items-center gap-2">
-                                                                <span>{item.name}</span>
-                                                                {item.category && item.category !== 'General' && (
-                                                                    <span className="text-[11px] font-normal px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-700 text-zinc-600 dark:text-zinc-300">
-                                                                        {item.category}
+                                                <div 
+                                                    key={item.key}
+                                                    className={`rounded-xl border transition-all shadow-xs overflow-hidden ${
+                                                        hasDiscrepancy
+                                                            ? item.variance > 0
+                                                                ? 'border-emerald-200 dark:border-emerald-800/70 bg-emerald-50/20 dark:bg-emerald-950/15'
+                                                                : 'border-amber-200 dark:border-amber-800/70 bg-amber-50/25 dark:bg-amber-950/20'
+                                                            : 'border-zinc-200 dark:border-zinc-700/80 bg-white dark:bg-zinc-800/95'
+                                                    }`}
+                                                >
+                                                    {/* Card Header & Main Info */}
+                                                    <div className="p-3.5 pb-3">
+                                                        <div className="flex items-start justify-between gap-2">
+                                                            <div className="min-w-0 flex-1">
+                                                                <div className="flex items-center gap-1.5 flex-wrap">
+                                                                    <h4 className="font-bold text-sm text-zinc-900 dark:text-zinc-100 leading-snug">
+                                                                        {item.name}
+                                                                    </h4>
+                                                                    {item.category && item.category !== 'General' && (
+                                                                        <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-700 text-zinc-600 dark:text-zinc-300">
+                                                                            {item.category}
+                                                                        </span>
+                                                                    )}
+                                                                    {item.is_unique && (
+                                                                        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-purple-50 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300 border border-purple-200 dark:border-purple-800">
+                                                                            ⚡ Unique
+                                                                        </span>
+                                                                    )}
+                                                                </div>
+                                                                <div className="flex items-center gap-2 mt-1 text-xs text-zinc-500 dark:text-zinc-400 font-mono">
+                                                                    <span className="truncate">{item.barcodeDisplay}</span>
+                                                                    <span>&bull;</span>
+                                                                    <span className="shrink-0">£{item.price.toFixed(2)} / ea</span>
+                                                                </div>
+                                                            </div>
+
+                                                            {/* Variance Pill Badge */}
+                                                            <div className="shrink-0 text-right">
+                                                                {hasDiscrepancy ? (
+                                                                    <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-bold border ${
+                                                                        item.variance > 0
+                                                                            ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/60 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800'
+                                                                            : 'bg-amber-100 text-amber-800 dark:bg-amber-900/60 dark:text-amber-300 border-amber-200 dark:border-amber-800'
+                                                                    }`}>
+                                                                        {item.variance > 0 ? `+${item.variance}` : item.variance} var
+                                                                    </span>
+                                                                ) : (
+                                                                    <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-zinc-100 text-zinc-600 dark:bg-zinc-700 dark:text-zinc-300">
+                                                                        ✓ Balanced
                                                                     </span>
                                                                 )}
-                                                                {item.is_unique && (
-                                                                    <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-purple-50 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300 border border-purple-200 dark:border-purple-800">
-                                                                        Unique
+                                                                {hasDiscrepancy && (
+                                                                    <span className={`block text-[10px] font-bold mt-0.5 ${item.value_variance > 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600 dark:text-amber-400'}`}>
+                                                                        {item.value_variance > 0 ? '+' : ''}{item.value_variance < 0 ? '-' : ''}£{Math.abs(item.value_variance).toFixed(2)}
                                                                     </span>
                                                                 )}
                                                             </div>
-                                                        </td>
-                                                        <td className="px-4 py-3 whitespace-nowrap text-sm font-mono text-zinc-500">
-                                                            {item.barcodeDisplay}
-                                                        </td>
-                                                        <td className="px-4 py-3 whitespace-nowrap text-sm text-zinc-500">£{item.price.toFixed(2)}</td>
-                                                        <td className="px-4 py-3 whitespace-nowrap text-sm font-semibold text-zinc-600 dark:text-zinc-400">{item.expected_quantity}</td>
-                                                        <td className="px-4 py-3 whitespace-nowrap text-sm font-bold text-blue-600 dark:text-blue-400">{item.counted_quantity}</td>
-                                                        <td className={`px-4 py-3 whitespace-nowrap text-sm font-bold ${hasDiscrepancy ? (item.variance > 0 ? 'text-green-600' : 'text-red-600') : 'text-zinc-500'}`}>
-                                                            {item.variance > 0 ? `+${item.variance}` : item.variance}
-                                                        </td>
-                                                        <td className={`px-4 py-3 whitespace-nowrap text-sm font-bold ${hasDiscrepancy ? (item.value_variance > 0 ? 'text-green-600' : 'text-red-600') : 'text-zinc-500'}`}>
-                                                            {item.value_variance > 0 ? '+' : ''}{item.value_variance < 0 ? '-' : ''}£{Math.abs(item.value_variance).toFixed(2)}
-                                                        </td>
-                                                    </tr>
+                                                        </div>
+
+                                                        {/* 3-Box Metrics Grid */}
+                                                        <div className="grid grid-cols-3 gap-2 mt-3 pt-2.5 border-t border-zinc-100 dark:border-zinc-700/60">
+                                                            <div className="bg-zinc-50 dark:bg-zinc-900/60 p-2 rounded-lg text-center border border-zinc-150 dark:border-zinc-700/50">
+                                                                <span className="block text-[10px] uppercase font-bold text-zinc-400 tracking-wider">Expected</span>
+                                                                <span className="text-sm font-mono font-bold text-zinc-700 dark:text-zinc-300">{item.expected_quantity}</span>
+                                                            </div>
+                                                            <div className="bg-blue-50/70 dark:bg-blue-950/40 p-2 rounded-lg text-center border border-blue-100 dark:border-blue-900/50">
+                                                                <span className="block text-[10px] uppercase font-bold text-blue-500 tracking-wider">Counted</span>
+                                                                <span className="text-sm font-mono font-bold text-blue-700 dark:text-blue-300">{item.counted_quantity}</span>
+                                                            </div>
+                                                            <div className={`p-2 rounded-lg text-center border ${
+                                                                hasDiscrepancy
+                                                                    ? item.variance > 0
+                                                                        ? 'bg-emerald-50/70 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-900/50'
+                                                                        : 'bg-amber-50/70 dark:bg-amber-950/40 border-amber-200 dark:border-amber-900/50'
+                                                                    : 'bg-zinc-50 dark:bg-zinc-900/60 border-zinc-150 dark:border-zinc-700/50'
+                                                            }`}>
+                                                                <span className={`block text-[10px] uppercase font-bold tracking-wider ${
+                                                                    hasDiscrepancy
+                                                                        ? item.variance > 0 ? 'text-emerald-600' : 'text-amber-600'
+                                                                        : 'text-zinc-400'
+                                                                }`}>Variance</span>
+                                                                <span className={`text-sm font-mono font-bold ${
+                                                                    hasDiscrepancy
+                                                                        ? item.variance > 0 ? 'text-emerald-700 dark:text-emerald-300' : 'text-amber-700 dark:text-amber-300'
+                                                                        : 'text-zinc-600 dark:text-zinc-400'
+                                                                }`}>
+                                                                    {item.variance > 0 ? `+${item.variance}` : item.variance}
+                                                                </span>
+                                                            </div>
+                                                        </div>
+
+                                                        {/* Expand / Collapse Button for Scans */}
+                                                        <div className="flex items-center justify-between gap-2 mt-3 pt-2.5 border-t border-zinc-100 dark:border-zinc-700/60">
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => toggleHistoryGroup(item.name)}
+                                                                className="text-xs font-semibold text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200 flex items-center gap-1.5 py-1 px-1.5 rounded transition-colors touch-manipulation w-full justify-between"
+                                                            >
+                                                                <span className="flex items-center gap-1.5">
+                                                                    <ChevronDownIcon className={`w-3.5 h-3.5 transition-transform duration-200 ${isExpanded ? 'rotate-180' : '-rotate-90'}`} />
+                                                                    <span>{item.rawItems.length} Scans / Serials Recorded</span>
+                                                                </span>
+                                                                <span className="text-[11px] text-zinc-400 font-normal">
+                                                                    {isExpanded ? 'Hide' : 'View breakdown'}
+                                                                </span>
+                                                            </button>
+                                                        </div>
+                                                    </div>
+
+                                                    {/* Expandable Scans List */}
                                                     {isExpanded && (
-                                                        <tr className="bg-zinc-50/70 dark:bg-zinc-900/40">
-                                                            <td colSpan="8" className="px-6 py-3">
-                                                                <div className="border border-zinc-200 dark:border-zinc-700 rounded-lg overflow-hidden bg-white dark:bg-zinc-800/80 shadow-xs">
-                                                                    <div className="px-3.5 py-2 bg-zinc-100/80 dark:bg-zinc-700/60 text-xs font-semibold text-zinc-600 dark:text-zinc-300 border-b border-zinc-200 dark:border-zinc-700 flex justify-between items-center">
-                                                                        <span>Recorded Scans / Serial Numbers ({item.rawItems.length})</span>
-                                                                        <span>Expected vs Counted</span>
-                                                                    </div>
-                                                                    <div className="max-h-56 overflow-y-auto divide-y divide-zinc-100 dark:divide-zinc-700 text-xs">
-                                                                        {item.rawItems.map((raw, idx) => {
-                                                                            const isCounted = (raw.counted_quantity || 0) > 0;
-                                                                            return (
-                                                                                <div key={raw.id || idx} className="px-3.5 py-2 flex items-center justify-between font-mono">
-                                                                                    <div className="flex items-center gap-2">
-                                                                                        <span className="text-zinc-400 text-[11px] font-sans">#{idx + 1}</span>
-                                                                                        <span className="text-zinc-800 dark:text-zinc-200 font-medium">
-                                                                                            {raw.stock_items?.barcode || 'No Barcode'}
-                                                                                        </span>
-                                                                                    </div>
-                                                                                    <div className="flex items-center gap-3">
-                                                                                        <span className="text-zinc-500 font-sans text-xs">
-                                                                                            Counted: <strong>{raw.counted_quantity || 0}</strong> / Expected: {raw.expected_quantity ?? 1}
-                                                                                        </span>
-                                                                                        <span className={`px-2 py-0.5 rounded text-[11px] font-sans font-medium ${isCounted ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300' : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'}`}>
-                                                                                            {isCounted ? 'Counted' : 'Missing'}
-                                                                                        </span>
-                                                                                    </div>
-                                                                                </div>
-                                                                            );
-                                                                        })}
-                                                                    </div>
-                                                                </div>
-                                                            </td>
-                                                        </tr>
+                                                        <div className="border-t border-zinc-200 dark:border-zinc-700/80 bg-zinc-50/80 dark:bg-zinc-900/60 p-3">
+                                                            <div className="text-[11px] font-bold text-zinc-500 uppercase tracking-wider mb-2 flex justify-between">
+                                                                <span>Serial / Barcode</span>
+                                                                <span>Status</span>
+                                                            </div>
+                                                            <div className="space-y-1.5 max-h-56 overflow-y-auto pr-1">
+                                                                {item.rawItems.map((raw, idx) => {
+                                                                    const isCounted = (raw.counted_quantity || 0) > 0;
+                                                                    return (
+                                                                        <div key={raw.id || idx} className="p-2 rounded-lg bg-white dark:bg-zinc-800 border border-zinc-200/70 dark:border-zinc-700/60 flex items-center justify-between text-xs">
+                                                                            <div className="flex items-center gap-2 min-w-0">
+                                                                                <span className="text-zinc-400 text-[10px]">#{idx + 1}</span>
+                                                                                <span className="font-mono font-medium text-zinc-800 dark:text-zinc-200 truncate">
+                                                                                    {raw.stock_items?.barcode || 'No Barcode'}
+                                                                                </span>
+                                                                            </div>
+                                                                            <div className="flex items-center gap-2 shrink-0">
+                                                                                <span className="text-[11px] text-zinc-500 font-mono">
+                                                                                    {raw.counted_quantity || 0}/{raw.expected_quantity ?? 1}
+                                                                                </span>
+                                                                                <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
+                                                                                    isCounted 
+                                                                                        ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300' 
+                                                                                        : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'
+                                                                                }`}>
+                                                                                    {isCounted ? 'Counted' : 'Missing'}
+                                                                                </span>
+                                                                            </div>
+                                                                        </div>
+                                                                    );
+                                                                })}
+                                                            </div>
+                                                        </div>
                                                     )}
-                                                </React.Fragment>
+                                                </div>
                                             );
                                         })}
-                                        {filteredHistoryGroups.length === 0 && (
-                                            <tr>
-                                                <td colSpan="8" className="px-4 py-8 text-center text-sm text-zinc-500">
-                                                    {historySearchTerm ? "No item types match your search." : "No items were recorded in this stock take."}
-                                                </td>
-                                            </tr>
-                                        )}
-                                    </tbody>
-                                </table>
-                            </div>
+                                    </div>
+
+                                    {/* DESKTOP VIEW (or Mobile Table Mode) */}
+                                    <div className={`${historyMobileViewMode === 'table' ? 'block' : 'hidden'} sm:block overflow-x-auto border border-zinc-200 dark:border-zinc-700 rounded-lg`}>
+                                        <table className="min-w-full divide-y divide-zinc-200 dark:divide-zinc-700">
+                                            <thead className="bg-zinc-50 dark:bg-zinc-900/50">
+                                                <tr>
+                                                    <th className="w-8 px-3 py-3"></th>
+                                                    <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Item Type</th>
+                                                    <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Barcode / Serials</th>
+                                                    <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Price</th>
+                                                    <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Expected</th>
+                                                    <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Counted</th>
+                                                    <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Variance</th>
+                                                    <th className="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Value Var</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody className="bg-white dark:bg-zinc-800 divide-y divide-zinc-200 dark:divide-zinc-700">
+                                                {filteredHistoryGroups.map(item => {
+                                                    const hasDiscrepancy = item.variance !== 0;
+                                                    const isExpanded = !!expandedHistoryTypes[item.name];
+
+                                                    return (
+                                                        <React.Fragment key={item.key}>
+                                                            <tr 
+                                                                onClick={() => toggleHistoryGroup(item.name)} 
+                                                                className={`cursor-pointer transition-colors hover:bg-zinc-50 dark:hover:bg-zinc-700/40 ${hasDiscrepancy ? 'bg-amber-50/30 dark:bg-amber-900/10' : ''}`}
+                                                            >
+                                                                <td className="px-3 py-3 text-center text-zinc-400">
+                                                                    <ChevronDownIcon className={`w-4 h-4 transition-transform duration-200 ${isExpanded ? 'transform rotate-180' : '-rotate-90'}`} />
+                                                                </td>
+                                                                <td className="px-4 py-3 whitespace-nowrap text-sm font-medium text-zinc-900 dark:text-zinc-100">
+                                                                    <div className="flex items-center gap-2">
+                                                                        <span>{item.name}</span>
+                                                                        {item.category && item.category !== 'General' && (
+                                                                            <span className="text-[11px] font-normal px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-700 text-zinc-600 dark:text-zinc-300">
+                                                                                {item.category}
+                                                                            </span>
+                                                                        )}
+                                                                        {item.is_unique && (
+                                                                            <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-purple-50 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300 border border-purple-200 dark:border-purple-800">
+                                                                                Unique
+                                                                            </span>
+                                                                        )}
+                                                                    </div>
+                                                                </td>
+                                                                <td className="px-4 py-3 whitespace-nowrap text-sm font-mono text-zinc-500">
+                                                                    {item.barcodeDisplay}
+                                                                </td>
+                                                                <td className="px-4 py-3 whitespace-nowrap text-sm text-zinc-500">£{item.price.toFixed(2)}</td>
+                                                                <td className="px-4 py-3 whitespace-nowrap text-sm font-semibold text-zinc-600 dark:text-zinc-400">{item.expected_quantity}</td>
+                                                                <td className="px-4 py-3 whitespace-nowrap text-sm font-bold text-blue-600 dark:text-blue-400">{item.counted_quantity}</td>
+                                                                <td className={`px-4 py-3 whitespace-nowrap text-sm font-bold ${hasDiscrepancy ? (item.variance > 0 ? 'text-green-600' : 'text-red-600') : 'text-zinc-500'}`}>
+                                                                    {item.variance > 0 ? `+${item.variance}` : item.variance}
+                                                                </td>
+                                                                <td className={`px-4 py-3 whitespace-nowrap text-sm font-bold ${hasDiscrepancy ? (item.value_variance > 0 ? 'text-green-600' : 'text-red-600') : 'text-zinc-500'}`}>
+                                                                    {item.value_variance > 0 ? '+' : ''}{item.value_variance < 0 ? '-' : ''}£{Math.abs(item.value_variance).toFixed(2)}
+                                                                </td>
+                                                            </tr>
+                                                            {isExpanded && (
+                                                                <tr className="bg-zinc-50/70 dark:bg-zinc-900/40">
+                                                                    <td colSpan="8" className="px-6 py-3">
+                                                                        <div className="border border-zinc-200 dark:border-zinc-700 rounded-lg overflow-hidden bg-white dark:bg-zinc-800/80 shadow-xs">
+                                                                            <div className="px-3.5 py-2 bg-zinc-100/80 dark:bg-zinc-700/60 text-xs font-semibold text-zinc-600 dark:text-zinc-300 border-b border-zinc-200 dark:border-zinc-700 flex justify-between items-center">
+                                                                                <span>Recorded Scans / Serial Numbers ({item.rawItems.length})</span>
+                                                                                <span>Expected vs Counted</span>
+                                                                            </div>
+                                                                            <div className="max-h-56 overflow-y-auto divide-y divide-zinc-100 dark:divide-zinc-700 text-xs">
+                                                                                {item.rawItems.map((raw, idx) => {
+                                                                                    const isCounted = (raw.counted_quantity || 0) > 0;
+                                                                                    return (
+                                                                                        <div key={raw.id || idx} className="px-3.5 py-2 flex items-center justify-between font-mono">
+                                                                                            <div className="flex items-center gap-2">
+                                                                                                <span className="text-zinc-400 text-[11px] font-sans">#{idx + 1}</span>
+                                                                                                <span className="text-zinc-800 dark:text-zinc-200 font-medium">
+                                                                                                    {raw.stock_items?.barcode || 'No Barcode'}
+                                                                                                </span>
+                                                                                            </div>
+                                                                                            <div className="flex items-center gap-3">
+                                                                                                <span className="text-zinc-500 font-sans text-xs">
+                                                                                                    Counted: <strong>{raw.counted_quantity || 0}</strong> / Expected: {raw.expected_quantity ?? 1}
+                                                                                                </span>
+                                                                                                <span className={`px-2 py-0.5 rounded text-[11px] font-sans font-medium ${isCounted ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300' : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'}`}>
+                                                                                                    {isCounted ? 'Counted' : 'Missing'}
+                                                                                                </span>
+                                                                                            </div>
+                                                                                        </div>
+                                                                                    );
+                                                                                })}
+                                                                            </div>
+                                                                        </div>
+                                                                    </td>
+                                                                </tr>
+                                                            )}
+                                                        </React.Fragment>
+                                                    );
+                                                })}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </>
+                            )}
                         </div>
                     ) : (
                         <div className="p-6">

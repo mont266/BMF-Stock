@@ -619,8 +619,8 @@ const StockManagerApp = ({
 
   const [itemTypes, setItemTypes] = useState([]);
   const [itemTypesLoading, setItemTypesLoading] = useState(true);
-  const [editingItemType, setEditingItemType] = useState(null); // e.g., { id, name, price, category, stock_threshold, is_unique, subcategory_id, supplier_id }
-  const [newItemTypeInfo, setNewItemTypeInfo] = useState({ name: '', barcode: '', price: '', category: '', subcategory_id: '', stock_threshold: '', is_unique: false, supplier_id: '' });
+  const [editingItemType, setEditingItemType] = useState(null); // e.g., { id, name, category, stock_threshold, is_unique, subcategory_id, supplier_id }
+  const [newItemTypeInfo, setNewItemTypeInfo] = useState({ name: '', barcode: '', category: '', subcategory_id: '', stock_threshold: '', is_unique: false, supplier_id: '' });
   const [isAddItemTypeModalOpen, setIsAddItemTypeModalOpen] = useState(false);
   const [expandedItemTypeGroups, setExpandedItemTypeGroups] = useState({});
   const [expandedSubCategory, setExpandedSubCategory] = useState({});
@@ -645,7 +645,7 @@ const StockManagerApp = ({
   const [supplierPartNumbersLoading, setSupplierPartNumbersLoading] = useState(true);
   const [selectedItemTypeForParts, setSelectedItemTypeForParts] = useState(null);
   const [isManagePartNumbersModalOpen, setIsManagePartNumbersModalOpen] = useState(false);
-  const [newPartNumberInfo, setNewPartNumberInfo] = useState({ supplier_id: '', supplier_name: '', part_number: '', barcode: '', purchase_price: '', lead_time_days: '', notes: '' });
+  const [newPartNumberInfo, setNewPartNumberInfo] = useState({ supplier_id: '', supplier_name: '', part_number: '', barcode: '', purchase_price: '', pack_quantity: '10', send_in_packs: false, lead_time_days: '', notes: '' });
   const [editingPartNumber, setEditingPartNumber] = useState(null);
   const [stockSearchTerm, setStockSearchTerm] = useState('');
   const [expandedSupplierCatalog, setExpandedSupplierCatalog] = useState({});
@@ -1430,33 +1430,136 @@ const StockManagerApp = ({
     if (!itemTypes) return map;
     const typeIdMap = {};
     for (const it of itemTypes) {
-      typeIdMap[it.id] = it;
+      if (it.id) typeIdMap[String(it.id)] = it;
+      if (it.name) typeIdMap[String(it.name).toLowerCase()] = it;
     }
     if (supplierPartNumbers && supplierPartNumbers.length > 0) {
       for (const p of supplierPartNumbers) {
-        const it = typeIdMap[p.item_type_id] || p.item_types;
+        const it = (p.item_type_id && typeIdMap[String(p.item_type_id)]) || 
+                   (p.item_name && typeIdMap[String(p.item_name).toLowerCase()]) || 
+                   p.item_types;
+        const resolvedName = it?.name || p.item_name || p.item_types?.name;
         const entry = {
           id: p.id,
-          itemTypeId: p.item_type_id,
-          itemTypeName: it?.name || p.item_types?.name,
+          itemTypeId: p.item_type_id || it?.id,
+          itemTypeName: resolvedName,
           supplierId: p.supplier_id,
           supplierName: p.suppliers?.name || p.supplier_name || 'Supplier',
-          partNumber: p.part_number,
-          purchasePrice: p.purchase_price,
+          partNumber: p.part_number || p.supplier_part_number,
+          purchasePrice: p.purchase_price || p.supplier_purchase_price,
           barcode: p.barcode,
+          packQuantity: parseInt(p.pack_quantity, 10) > 0 ? parseInt(p.pack_quantity, 10) : 1,
+          sendInPacks: Boolean(p.send_in_packs),
           leadTimeDays: p.lead_time_days || 0,
           notes: p.notes
         };
-        if (p.part_number) {
-          map[String(p.part_number).trim().toLowerCase()] = entry;
-        }
-        if (p.barcode) {
-          map[String(p.barcode).trim().toLowerCase()] = entry;
-        }
+
+        const addKey = (val) => {
+          if (!val) return;
+          const s = String(val).trim().toLowerCase();
+          if (s) {
+            map[s] = entry;
+            const stripped = s.replace(/[\s\-_]/g, '');
+            if (stripped && stripped !== s) {
+              map[stripped] = entry;
+            }
+          }
+        };
+
+        addKey(p.part_number);
+        addKey(p.supplier_part_number);
+        addKey(p.barcode);
       }
     }
     return map;
   }, [supplierPartNumbers, itemTypes]);
+
+  // Canonical resolution of supplier purchase price for an item or item type (Source of Truth for stock cost)
+  const getItemSupplierPurchasePrice = useCallback((itemOrName) => {
+    if (!itemOrName) return 0;
+    const name = typeof itemOrName === 'string' ? itemOrName : itemOrName.name;
+    const item = typeof itemOrName === 'object' ? itemOrName : null;
+
+    // 1. Direct match on item's supplier_part_number in supplier parts lookup
+    if (item?.supplier_part_number && partNumberLookupMap) {
+      const part = partNumberLookupMap[String(item.supplier_part_number).trim().toLowerCase()];
+      if (part && parseFloat(part.purchasePrice) > 0) {
+        return parseFloat(part.purchasePrice);
+      }
+    }
+
+    // 2. Direct match on item's barcode in supplier parts lookup
+    if (item?.barcode && partNumberLookupMap) {
+      const part = partNumberLookupMap[String(item.barcode).trim().toLowerCase()];
+      if (part && parseFloat(part.purchasePrice) > 0) {
+        return parseFloat(part.purchasePrice);
+      }
+    }
+
+    // 3. Match from item type supplier part numbers catalog (Canonical Source of Truth)
+    const itemTypeObj = itemTypes.find(it => it.name === name || it.id === item?.item_type_id || it.id === item?.id);
+    const parts = supplierPartNumbersByItemTypeName[name] || (itemTypeObj ? (supplierPartNumbersByItemTypeId[itemTypeObj.id] || []) : []);
+    if (parts && parts.length > 0) {
+      // Prioritize part matching designated supplier for this item type
+      const designatedSupplierPart = (itemTypeObj?.supplier_id 
+        ? parts.find(p => p.supplier_id === itemTypeObj.supplier_id && parseFloat(p.purchase_price) > 0) 
+        : null);
+      if (designatedSupplierPart) {
+        return parseFloat(designatedSupplierPart.purchase_price);
+      }
+      // Or first supplier part with a positive purchase price
+      const validPricedPart = parts.find(p => parseFloat(p.purchase_price) > 0);
+      if (validPricedPart) {
+        return parseFloat(validPricedPart.purchase_price);
+      }
+      // Or first registered part
+      const firstPrice = parseFloat(parts[0]?.purchase_price);
+      if (!isNaN(firstPrice) && firstPrice >= 0) {
+        return firstPrice;
+      }
+    }
+
+    // 4. Fallback to physical stock record's purchase_price if item had one recorded
+    if (item?.purchase_price != null && parseFloat(item.purchase_price) > 0) {
+      return parseFloat(item.purchase_price);
+    }
+
+    return 0;
+  }, [partNumberLookupMap, itemTypes, supplierPartNumbersByItemTypeName, supplierPartNumbersByItemTypeId]);
+
+  // Resolves whether a scanned barcode, part number, or item gets sent out in packs, and the pack quantity
+  const getItemPackInfo = useCallback((decodedText, itemOrType) => {
+    if (!decodedText && !itemOrType) return { isPack: false, packQuantity: 1, partNumber: '' };
+    const cleanScan = decodedText ? String(decodedText).trim().toLowerCase() : '';
+    const itemName = typeof itemOrType === 'string' ? itemOrType : (itemOrType?.name || '');
+    const itemTypeId = itemOrType?.item_type_id || itemOrType?.id || null;
+
+    const strippedScan = cleanScan ? cleanScan.replace(/[\s\-_]/g, '') : '';
+
+    // 1. Direct match on scanned barcode or part number in partNumberLookupMap
+    if (cleanScan && partNumberLookupMap) {
+      const part = partNumberLookupMap[cleanScan] || (strippedScan ? partNumberLookupMap[strippedScan] : null);
+      if (part && part.sendInPacks && part.packQuantity > 0) {
+        return { isPack: true, packQuantity: part.packQuantity, partNumber: part.partNumber };
+      }
+    }
+
+    // 2. Check item's supplier part numbers catalog if item type name or id is known
+    const parts = (itemName ? supplierPartNumbersByItemTypeName[itemName] : null) || 
+                  (itemTypeId ? supplierPartNumbersByItemTypeId[itemTypeId] : null) || [];
+    
+    // Check if any registered supplier part number for this item has send_in_packs enabled
+    const packPart = parts.find(p => p.send_in_packs && parseInt(p.pack_quantity, 10) > 0);
+    if (packPart) {
+      return { 
+        isPack: true, 
+        packQuantity: parseInt(packPart.pack_quantity, 10) || 1, 
+        partNumber: packPart.part_number 
+      };
+    }
+
+    return { isPack: false, packQuantity: 1, partNumber: '' };
+  }, [partNumberLookupMap, supplierPartNumbersByItemTypeName, supplierPartNumbersByItemTypeId]);
 
   const teamBarcodeLookup = useMemo(() => {
     const map = {};
@@ -1521,10 +1624,11 @@ const StockManagerApp = ({
     try {
         const trimmedScan = String(decodedText).trim();
         const lowerScan = trimmedScan.toLowerCase();
-        const partLookup = partNumberLookupMap[lowerScan];
+        const strippedScan = lowerScan.replace(/[\s\-_]/g, '');
+        const partLookup = partNumberLookupMap[lowerScan] || (strippedScan ? partNumberLookupMap[strippedScan] : null);
 
         // 1. Check if scanned barcode is a Team barcode or team code!
-        const matchedTeamByBarcode = teamBarcodeLookup[lowerScan];
+        const matchedTeamByBarcode = teamBarcodeLookup[lowerScan] || (strippedScan ? teamBarcodeLookup[strippedScan] : null);
         if (matchedTeamByBarcode) {
             playBeep('success');
             triggerScanFeedback('success');
@@ -1575,15 +1679,22 @@ const StockManagerApp = ({
         let matchedItemType = partLookup
             ? itemTypes.find(it => it.id === partLookup.itemTypeId || it.name === partLookup.itemTypeName)
             : itemTypes.find(it => {
-                if (it.barcode && String(it.barcode).trim().toLowerCase() === lowerScan) return true;
-                if (it.name && String(it.name).trim().toLowerCase() === lowerScan) return true;
-                if (it.name && String(it.name).replace(/\s+/g, '').toLowerCase() === lowerScan.replace(/\s+/g, '')) return true;
+                const itBc = String(it.barcode || '').trim().toLowerCase();
+                const itName = String(it.name || '').trim().toLowerCase();
+                if (itBc && (itBc === lowerScan || itBc.replace(/[\s\-_]/g, '') === strippedScan)) return true;
+                if (itName && (itName === lowerScan || itName.replace(/[\s\-_]/g, '') === strippedScan)) return true;
                 const associated = itemTypeBarcodesMap[it.name] || [];
-                return associated.some(bc => String(bc).trim().toLowerCase() === lowerScan);
+                return associated.some(bc => {
+                    const b = String(bc).trim().toLowerCase();
+                    return b === lowerScan || b.replace(/[\s\-_]/g, '') === strippedScan;
+                });
             });
 
         if (!matchedItemType && stock && stock.length > 0) {
-            const stockMatch = stock.find(s => String(s.barcode || '').trim().toLowerCase() === lowerScan);
+            const stockMatch = stock.find(s => {
+                const sBc = String(s.barcode || '').trim().toLowerCase();
+                return sBc === lowerScan || (sBc && sBc.replace(/[\s\-_]/g, '') === strippedScan);
+            });
             if (stockMatch) {
                 matchedItemType = itemTypes.find(it => it.name === stockMatch.name);
             }
@@ -1594,10 +1705,20 @@ const StockManagerApp = ({
             isProcessingScanRef.current = true;
             (async () => {
                 try {
-                    const items = await getStockItemsByBarcode(decodedText, matchedItemType?.name);
+                    const targetLoc = (assignmentContext.location && assignmentContext.location !== 'All')
+                        ? assignmentContext.location
+                        : (activeLocation !== 'All' ? activeLocation : (displayLocations[0] || Location.LEADING_STORES));
+                    let items = await getStockItemsByBarcode(decodedText, matchedItemType?.name);
+                    if (items.length === 0 && (matchedItemType || partLookup)) {
+                        const targetName = matchedItemType?.name || partLookup?.itemTypeName;
+                        items = stock.filter(i => (targetName && i.name === targetName) || (i.barcode && String(i.barcode).trim().toLowerCase() === lowerScan));
+                    }
                     const itemTypeDetails = items.length > 0 ? itemTypes.find(it => it.name === items[0].name) : (matchedItemType || null);
                     const isUnique = !!itemTypeDetails?.is_unique;
-                    const targetLoc = assignmentContext.location;
+                    const packInfo = getItemPackInfo(decodedText, matchedItemType || (items.length > 0 ? items[0] : null));
+                    const basePackQty = (!isUnique && packInfo.isPack && packInfo.packQuantity > 0) ? packInfo.packQuantity : 1;
+                    const incrementQty = (!isUnique && packInfo.isPack) ? basePackQty : 1;
+                    const packNote = (!isUnique && packInfo.isPack && packInfo.packQuantity > 0) ? ` (Pack of ${basePackQty})` : '';
 
                     if (items.length === 0) {
                         if (matchedItemType) {
@@ -1631,13 +1752,13 @@ const StockManagerApp = ({
                                     if (existingIdx >= 0) {
                                         const updated = [...prev];
                                         const currentEntry = updated[existingIdx];
-                                        const newQty = currentEntry.quantity + 1;
-                                        updated[existingIdx] = { ...currentEntry, quantity: newQty, availableCount: 0 };
-                                        addToast(`+1 ${itemName} staged (0 recorded in stock at ${targetLoc})`, 'warning', decodedText);
+                                        const newQty = currentEntry.quantity + incrementQty;
+                                        updated[existingIdx] = { ...currentEntry, quantity: newQty, availableCount: 0, isPack: packInfo.isPack, packQuantity: packInfo.packQuantity };
+                                        addToast(`+${incrementQty} ${itemName}${packNote} staged (0 recorded in stock at ${targetLoc})`, 'warning', decodedText);
                                         triggerScanFeedback('warning');
                                         return updated;
                                     }
-                                    addToast(`+1 ${itemName} staged (0 recorded in stock at ${targetLoc})`, 'warning', decodedText);
+                                    addToast(`+${incrementQty} ${itemName}${packNote} staged (0 recorded in stock at ${targetLoc})`, 'warning', decodedText);
                                     triggerScanFeedback('warning');
                                     return [
                                         ...prev,
@@ -1646,7 +1767,9 @@ const StockManagerApp = ({
                                             name: itemName,
                                             barcode: decodedText,
                                             isUnique: false,
-                                            quantity: 1,
+                                            quantity: incrementQty,
+                                            isPack: packInfo.isPack,
+                                            packQuantity: packInfo.packQuantity,
                                             location: targetLoc,
                                             availableCount: 0,
                                             partNumber: partLookup?.partNumber || ''
@@ -1698,13 +1821,13 @@ const StockManagerApp = ({
                                 if (existingIdx >= 0) {
                                     const updated = [...prev];
                                     const currentEntry = updated[existingIdx];
-                                    const newQty = currentEntry.quantity + 1;
-                                    updated[existingIdx] = { ...currentEntry, quantity: newQty, availableCount: 0 };
-                                    addToast(`+1 ${itemName} staged (0 available at ${targetLoc})`, 'warning', decodedText);
+                                    const newQty = currentEntry.quantity + incrementQty;
+                                    updated[existingIdx] = { ...currentEntry, quantity: newQty, availableCount: 0, isPack: packInfo.isPack, packQuantity: packInfo.packQuantity };
+                                    addToast(`+${incrementQty} ${itemName}${packNote} staged (0 available at ${targetLoc})`, 'warning', decodedText);
                                     triggerScanFeedback('warning');
                                     return updated;
                                 }
-                                addToast(`+1 ${itemName} staged (0 available at ${targetLoc})`, 'warning', decodedText);
+                                addToast(`+${incrementQty} ${itemName}${packNote} staged (0 available at ${targetLoc})`, 'warning', decodedText);
                                 triggerScanFeedback('warning');
                                 return [
                                     ...prev,
@@ -1713,7 +1836,9 @@ const StockManagerApp = ({
                                         name: itemName,
                                         barcode: decodedText,
                                         isUnique: false,
-                                        quantity: 1,
+                                        quantity: incrementQty,
+                                        isPack: packInfo.isPack,
+                                        packQuantity: packInfo.packQuantity,
                                         location: targetLoc,
                                         availableCount: 0,
                                         partNumber: partLookup?.partNumber || ''
@@ -1755,22 +1880,24 @@ const StockManagerApp = ({
                             if (existingIdx >= 0) {
                                 const updated = [...prev];
                                 const currentEntry = updated[existingIdx];
-                                const newQty = currentEntry.quantity + 1;
+                                const newQty = currentEntry.quantity + incrementQty;
                                 updated[existingIdx] = {
                                     ...currentEntry,
                                     quantity: newQty,
-                                    availableCount: availableItems.length
+                                    availableCount: availableItems.length,
+                                    isPack: packInfo.isPack,
+                                    packQuantity: packInfo.packQuantity
                                 };
                                 if (newQty > availableItems.length) {
-                                    addToast(`+1 ${itemName} staged (${newQty} exceeds stock of ${availableItems.length})`, 'warning', decodedText);
+                                    addToast(`+${incrementQty} ${itemName}${packNote} staged (${newQty} exceeds stock of ${availableItems.length})`, 'warning', decodedText);
                                     triggerScanFeedback('warning');
                                 } else {
-                                    addToast(`+1 ${itemName} staged (${newQty} total)`, 'success', decodedText);
+                                    addToast(`+${incrementQty} ${itemName}${packNote} staged (${newQty} total)`, 'success', decodedText);
                                     triggerScanFeedback('success');
                                 }
                                 return updated;
                             } else {
-                                addToast(`+1 ${itemName} staged (1 total)`, 'success', decodedText);
+                                addToast(`+${incrementQty} ${itemName}${packNote} staged (${incrementQty} total)`, 'success', decodedText);
                                 triggerScanFeedback('success');
                                 return [
                                     ...prev,
@@ -1779,7 +1906,9 @@ const StockManagerApp = ({
                                         name: itemName,
                                         barcode: decodedText,
                                         isUnique: false,
-                                        quantity: 1,
+                                        quantity: incrementQty,
+                                        isPack: packInfo.isPack,
+                                        packQuantity: packInfo.packQuantity,
                                         location: availableItems[0].location || targetLoc,
                                         availableCount: availableItems.length,
                                         partNumber: partLookup?.partNumber || ''
@@ -1802,8 +1931,13 @@ const StockManagerApp = ({
         if (scanMode === 'in') {
             playBeep('success');
             handleSetView(View.LIST); // Stop scanner for 'in' mode
-            const items = await getStockItemsByBarcode(decodedText, matchedItemType?.name);
+            let items = await getStockItemsByBarcode(decodedText, matchedItemType?.name);
+            if (items.length === 0 && (matchedItemType || partLookup)) {
+                const targetName = matchedItemType?.name || partLookup?.itemTypeName;
+                items = stock.filter(i => (targetName && i.name === targetName) || (i.barcode && String(i.barcode).trim().toLowerCase() === lowerScan));
+            }
             const itemTypeDetails = items.length > 0 ? itemTypes.find(it => it.name === items[0].name) : (matchedItemType || null);
+            const packInfo = getItemPackInfo(decodedText, matchedItemType || (items.length > 0 ? items[0] : null));
             
             if (items.length === 0) {
                 if (!isAdminProfile) {
@@ -1813,25 +1947,33 @@ const StockManagerApp = ({
                     return;
                 }
                 const defaultItemType = matchedItemType?.name || '';
+                const defaultQty = (packInfo.isPack && packInfo.packQuantity > 0) ? String(packInfo.packQuantity) : '';
                 setNewScannedItemDetails({ 
                     barcode: partLookup ? (matchedItemType?.barcode || decodedText) : decodedText, 
                     name: defaultItemType, 
                     description: partLookup ? `Supplier Part #${partLookup.partNumber} (${partLookup.supplierName})` : '', 
-                    quantity: '',
+                    quantity: defaultQty,
                     firstSerial: decodedText,
                     lastSerial: decodedText,
                     supplier_id: partLookup?.supplierId || matchedItemType?.supplier_id || '',
-                    purchase_price: partLookup?.purchasePrice || matchedItemType?.price || '',
+                    purchase_price: partLookup?.purchasePrice || getItemSupplierPurchasePrice(matchedItemType || defaultItemType) || '',
                     location: activeLocation !== 'All' ? activeLocation : (displayLocations[0] || Location.LEADING_STORES),
                 });
+                if (packInfo.isPack && packInfo.packQuantity > 1) {
+                    addToast(`Pack item detected (${packInfo.packQuantity} units/pk). Defaulted quantity to 1 pack.`, 'info', decodedText);
+                }
                 setIsAddScannedItemModalOpen(true);
             } else {
                 if (itemTypeDetails?.is_unique && !partLookup) {
                     setError(`An item with serial number "${decodedText}" already exists. Unique items cannot be duplicated.`);
                 } else {
                     setItemForQuantityAdd(items[0]);
-                    setQuantityToAdd('');
+                    const defaultQty = (packInfo.isPack && packInfo.packQuantity > 0) ? String(packInfo.packQuantity) : '1';
+                    setQuantityToAdd(defaultQty);
                     setQuantityAddLocation(activeLocation !== 'All' ? activeLocation : (items[0].location || displayLocations[0] || Location.LEADING_STORES));
+                    if (packInfo.isPack && packInfo.packQuantity > 1) {
+                        addToast(`Pack item detected (${packInfo.packQuantity} units/pk). Defaulted quantity to 1 pack.`, 'info', decodedText);
+                    }
                     setIsAddQuantityModalOpen(true);
                 }
             }
@@ -1844,7 +1986,11 @@ const StockManagerApp = ({
             // Use a self-invoking async function to handle the promise chain without making the parent useCallback async.
             (async () => {
                 try {
-                    const items = await getStockItemsByBarcode(decodedText, matchedItemType?.name);
+                    let items = await getStockItemsByBarcode(decodedText, matchedItemType?.name);
+                    if (items.length === 0 && (matchedItemType || partLookup)) {
+                        const targetName = matchedItemType?.name || partLookup?.itemTypeName;
+                        items = stock.filter(i => (targetName && i.name === targetName) || (i.barcode && String(i.barcode).trim().toLowerCase() === lowerScan));
+                    }
                     
                     if (items.length === 0) {
                         if (matchedItemType) {
@@ -1925,9 +2071,14 @@ const StockManagerApp = ({
             isProcessingScanRef.current = true;
             (async () => {
                 try {
-                    const items = await getStockItemsByBarcode(decodedText, matchedItemType?.name);
+                    let items = await getStockItemsByBarcode(decodedText, matchedItemType?.name);
+                    if (items.length === 0 && (matchedItemType || partLookup)) {
+                        const targetName = matchedItemType?.name || partLookup?.itemTypeName;
+                        items = stock.filter(i => (targetName && i.name === targetName) || (i.barcode && String(i.barcode).trim().toLowerCase() === lowerScan));
+                    }
                     const itemTypeDetails = items.length > 0 ? itemTypes.find(it => it.name === items[0].name) : (matchedItemType || null);
                     const isUnique = !!itemTypeDetails?.is_unique;
+                    const packInfo = getItemPackInfo(decodedText, matchedItemType || (items.length > 0 ? items[0] : null));
                     const returningTeam = returnContext.team;
                     const targetLoc = (returnContext.location && returnContext.location !== 'All') 
                         ? returnContext.location 
@@ -1941,12 +2092,14 @@ const StockManagerApp = ({
                     }
 
                     // Check items assigned to this returning team
-                    const teamAssignedItems = items.filter(i => i.assigned_to === returningTeam);
+                    const teamAssignedItems = items.filter(i => 
+                        String(i.assigned_to).trim().toLowerCase() === String(returningTeam).trim().toLowerCase()
+                    );
                     const itemName = items[0].name;
 
                     if (teamAssignedItems.length === 0) {
                         const currentHolder = items[0].assigned_to;
-                        if (currentHolder === Team.UNASSIGNED) {
+                        if (!currentHolder || currentHolder === Team.UNASSIGNED) {
                             addToast(`"${itemName}" is already in stock (unassigned)`, 'warning', decodedText);
                         } else {
                             addToast(`"${itemName}" is currently assigned to "${currentHolder}" (not ${returningTeam})`, 'warning', decodedText);
@@ -1963,6 +2116,7 @@ const StockManagerApp = ({
                                 triggerScanFeedback('warning');
                                 return prev;
                             }
+                            const matchedSerial = teamAssignedItems.find(i => String(i.barcode).toLowerCase() === lowerScan)?.barcode || teamAssignedItems[0]?.barcode || decodedText;
                             addToast(`+1 ${itemName} staged for return`, 'success', decodedText);
                             triggerScanFeedback('success');
                             return [
@@ -1971,12 +2125,14 @@ const StockManagerApp = ({
                                     id: `return-unique-${decodedText}-${Date.now()}`,
                                     name: itemName,
                                     barcode: decodedText,
-                                    serial: decodedText,
+                                    serial: matchedSerial,
                                     isUnique: true,
                                     quantity: 1,
                                     location: targetLoc,
                                     availableCount: teamAssignedItems.length,
-                                    partNumber: partLookup?.partNumber || ''
+                                    partNumber: partLookup?.partNumber || '',
+                                    isPack: packInfo.isPack,
+                                    packQuantity: packInfo.packQuantity
                                 }
                             ];
                         } else {
@@ -1996,7 +2152,9 @@ const StockManagerApp = ({
                                 updated[existingIdx] = {
                                     ...currentEntry,
                                     quantity: newQty,
-                                    availableCount: maxAvailable
+                                    availableCount: maxAvailable,
+                                    isPack: packInfo.isPack,
+                                    packQuantity: packInfo.packQuantity
                                 };
                                 addToast(`+1 ${itemName} staged (${newQty}/${maxAvailable} to return)`, 'success', decodedText);
                                 triggerScanFeedback('success');
@@ -2020,7 +2178,9 @@ const StockManagerApp = ({
                                         quantity: 1,
                                         location: targetLoc,
                                         availableCount: maxAvailable,
-                                        partNumber: partLookup?.partNumber || ''
+                                        partNumber: partLookup?.partNumber || '',
+                                        isPack: packInfo.isPack,
+                                        packQuantity: packInfo.packQuantity
                                     }
                                 ];
                             }
@@ -2039,20 +2199,32 @@ const StockManagerApp = ({
             isProcessingScanRef.current = true;
             (async () => {
                 try {
-                    const items = await getStockItemsByBarcode(decodedText, matchedItemType?.name);
+                    let items = await getStockItemsByBarcode(decodedText, matchedItemType?.name);
+                    if (items.length === 0 && (matchedItemType || partLookup)) {
+                        const targetName = matchedItemType?.name || partLookup?.itemTypeName;
+                        items = stock.filter(i => (targetName && i.name === targetName) || (i.barcode && String(i.barcode).trim().toLowerCase() === lowerScan));
+                    }
                     if (items.length === 0) {
                         logUnrecognizedBarcode(decodedText);
                         triggerScanFeedback('error');
-                        addToast(`Unrecognised: ${decodedText}`, 'error', decodedText);
+                        addToast(`Unrecognised barcode: ${decodedText}`, 'error', decodedText);
                         return;
                     }
                     
                     const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-                    const itemToReturn = items.find(i => i.assigned_to === returnContext.team && i.assigned_at && new Date(i.assigned_at) >= twentyFourHoursAgo);
+                    let itemToReturn = items.find(i => 
+                        String(i.assigned_to).trim().toLowerCase() === String(returnContext.team).trim().toLowerCase() && 
+                        i.assigned_at && new Date(i.assigned_at) >= twentyFourHoursAgo
+                    );
+                    if (!itemToReturn) {
+                        itemToReturn = items.find(i => 
+                            String(i.assigned_to).trim().toLowerCase() === String(returnContext.team).trim().toLowerCase()
+                        );
+                    }
                     
                     if (!itemToReturn) {
                         triggerScanFeedback('warning');
-                        addToast(`Not assigned to ${returnContext.team} recently`, 'warning', decodedText);
+                        addToast(`"${items[0].name}" is not currently assigned to ${returnContext.team}`, 'warning', decodedText);
                         return;
                     }
                     const rapidReturnLoc = (returnContext.location && returnContext.location !== 'All') 
@@ -2078,7 +2250,11 @@ const StockManagerApp = ({
             playBeep('success');
             handleSetView(View.LIST); // Stop scanner
             
-            const items = await getStockItemsByBarcode(decodedText, matchedItemType?.name);
+            let items = await getStockItemsByBarcode(decodedText, matchedItemType?.name);
+            if (items.length === 0 && (matchedItemType || partLookup)) {
+                const targetName = matchedItemType?.name || partLookup?.itemTypeName;
+                items = stock.filter(i => (targetName && i.name === targetName) || (i.barcode && String(i.barcode).trim().toLowerCase() === lowerScan));
+            }
             if (items.length === 0) {
                 logUnrecognizedBarcode(decodedText);
                 addToast(`Unrecognised barcode: ${decodedText}`, 'error');
@@ -2086,20 +2262,39 @@ const StockManagerApp = ({
             }
             
             const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-            const teamItems = items.filter(i => i.assigned_to === returnContext.team && i.assigned_at && new Date(i.assigned_at) >= twentyFourHoursAgo);
+            let teamItems = items.filter(i => 
+                String(i.assigned_to).trim().toLowerCase() === String(returnContext.team).trim().toLowerCase() && 
+                i.assigned_at && new Date(i.assigned_at) >= twentyFourHoursAgo
+            );
+            if (teamItems.length === 0) {
+                teamItems = items.filter(i => 
+                    String(i.assigned_to).trim().toLowerCase() === String(returnContext.team).trim().toLowerCase()
+                );
+            }
             
             if (teamItems.length === 0) {
-                addToast(`No items of this type assigned to ${returnContext.team} in last 24h`, 'warning');
+                addToast(`"${items[0].name}" has no units currently assigned to ${returnContext.team}`, 'warning');
                 return;
             }
             
+            const packInfo = getItemPackInfo(decodedText, matchedItemType || teamItems[0]);
             setItemForQuantityReturn(teamItems);
-            setQuantityToReturn('');
+            if (packInfo.isPack && packInfo.packQuantity > 1) {
+                const defaultReturn = Math.min(packInfo.packQuantity, teamItems.length);
+                setQuantityToReturn(String(defaultReturn));
+                addToast(`Pack item detected (${packInfo.packQuantity}/pk). Defaulted to ${defaultReturn} unit${defaultReturn !== 1 ? 's' : ''}.`, 'info', decodedText);
+            } else {
+                setQuantityToReturn(String(teamItems.length));
+            }
             setIsReturnQuantityModalOpen(true);
         } else if (scanMode === 'out-quantity') {
             playBeep('success');
             handleSetView(View.LIST); // Stop scanner for quantity mode
-            const items = await getStockItemsByBarcode(decodedText, matchedItemType?.name);
+            let items = await getStockItemsByBarcode(decodedText, matchedItemType?.name);
+            if (items.length === 0 && (matchedItemType || partLookup)) {
+                const targetName = matchedItemType?.name || partLookup?.itemTypeName;
+                items = stock.filter(i => (targetName && i.name === targetName) || (i.barcode && String(i.barcode).trim().toLowerCase() === lowerScan));
+            }
             
             if (items.length === 0) {
                 if (matchedItemType) {
@@ -2140,8 +2335,14 @@ const StockManagerApp = ({
                 setError(`No available stock found for "${decodedText}".`);
                 return;
             }
+            const packInfo = getItemPackInfo(decodedText, matchedItemType || items[0]);
             setItemForQuantityAssign(availableItems);
-            setQuantityToAssign('');
+            if (packInfo.isPack && packInfo.packQuantity > 1) {
+                setQuantityToAssign(String(packInfo.packQuantity));
+                addToast(`Pack item detected. Defaulted sign-out quantity to ${packInfo.packQuantity} units.`, 'info', decodedText);
+            } else {
+                setQuantityToAssign('');
+            }
             setIsAssignQuantityModalOpen(true);
         } else if (scanMode === 'out-range-start') {
             playBeep('success');
@@ -2172,7 +2373,7 @@ const StockManagerApp = ({
                     firstSerial: decodedText,
                     lastSerial: decodedText,
                     supplier_id: partLookup?.supplierId || matchedItemType?.supplier_id || '',
-                    purchase_price: partLookup?.purchasePrice || matchedItemType?.price || '',
+                    purchase_price: partLookup?.purchasePrice || getItemSupplierPurchasePrice(matchedItemType || defaultItemType) || '',
                     location: activeLocation !== 'All' ? activeLocation : (displayLocations[0] || Location.LEADING_STORES),
                 });
                 setIsAddScannedItemModalOpen(true);
@@ -2183,7 +2384,7 @@ const StockManagerApp = ({
         setError(`Failed to process scan: ${e.message}`);
         handleSetView(View.LIST);
     }
-  }, [getStockItemsByBarcode, handleSetView, scanMode, itemTypes, itemTypeBarcodesMap, partNumberLookupMap, teamBarcodeLookup, assignmentContext, returnContext, selectedProfile, isAdminProfile, playBeep, triggerScanFeedback, addToast, setStock, updateStockItemAssignment, logUnrecognizedBarcode, activeLocation, displayLocations]);
+  }, [getStockItemsByBarcode, handleSetView, scanMode, itemTypes, itemTypeBarcodesMap, partNumberLookupMap, teamBarcodeLookup, assignmentContext, returnContext, selectedProfile, isAdminProfile, playBeep, triggerScanFeedback, addToast, setStock, updateStockItemAssignment, logUnrecognizedBarcode, activeLocation, displayLocations, getItemSupplierPurchasePrice, getItemPackInfo]);
   
   const handleScanError = useCallback((err) => {
     handleSetView(View.LIST);
@@ -2369,12 +2570,13 @@ const StockManagerApp = ({
             }
 
             const itemLocation = newItem.location || (dashboardFilters.location !== 'All' ? dashboardFilters.location : (displayLocations[0] || Location.LEADING_STORES));
+            const supplierPurchasePrice = getItemSupplierPurchasePrice({ name: selectedItemType?.name || name });
             itemsToAdd = barcodes.map(barcode => ({
                 name,
                 description,
                 barcode,
                 location: itemLocation,
-                purchase_price: parseFloat(selectedItemType.price) || 0,
+                purchase_price: supplierPurchasePrice,
             }));
 
         } else { // Not a unique item type
@@ -2402,12 +2604,13 @@ const StockManagerApp = ({
             }
 
             const itemLocation = newItem.location || (dashboardFilters.location !== 'All' ? dashboardFilters.location : (displayLocations[0] || Location.LEADING_STORES));
+            const supplierPurchasePrice = getItemSupplierPurchasePrice({ name: selectedItemType?.name || name, barcode: barcode.trim() });
             itemsToAdd = Array.from({ length: quantity }, () => ({
                 name,
                 description,
                 barcode: barcode.trim(),
                 location: itemLocation,
-                purchase_price: parseFloat(selectedItemType.price) || 0,
+                purchase_price: supplierPurchasePrice,
             }));
         }
         
@@ -2481,12 +2684,13 @@ const StockManagerApp = ({
             }
 
             const targetLocation = newScannedItemDetails.location || (dashboardFilters.location !== 'All' ? dashboardFilters.location : (displayLocations[0] || Location.LEADING_STORES));
+            const supplierPurchasePrice = parseFloat(newScannedItemDetails.purchase_price) || getItemSupplierPurchasePrice({ name: newScannedItemDetails.name });
             itemsToAdd = serials.map(barcode => ({
                 name: newScannedItemDetails.name,
                 description: newScannedItemDetails.description,
                 barcode,
                 location: targetLocation,
-                purchase_price: parseFloat(selectedItemType.price) || 0,
+                purchase_price: supplierPurchasePrice,
             }));
             successCount = itemsToAdd.length;
 
@@ -2517,12 +2721,13 @@ const StockManagerApp = ({
                 }
             }
             const targetLocation = newScannedItemDetails.location || (dashboardFilters.location !== 'All' ? dashboardFilters.location : (displayLocations[0] || Location.LEADING_STORES));
+            const supplierPurchasePrice = parseFloat(newScannedItemDetails.purchase_price) || getItemSupplierPurchasePrice({ name: newScannedItemDetails.name, barcode: newScannedItemDetails.barcode });
             itemsToAdd = Array.from({ length: quantity }, () => ({
                 name: newScannedItemDetails.name,
                 description: newScannedItemDetails.description,
                 barcode: newScannedItemDetails.barcode,
                 location: targetLocation,
-                purchase_price: parseFloat(selectedItemType.price) || 0,
+                purchase_price: supplierPurchasePrice,
             }));
             successCount = itemsToAdd.length;
         }
@@ -2552,14 +2757,14 @@ const StockManagerApp = ({
             throw new Error("Please enter a valid quantity.");
         }
         
-        const itemTypeDetails = itemTypes.find(it => it.name === itemForQuantityAdd.name);
         const targetLocation = quantityAddLocation || itemForQuantityAdd.location || (dashboardFilters.location !== 'All' ? dashboardFilters.location : (displayLocations[0] || Location.LEADING_STORES));
+        const supplierPurchasePrice = getItemSupplierPurchasePrice(itemForQuantityAdd);
         const itemsToAdd = Array.from({ length: quantity }, () => ({
             name: itemForQuantityAdd.name,
             description: itemForQuantityAdd.description,
             barcode: itemForQuantityAdd.barcode,
             location: targetLocation,
-            purchase_price: parseFloat(itemTypeDetails?.price) || 0,
+            purchase_price: supplierPurchasePrice,
         }));
 
         await bulkAddStockItems(itemsToAdd, selectedProfile.name);
@@ -2809,8 +3014,9 @@ const StockManagerApp = ({
       for (const entry of stagedReturnItems) {
         if (entry.isUnique) {
           const found = stock.find(i => 
-            i.barcode === entry.barcode && 
-            i.assigned_to === team
+            !allItemIdsToReturn.includes(i.id) &&
+            String(i.assigned_to).trim().toLowerCase() === String(team).trim().toLowerCase() &&
+            (i.barcode === entry.serial || i.barcode === entry.barcode || (i.name === entry.name && !allItemIdsToReturn.includes(i.id)))
           );
           if (found) {
             allItemIdsToReturn.push(found.id);
@@ -2819,8 +3025,9 @@ const StockManagerApp = ({
         } else {
           // Bulk item
           const teamItems = stock.filter(i => 
+            !allItemIdsToReturn.includes(i.id) &&
             i.name === entry.name && 
-            i.assigned_to === team
+            String(i.assigned_to).trim().toLowerCase() === String(team).trim().toLowerCase()
           );
           const countNeeded = Math.min(entry.quantity, teamItems.length);
           const itemsToTake = teamItems.slice(0, countNeeded);
@@ -3315,7 +3522,7 @@ const StockManagerApp = ({
 
       const payload = { 
         name: newItemTypeInfo.name.trim(), 
-        price: parseFloat(newItemTypeInfo.price) || 0,
+        price: 0, // Canonical pricing now comes from item_supplier_part_numbers (supplier purchase price)
         category: newItemTypeInfo.category,
         subcategory_id: subId,
         supplier_id: supId,
@@ -3326,7 +3533,7 @@ const StockManagerApp = ({
 
       if (isTrainingMode) {
         trainingManager.addItemType(payload);
-        setNewItemTypeInfo({ name: '', barcode: '', price: '', category: '', subcategory_id: '', stock_threshold: '', is_unique: false, supplier_id: '' });
+        setNewItemTypeInfo({ name: '', barcode: '', category: '', subcategory_id: '', stock_threshold: '', is_unique: false, supplier_id: '' });
         await fetchItemTypes();
         setIsAddItemTypeModalOpen(false);
         return;
@@ -3344,7 +3551,7 @@ const StockManagerApp = ({
         insertError = retry.error;
       }
       if (insertError) throw insertError;
-      setNewItemTypeInfo({ name: '', barcode: '', price: '', category: '', subcategory_id: '', stock_threshold: '', is_unique: false, supplier_id: '' });
+      setNewItemTypeInfo({ name: '', barcode: '', category: '', subcategory_id: '', stock_threshold: '', is_unique: false, supplier_id: '' });
       await fetchItemTypes();
       await fetchCategories();
       setIsAddItemTypeModalOpen(false);
@@ -3680,7 +3887,6 @@ const StockManagerApp = ({
 
         const updatePayload = { 
             name: editingItemType.name.trim(),
-            price: parseFloat(editingItemType.price) || 0,
             category: editingItemType.category,
             subcategory_id: subId,
             supplier_id: supId,
@@ -4470,7 +4676,8 @@ const StockManagerApp = ({
         throw new Error("No items selected to transfer.");
       }
 
-      const targetLoc = location || (activeLocation !== 'All' ? activeLocation : (displayLocations[0] || Location.LEADING_STORES));
+      const firstUnit = stock.find(s => itemIdsToTransfer.includes(s.id));
+      const targetLoc = firstUnit?.location || location || (activeLocation !== 'All' ? activeLocation : (displayLocations[0] || Location.LEADING_STORES));
       await bulkUpdateAssignments(itemIdsToTransfer, targetLoc, toTeam, selectedProfile.name);
       await refetchStock();
 
@@ -4702,14 +4909,14 @@ const StockManagerApp = ({
         acc[type.name] = {
             id: type.id,
             category: type.category,
-            price: type.price || 0,
+            purchase_price: getItemSupplierPurchasePrice(type),
             threshold: type.stock_threshold || 0,
             is_unique: type.is_unique || false,
             barcode: stock.find(s => s.name === type.name)?.barcode,
         };
         return acc;
     }, {});
-  }, [itemTypes, stock]);
+  }, [itemTypes, stock, getItemSupplierPurchasePrice]);
 
   const { totalInventoryValue, companyInventoryValue } = useMemo(() => {
     if (!currentStock || !isAdminProfile) return { totalInventoryValue: 0, companyInventoryValue: 0 };
@@ -4717,7 +4924,8 @@ const StockManagerApp = ({
     let companyVal = 0;
     for (const item of currentStock) {
         const details = itemTypeDetailsMap[item.name];
-        const price = item.purchase_price != null ? item.purchase_price : (details ? details.price : 0);
+        // Supplier purchase price is canonical source of truth for stock cost tallying
+        const price = getItemSupplierPurchasePrice(item) || (details ? details.purchase_price : 0) || (item.purchase_price != null ? item.purchase_price : 0);
         const p = parseFloat(price) || 0;
         companyVal += p;
         if (dashboardFilters.location === 'All' || item.location === dashboardFilters.location) {
@@ -4725,21 +4933,21 @@ const StockManagerApp = ({
         }
     }
     return { totalInventoryValue: locationVal, companyInventoryValue: companyVal };
-  }, [currentStock, itemTypeDetailsMap, isAdminProfile, dashboardFilters.location]);
+  }, [currentStock, itemTypeDetailsMap, isAdminProfile, dashboardFilters.location, getItemSupplierPurchasePrice]);
 
   const stockGroupValues = useMemo(() => {
     if (!isAdminProfile || !groupedStock || !itemTypeDetailsMap) return {};
     return Object.entries(groupedStock).reduce((acc, [name, items]) => {
         const details = itemTypeDetailsMap[name];
-        // For groups, since items might have different historical prices, we need to sum them individually
+        // Supplier purchase price is canonical source of truth for stock cost tallying
         const groupTotal = items.reduce((sum, item) => {
-             const p = item.purchase_price != null ? item.purchase_price : (details ? details.price : 0);
-             return sum + parseFloat(p);
+             const price = getItemSupplierPurchasePrice(item) || (details ? details.purchase_price : 0) || (item.purchase_price != null ? item.purchase_price : 0);
+             return sum + (parseFloat(price) || 0);
         }, 0);
         acc[name] = groupTotal;
         return acc;
     }, {});
-  }, [groupedStock, itemTypeDetailsMap, isAdminProfile]);
+  }, [groupedStock, itemTypeDetailsMap, isAdminProfile, getItemSupplierPurchasePrice]);
 
   const getStockLevelIndicator = useCallback((itemCount, threshold) => {
       if (!threshold || threshold <= 0) {
@@ -4840,6 +5048,8 @@ const StockManagerApp = ({
         part_number: partData.part_number.trim(),
         barcode: partData.barcode?.trim() || null,
         purchase_price: parseFloat(partData.purchase_price) || 0,
+        pack_quantity: parseInt(partData.pack_quantity, 10) > 0 ? parseInt(partData.pack_quantity, 10) : (partData.send_in_packs ? 10 : 1),
+        send_in_packs: Boolean(partData.send_in_packs),
         lead_time_days: parseInt(partData.lead_time_days, 10) || 0,
         notes: partData.notes?.trim() || null
       };
@@ -4852,7 +5062,7 @@ const StockManagerApp = ({
           item_types: itemTypeObj ? { id: itemTypeObj.id, name: itemTypeObj.name, category: itemTypeObj.category } : null
         });
         await fetchSupplierPartNumbers();
-        setNewPartNumberInfo({ supplier_id: '', supplier_name: '', part_number: '', barcode: '', purchase_price: '', lead_time_days: '', notes: '' });
+        setNewPartNumberInfo({ supplier_id: '', supplier_name: '', part_number: '', barcode: '', purchase_price: '', pack_quantity: '10', send_in_packs: false, lead_time_days: '', notes: '' });
         setSuccessMessage(`Supplier part number "${payload.part_number}" saved successfully.`);
         setTimeout(() => setSuccessMessage(null), 3500);
         return created;
@@ -4862,15 +5072,26 @@ const StockManagerApp = ({
       const user = session?.user;
       payload.user_id = user?.id || null;
 
-      const { data, error } = await supabase
+      let { data, error } = await supabase
         .from('item_supplier_part_numbers')
         .insert([payload])
         .select('*, suppliers(id, name), item_types(id, name, category)');
 
+      if (error && (error.code === '42703' || error.message?.includes('pack_quantity') || error.message?.includes('send_in_packs'))) {
+        delete payload.pack_quantity;
+        delete payload.send_in_packs;
+        const retry = await supabase
+          .from('item_supplier_part_numbers')
+          .insert([payload])
+          .select('*, suppliers(id, name), item_types(id, name, category)');
+        data = retry.data;
+        error = retry.error;
+      }
+
       if (error) throw error;
 
       await fetchSupplierPartNumbers();
-      setNewPartNumberInfo({ supplier_id: '', supplier_name: '', part_number: '', barcode: '', purchase_price: '', lead_time_days: '', notes: '' });
+      setNewPartNumberInfo({ supplier_id: '', supplier_name: '', part_number: '', barcode: '', purchase_price: '', pack_quantity: '10', send_in_packs: false, lead_time_days: '', notes: '' });
       setSuccessMessage(`Supplier part number "${payload.part_number}" saved successfully.`);
       setTimeout(() => setSuccessMessage(null), 3500);
       return data?.[0];
@@ -4898,6 +5119,8 @@ const StockManagerApp = ({
         part_number: partData.part_number.trim(),
         barcode: partData.barcode?.trim() || null,
         purchase_price: parseFloat(partData.purchase_price) || 0,
+        pack_quantity: parseInt(partData.pack_quantity, 10) > 0 ? parseInt(partData.pack_quantity, 10) : (partData.send_in_packs ? 10 : 1),
+        send_in_packs: Boolean(partData.send_in_packs),
         lead_time_days: parseInt(partData.lead_time_days, 10) || 0,
         notes: partData.notes?.trim() || null,
         updated_at: new Date().toISOString()
@@ -4912,10 +5135,20 @@ const StockManagerApp = ({
         return;
       }
 
-      const { error } = await supabase
+      let { error } = await supabase
         .from('item_supplier_part_numbers')
         .update(payload)
         .eq('id', partId);
+
+      if (error && (error.code === '42703' || error.message?.includes('pack_quantity') || error.message?.includes('send_in_packs'))) {
+        delete payload.pack_quantity;
+        delete payload.send_in_packs;
+        const retry = await supabase
+          .from('item_supplier_part_numbers')
+          .update(payload)
+          .eq('id', partId);
+        error = retry.error;
+      }
 
       if (error) throw error;
 
@@ -5003,6 +5236,91 @@ const StockManagerApp = ({
 
   const selectedScannedItemType = useMemo(() => itemTypes.find(it => it.name === newScannedItemDetails.name), [newScannedItemDetails.name, itemTypes]);
   const isMeterType = selectedScannedItemType?.category === StockCategory.METERS;
+
+  // Scanner gun listener when Add Quantity or Add Scanned Item modal is active
+  useEffect(() => {
+    if (!isAddQuantityModalOpen && !isAddScannedItemModalOpen) return;
+
+    let buffer = '';
+    let timeout = null;
+
+    const handleModalScanKeyDown = (e) => {
+      // Don't intercept tab, escape, or navigation shortcuts
+      if (e.key === 'Tab' || e.key === 'Escape') return;
+
+      if (timeout) clearTimeout(timeout);
+
+      if (e.key === 'Enter') {
+        const scannedCode = buffer.trim();
+        buffer = '';
+        if (scannedCode.length >= 2) {
+          const lowerScanned = scannedCode.toLowerCase();
+          const strippedScanned = lowerScanned.replace(/[\s\-_]/g, '');
+
+          if (isAddQuantityModalOpen && itemForQuantityAdd) {
+            const packInfo = getItemPackInfo(itemForQuantityAdd.barcode, itemForQuantityAdd);
+            const itemBarcode = String(itemForQuantityAdd.barcode || '').trim().toLowerCase();
+            const strippedBarcode = itemBarcode.replace(/[\s\-_]/g, '');
+            const itemPart = String(packInfo.partNumber || '').trim().toLowerCase();
+            const strippedPart = itemPart.replace(/[\s\-_]/g, '');
+
+            const isMatch = lowerScanned === itemBarcode || 
+                            strippedScanned === strippedBarcode || 
+                            (itemPart && (lowerScanned === itemPart || strippedScanned === strippedPart));
+
+            if (isMatch) {
+              e.preventDefault();
+              e.stopPropagation();
+              playBeep('success');
+              const increment = (packInfo.isPack && packInfo.packQuantity > 0) ? packInfo.packQuantity : 1;
+              setQuantityToAdd(prev => {
+                const current = parseInt(prev, 10) || 0;
+                const next = current + increment;
+                const nextPacks = packInfo.isPack ? Math.floor(next / packInfo.packQuantity) : next;
+                addToast(`+1 ${packInfo.isPack ? `Pack (${packInfo.packQuantity} units)` : 'Unit'} scanned (${nextPacks} ${packInfo.isPack ? 'Packs' : 'Units'} total)`, 'success', scannedCode);
+                return String(next);
+              });
+              return;
+            }
+          } else if (isAddScannedItemModalOpen && newScannedItemDetails) {
+            const packInfo = getItemPackInfo(newScannedItemDetails.barcode, selectedScannedItemType || newScannedItemDetails.name);
+            const itemBarcode = String(newScannedItemDetails.barcode || '').trim().toLowerCase();
+            const strippedBarcode = itemBarcode.replace(/[\s\-_]/g, '');
+            const itemPart = String(packInfo.partNumber || '').trim().toLowerCase();
+            const strippedPart = itemPart.replace(/[\s\-_]/g, '');
+
+            const isMatch = lowerScanned === itemBarcode || 
+                            strippedScanned === strippedBarcode || 
+                            (itemPart && (lowerScanned === itemPart || strippedScanned === strippedPart));
+
+            if (isMatch) {
+              e.preventDefault();
+              e.stopPropagation();
+              playBeep('success');
+              const increment = (packInfo.isPack && packInfo.packQuantity > 0) ? packInfo.packQuantity : 1;
+              setNewScannedItemDetails(prev => {
+                const current = parseInt(prev.quantity, 10) || 0;
+                const next = current + increment;
+                const nextPacks = packInfo.isPack ? Math.floor(next / packInfo.packQuantity) : next;
+                addToast(`+1 ${packInfo.isPack ? `Pack (${packInfo.packQuantity} units)` : 'Unit'} scanned (${nextPacks} ${packInfo.isPack ? 'Packs' : 'Units'} total)`, 'success', scannedCode);
+                return { ...prev, quantity: String(next) };
+              });
+              return;
+            }
+          }
+        }
+      } else if (e.key && e.key.length === 1) {
+        buffer += e.key;
+        timeout = setTimeout(() => { buffer = ''; }, 400);
+      }
+    };
+
+    window.addEventListener('keydown', handleModalScanKeyDown, true);
+    return () => {
+      if (timeout) clearTimeout(timeout);
+      window.removeEventListener('keydown', handleModalScanKeyDown, true);
+    };
+  }, [isAddQuantityModalOpen, isAddScannedItemModalOpen, itemForQuantityAdd, newScannedItemDetails, selectedScannedItemType, getItemPackInfo, playBeep, addToast]);
 
   // Filter Subcategories based on selected category in forms
   const getFilteredSubcategories = (categoryName) => {
@@ -5130,7 +5448,7 @@ const StockManagerApp = ({
                   </button>
               </div>
               <div className="mt-2 text-center">
-                  <span className="text-[10px] font-medium text-zinc-400 dark:text-zinc-500 tracking-wider">V0.14</span>
+                  <span className="text-[10px] font-medium text-zinc-400 dark:text-zinc-500 tracking-wider">V0.15</span>
               </div>
           </div>
         </aside>
@@ -5407,41 +5725,119 @@ const StockManagerApp = ({
                                     </div>
                                     <div className="flex items-center gap-2 shrink-0">
                                       {!item.isUnique ? (
-                                        <div className="flex items-center gap-1 bg-zinc-800 px-1 py-0.5 rounded-lg border border-zinc-700">
-                                          <button
-                                            type="button"
-                                            tabIndex={-1}
-                                            onMouseDown={(e) => e.preventDefault()}
-                                            onClick={(e) => {
-                                              e.preventDefault();
-                                              e.stopPropagation();
-                                              handleUpdateStagedReturnQuantity(item.id, -1);
-                                            }}
-                                            disabled={item.quantity <= 1}
-                                            className="w-7 h-7 sm:w-6 sm:h-6 flex items-center justify-center text-zinc-300 hover:text-white rounded bg-zinc-700/60 hover:bg-zinc-700 active:scale-95 disabled:opacity-30 disabled:pointer-events-none transition-all text-sm font-bold touch-manipulation select-none"
-                                            title="Decrease quantity"
-                                          >
-                                            -
-                                          </button>
-                                          <span className="font-mono font-bold px-1.5 text-zinc-100 min-w-[20px] text-center select-none">
-                                            {item.quantity}{item.availableCount ? `/${item.availableCount}` : ''}
-                                          </span>
-                                          <button
-                                            type="button"
-                                            tabIndex={-1}
-                                            onMouseDown={(e) => e.preventDefault()}
-                                            onClick={(e) => {
-                                              e.preventDefault();
-                                              e.stopPropagation();
-                                              handleUpdateStagedReturnQuantity(item.id, 1);
-                                            }}
-                                            disabled={typeof item.availableCount === 'number' && item.quantity >= item.availableCount}
-                                            className="w-7 h-7 sm:w-6 sm:h-6 flex items-center justify-center text-zinc-300 hover:text-white rounded bg-zinc-700/60 hover:bg-zinc-700 active:scale-95 disabled:opacity-30 disabled:pointer-events-none transition-all text-sm font-bold touch-manipulation select-none"
-                                            title={typeof item.availableCount === 'number' && item.quantity >= item.availableCount ? `Max quantity (${item.availableCount}) reached` : 'Increase quantity'}
-                                          >
-                                            +
-                                          </button>
-                                        </div>
+                                        item.isPack && item.packQuantity > 1 ? (
+                                          <div className="flex flex-col items-end gap-1">
+                                            {/* Pack Stepper for Return */}
+                                            <div className="flex items-center gap-1 bg-purple-950/70 px-1 py-0.5 rounded-lg border border-purple-800/80">
+                                              <button
+                                                type="button"
+                                                tabIndex={-1}
+                                                onMouseDown={(e) => e.preventDefault()}
+                                                onClick={(e) => {
+                                                  e.preventDefault();
+                                                  e.stopPropagation();
+                                                  handleUpdateStagedReturnQuantity(item.id, -item.packQuantity);
+                                                }}
+                                                disabled={item.quantity <= item.packQuantity}
+                                                className="px-1.5 py-0.5 flex items-center justify-center text-purple-300 hover:text-white rounded bg-purple-900/60 hover:bg-purple-800 active:scale-95 disabled:opacity-30 disabled:pointer-events-none transition-all text-xs font-bold touch-manipulation select-none"
+                                                title={`Decrease by 1 pack (${item.packQuantity} units)`}
+                                              >
+                                                -1 Pk
+                                              </button>
+                                              <span className="font-mono font-bold px-1.5 text-purple-100 min-w-[20px] text-center select-none text-xs">
+                                                {Math.floor(item.quantity / item.packQuantity)} {Math.floor(item.quantity / item.packQuantity) === 1 ? 'Pk' : 'Pks'}
+                                              </span>
+                                              <button
+                                                type="button"
+                                                tabIndex={-1}
+                                                onMouseDown={(e) => e.preventDefault()}
+                                                onClick={(e) => {
+                                                  e.preventDefault();
+                                                  e.stopPropagation();
+                                                  handleUpdateStagedReturnQuantity(item.id, item.packQuantity);
+                                                }}
+                                                disabled={typeof item.availableCount === 'number' && item.quantity + item.packQuantity > item.availableCount}
+                                                className="px-1.5 py-0.5 flex items-center justify-center text-purple-300 hover:text-white rounded bg-purple-900/60 hover:bg-purple-800 active:scale-95 disabled:opacity-30 disabled:pointer-events-none transition-all text-xs font-bold touch-manipulation select-none"
+                                                title={`Increase by 1 pack (${item.packQuantity} units)`}
+                                              >
+                                                +1 Pk
+                                              </button>
+                                            </div>
+
+                                            {/* Loose Item Stepper for Return */}
+                                            <div className="flex items-center gap-1 bg-zinc-800 px-1 py-0.5 rounded-lg border border-zinc-700">
+                                              <button
+                                                type="button"
+                                                tabIndex={-1}
+                                                onMouseDown={(e) => e.preventDefault()}
+                                                onClick={(e) => {
+                                                  e.preventDefault();
+                                                  e.stopPropagation();
+                                                  handleUpdateStagedReturnQuantity(item.id, -1);
+                                                }}
+                                                disabled={item.quantity <= 1}
+                                                className="w-6 h-6 flex items-center justify-center text-zinc-300 hover:text-white rounded bg-zinc-700/60 hover:bg-zinc-700 active:scale-95 disabled:opacity-30 disabled:pointer-events-none transition-all text-xs font-bold touch-manipulation select-none"
+                                                title="Decrease by 1 loose unit"
+                                              >
+                                                -1
+                                              </button>
+                                              <span className="font-mono font-bold px-1.5 text-zinc-100 text-xs min-w-[20px] text-center select-none">
+                                                {item.quantity}{item.availableCount ? `/${item.availableCount}` : ''}
+                                              </span>
+                                              <button
+                                                type="button"
+                                                tabIndex={-1}
+                                                onMouseDown={(e) => e.preventDefault()}
+                                                onClick={(e) => {
+                                                  e.preventDefault();
+                                                  e.stopPropagation();
+                                                  handleUpdateStagedReturnQuantity(item.id, 1);
+                                                }}
+                                                disabled={typeof item.availableCount === 'number' && item.quantity >= item.availableCount}
+                                                className="w-6 h-6 flex items-center justify-center text-zinc-300 hover:text-white rounded bg-zinc-700/60 hover:bg-zinc-700 active:scale-95 disabled:opacity-30 disabled:pointer-events-none transition-all text-xs font-bold touch-manipulation select-none"
+                                                title={typeof item.availableCount === 'number' && item.quantity >= item.availableCount ? `Max quantity (${item.availableCount}) reached` : 'Increase by 1 loose unit'}
+                                              >
+                                                +1
+                                              </button>
+                                            </div>
+                                          </div>
+                                        ) : (
+                                          <div className="flex items-center gap-1 bg-zinc-800 px-1 py-0.5 rounded-lg border border-zinc-700">
+                                            <button
+                                              type="button"
+                                              tabIndex={-1}
+                                              onMouseDown={(e) => e.preventDefault()}
+                                              onClick={(e) => {
+                                                e.preventDefault();
+                                                e.stopPropagation();
+                                                handleUpdateStagedReturnQuantity(item.id, -1);
+                                              }}
+                                              disabled={item.quantity <= 1}
+                                              className="w-7 h-7 sm:w-6 sm:h-6 flex items-center justify-center text-zinc-300 hover:text-white rounded bg-zinc-700/60 hover:bg-zinc-700 active:scale-95 disabled:opacity-30 disabled:pointer-events-none transition-all text-sm font-bold touch-manipulation select-none"
+                                              title="Decrease quantity"
+                                            >
+                                              -
+                                            </button>
+                                            <span className="font-mono font-bold px-1.5 text-zinc-100 min-w-[20px] text-center select-none">
+                                              {item.quantity}{item.availableCount ? `/${item.availableCount}` : ''}
+                                            </span>
+                                            <button
+                                              type="button"
+                                              tabIndex={-1}
+                                              onMouseDown={(e) => e.preventDefault()}
+                                              onClick={(e) => {
+                                                e.preventDefault();
+                                                e.stopPropagation();
+                                                handleUpdateStagedReturnQuantity(item.id, 1);
+                                              }}
+                                              disabled={typeof item.availableCount === 'number' && item.quantity >= item.availableCount}
+                                              className="w-7 h-7 sm:w-6 sm:h-6 flex items-center justify-center text-zinc-300 hover:text-white rounded bg-zinc-700/60 hover:bg-zinc-700 active:scale-95 disabled:opacity-30 disabled:pointer-events-none transition-all text-sm font-bold touch-manipulation select-none"
+                                              title={typeof item.availableCount === 'number' && item.quantity >= item.availableCount ? `Max quantity (${item.availableCount}) reached` : 'Increase quantity'}
+                                            >
+                                              +
+                                            </button>
+                                          </div>
+                                        )
                                       ) : (
                                         <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-zinc-800 text-zinc-300 border border-zinc-700">
                                           Unique
@@ -5524,37 +5920,111 @@ const StockManagerApp = ({
                                     </div>
                                     <div className="flex items-center gap-2 shrink-0">
                                       {!item.isUnique ? (
-                                        <div className="flex items-center gap-1 bg-zinc-800 px-1 py-0.5 rounded-lg border border-zinc-700">
-                                          <button
-                                            type="button"
-                                            tabIndex={-1}
-                                            onMouseDown={(e) => e.preventDefault()}
-                                            onClick={(e) => {
-                                              e.preventDefault();
-                                              e.stopPropagation();
-                                              handleUpdateStagedQuantity(item.id, -1);
-                                            }}
-                                            className="w-7 h-7 sm:w-6 sm:h-6 flex items-center justify-center text-zinc-300 hover:text-white rounded bg-zinc-700/60 hover:bg-zinc-700 active:scale-95 transition-all text-sm font-bold touch-manipulation select-none"
-                                            title="Decrease quantity"
-                                          >
-                                            -
-                                          </button>
-                                          <span className="font-mono font-bold px-1.5 text-zinc-100 min-w-[20px] text-center select-none">{item.quantity}</span>
-                                          <button
-                                            type="button"
-                                            tabIndex={-1}
-                                            onMouseDown={(e) => e.preventDefault()}
-                                            onClick={(e) => {
-                                              e.preventDefault();
-                                              e.stopPropagation();
-                                              handleUpdateStagedQuantity(item.id, 1);
-                                            }}
-                                            className="w-7 h-7 sm:w-6 sm:h-6 flex items-center justify-center text-zinc-300 hover:text-white rounded bg-zinc-700/60 hover:bg-zinc-700 active:scale-95 transition-all text-sm font-bold touch-manipulation select-none"
-                                            title="Increase quantity"
-                                          >
-                                            +
-                                          </button>
-                                        </div>
+                                        item.isPack && item.packQuantity > 1 ? (
+                                          <div className="flex flex-col items-end gap-1">
+                                            {/* Pack Stepper */}
+                                            <div className="flex items-center gap-1 bg-blue-950/70 px-1 py-0.5 rounded-lg border border-blue-800/80">
+                                              <button
+                                                type="button"
+                                                tabIndex={-1}
+                                                onMouseDown={(e) => e.preventDefault()}
+                                                onClick={(e) => {
+                                                  e.preventDefault();
+                                                  e.stopPropagation();
+                                                  handleUpdateStagedQuantity(item.id, -item.packQuantity);
+                                                }}
+                                                className="px-1.5 py-0.5 flex items-center justify-center text-blue-300 hover:text-white rounded bg-blue-900/60 hover:bg-blue-800 active:scale-95 transition-all text-xs font-bold touch-manipulation select-none"
+                                                title={`Decrease by 1 pack (${item.packQuantity} units)`}
+                                              >
+                                                -1 Pk
+                                              </button>
+                                              <span className="font-mono font-bold px-1.5 text-blue-100 min-w-[20px] text-center select-none text-xs">
+                                                {Math.floor(item.quantity / item.packQuantity)} {Math.floor(item.quantity / item.packQuantity) === 1 ? 'Pk' : 'Pks'}
+                                              </span>
+                                              <button
+                                                type="button"
+                                                tabIndex={-1}
+                                                onMouseDown={(e) => e.preventDefault()}
+                                                onClick={(e) => {
+                                                  e.preventDefault();
+                                                  e.stopPropagation();
+                                                  handleUpdateStagedQuantity(item.id, item.packQuantity);
+                                                }}
+                                                className="px-1.5 py-0.5 flex items-center justify-center text-blue-300 hover:text-white rounded bg-blue-900/60 hover:bg-blue-800 active:scale-95 transition-all text-xs font-bold touch-manipulation select-none"
+                                                title={`Increase by 1 pack (${item.packQuantity} units)`}
+                                              >
+                                                +1 Pk
+                                              </button>
+                                            </div>
+
+                                            {/* Loose Item Stepper */}
+                                            <div className="flex items-center gap-1 bg-zinc-800 px-1 py-0.5 rounded-lg border border-zinc-700">
+                                              <button
+                                                type="button"
+                                                tabIndex={-1}
+                                                onMouseDown={(e) => e.preventDefault()}
+                                                onClick={(e) => {
+                                                  e.preventDefault();
+                                                  e.stopPropagation();
+                                                  handleUpdateStagedQuantity(item.id, -1);
+                                                }}
+                                                className="w-6 h-6 flex items-center justify-center text-zinc-300 hover:text-white rounded bg-zinc-700/60 hover:bg-zinc-700 active:scale-95 transition-all text-xs font-bold touch-manipulation select-none"
+                                                title="Decrease by 1 loose unit"
+                                              >
+                                                -1
+                                              </button>
+                                              <span className="font-mono font-semibold px-1 text-zinc-300 text-[11px] min-w-[40px] text-center select-none">
+                                                {item.quantity} total
+                                              </span>
+                                              <button
+                                                type="button"
+                                                tabIndex={-1}
+                                                onMouseDown={(e) => e.preventDefault()}
+                                                onClick={(e) => {
+                                                  e.preventDefault();
+                                                  e.stopPropagation();
+                                                  handleUpdateStagedQuantity(item.id, 1);
+                                                }}
+                                                className="w-6 h-6 flex items-center justify-center text-zinc-300 hover:text-white rounded bg-zinc-700/60 hover:bg-zinc-700 active:scale-95 transition-all text-xs font-bold touch-manipulation select-none"
+                                                title="Increase by 1 loose unit"
+                                              >
+                                                +1
+                                              </button>
+                                            </div>
+                                          </div>
+                                        ) : (
+                                          <div className="flex items-center gap-1 bg-zinc-800 px-1 py-0.5 rounded-lg border border-zinc-700">
+                                            <button
+                                              type="button"
+                                              tabIndex={-1}
+                                              onMouseDown={(e) => e.preventDefault()}
+                                              onClick={(e) => {
+                                                e.preventDefault();
+                                                e.stopPropagation();
+                                                handleUpdateStagedQuantity(item.id, -1);
+                                              }}
+                                              className="w-7 h-7 sm:w-6 sm:h-6 flex items-center justify-center text-zinc-300 hover:text-white rounded bg-zinc-700/60 hover:bg-zinc-700 active:scale-95 transition-all text-sm font-bold touch-manipulation select-none"
+                                              title="Decrease quantity"
+                                            >
+                                              -
+                                            </button>
+                                            <span className="font-mono font-bold px-1.5 text-zinc-100 min-w-[20px] text-center select-none">{item.quantity}</span>
+                                            <button
+                                              type="button"
+                                              tabIndex={-1}
+                                              onMouseDown={(e) => e.preventDefault()}
+                                              onClick={(e) => {
+                                                e.preventDefault();
+                                                e.stopPropagation();
+                                                handleUpdateStagedQuantity(item.id, 1);
+                                              }}
+                                              className="w-7 h-7 sm:w-6 sm:h-6 flex items-center justify-center text-zinc-300 hover:text-white rounded bg-zinc-700/60 hover:bg-zinc-700 active:scale-95 transition-all text-sm font-bold touch-manipulation select-none"
+                                              title="Increase quantity"
+                                            >
+                                              +
+                                            </button>
+                                          </div>
+                                        )
                                       ) : (
                                         <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-zinc-800 text-zinc-300 border border-zinc-700">
                                           Unique
@@ -5767,7 +6237,18 @@ const StockManagerApp = ({
 
                                         return (
                                         <div key={name} className="bg-white dark:bg-zinc-800 rounded-lg shadow-sm border border-zinc-200 dark:border-zinc-700 overflow-hidden">
-                                            <button onClick={() => setExpandedGroup(expandedGroup === name ? null : name)} className="w-full flex justify-between items-center p-4 text-left hover:bg-zinc-50 dark:hover:bg-zinc-700/50 transition-colors">
+                                            <div
+                                                role="button"
+                                                tabIndex={0}
+                                                onClick={() => setExpandedGroup(expandedGroup === name ? null : name)}
+                                                onKeyDown={(e) => {
+                                                  if (e.key === 'Enter' || e.key === ' ') {
+                                                    e.preventDefault();
+                                                    setExpandedGroup(expandedGroup === name ? null : name);
+                                                  }
+                                                }}
+                                                className="w-full flex justify-between items-center p-4 text-left hover:bg-zinc-50 dark:hover:bg-zinc-700/50 transition-colors cursor-pointer select-none"
+                                            >
                                                 <div className="flex items-center min-w-0 flex-1 mr-3">
                                                     {indicator && (
                                                       <span 
@@ -5869,7 +6350,7 @@ const StockManagerApp = ({
                                                   </button>
                                                   <ChevronDownIcon className={`w-5 h-5 text-zinc-400 transition-transform flex-shrink-0 ${expandedGroup === name ? 'rotate-180' : ''}`} />
                                                 </div>
-                                            </button>
+                                            </div>
                                             {expandedGroup === name && (
                                                 <div className="bg-zinc-50 dark:bg-zinc-900/50 border-t border-zinc-200 dark:border-zinc-700">
                                                     <div className="overflow-x-auto">
@@ -6625,9 +7106,14 @@ const StockManagerApp = ({
                                                                      {type.is_unique && <span className="text-xs font-medium bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-300 px-2 py-0.5 rounded-full">Unique</span>}
                                                                      {type.suppliers?.name && <span className="text-xs font-medium bg-cyan-100 text-cyan-800 dark:bg-cyan-900 dark:text-cyan-300 px-2 py-0.5 rounded-full">{type.suppliers.name}</span>}
                                                                    </div>
-                                                                   <span className="block text-xs text-zinc-500 dark:text-zinc-400 mt-1">
-                                                                       Price: £{Number(type.price || 0).toFixed(2)} &bull; Threshold: {type.stock_threshold || 0}
-                                                                   </span>
+                                                                   {(() => {
+                                                                       const suppPrice = getItemSupplierPurchasePrice(type);
+                                                                       return (
+                                                                           <span className="block text-xs text-zinc-500 dark:text-zinc-400 mt-1">
+                                                                               Supplier Purchase Price: {suppPrice > 0 ? `£${suppPrice.toFixed(2)}` : 'Not configured'} &bull; Threshold: {type.stock_threshold || 0}
+                                                                           </span>
+                                                                       );
+                                                                   })()}
                                                                    <div className="flex items-center gap-1.5 mt-2 flex-wrap">
                                                                        <span className="text-xs text-zinc-500 dark:text-zinc-400 flex items-center gap-1 font-medium">
                                                                            <BarcodeIcon className="w-3.5 h-3.5 text-zinc-400 dark:text-zinc-500" />
@@ -6678,6 +7164,11 @@ const StockManagerApp = ({
                                                                                    >
                                                                                        <span className="font-sans font-semibold text-[10px] text-zinc-500 dark:text-zinc-400">{sp.suppliers?.name || sp.supplier_name || 'Part'}:</span>
                                                                                        <span>{sp.part_number}</span>
+                                                                                       {sp.send_in_packs && (
+                                                                                           <span className="font-sans font-bold text-[9px] px-1 py-0.2 rounded bg-blue-100 text-blue-800 dark:bg-blue-900/60 dark:text-blue-200">
+                                                                                               Pack {sp.pack_quantity || 1}
+                                                                                           </span>
+                                                                                       )}
                                                                                    </span>
                                                                                );
                                                                            })
@@ -6950,6 +7441,7 @@ const StockManagerApp = ({
                           setSuccessMessage={setSuccessMessage}
                           itemTypes={itemTypes}
                           suppliers={suppliers}
+                          supplierPartNumbers={supplierPartNumbers}
                           refetchStock={refetchStock}
                           navigateTo={navigateTo}
                           groupedItemTypes={groupedItemTypes}
@@ -7193,53 +7685,284 @@ const StockManagerApp = ({
 
       
 
-      <Modal isOpen={isReturnQuantityModalOpen} onClose={() => { setIsReturnQuantityModalOpen(false); setItemForQuantityReturn(null); setQuantityToReturn(''); handleSetView(View.SCAN); }} title="Return Quantity">
-        {itemForQuantityReturn && itemForQuantityReturn.length > 0 && (
-          <form onSubmit={async (e) => {
-              e.preventDefault();
-              const numToReturn = parseInt(quantityToReturn, 10);
-              if (isNaN(numToReturn) || numToReturn <= 0) {
-                  setError("Please enter a valid quantity.");
-                  return;
-              }
-              if (numToReturn > itemForQuantityReturn.length) {
-                  setError(`Cannot return more than ${itemForQuantityReturn.length} items.`);
-                  return;
-              }
-              try {
-                  const targetReturnLoc = returnContext.location || (activeLocation !== 'All' ? activeLocation : (displayLocations[0] || Location.LEADING_STORES));
-                  const itemsToUpdate = itemForQuantityReturn.slice(0, numToReturn).map(i => i.id);
-                  if (itemsToUpdate.length === 1) {
-                      await updateStockItemAssignment(itemsToUpdate[0], targetReturnLoc, Team.UNASSIGNED, selectedProfile.name);
-                  } else {
-                      await bulkUpdateAssignments(itemsToUpdate, targetReturnLoc, Team.UNASSIGNED, selectedProfile.name);
-                  }
-                  await refetchStock();
-                  addToast(`Returned ${numToReturn} x ${itemForQuantityReturn[0].name} to ${targetReturnLoc}`, 'success');
-                  setIsReturnQuantityModalOpen(false);
-                  setItemForQuantityReturn(null);
-                  setQuantityToReturn('');
-                  handleSetView(View.SCAN);
-              } catch (err) {
-                  setError(err.message);
-              }
-          }} className="space-y-4">
-              <p className="text-sm text-zinc-600 dark:text-zinc-300">
-                  Item: <span className="font-semibold">{itemForQuantityReturn[0].name}</span>
-              </p>
-              <p className="text-sm text-zinc-600 dark:text-zinc-300">
-                  Currently assigned to {returnContext.team} in last 24h: <span className="font-semibold">{itemForQuantityReturn.length}</span>
-              </p>
-              <div>
-                  <label htmlFor="return-qty" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Quantity to Return</label>
-                  <input type="number" id="return-qty" min="1" max={itemForQuantityReturn.length} value={quantityToReturn} onChange={(e) => setQuantityToReturn(e.target.value)} className={formInputStyle} placeholder="Enter quantity" required autoFocus />
-              </div>
-              <div className="flex justify-end space-x-3 pt-6">
-                  <button type="button" onClick={() => { setIsReturnQuantityModalOpen(false); setItemForQuantityReturn(null); setQuantityToReturn(''); handleSetView(View.SCAN); }} className="px-4 py-2 bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-600 text-zinc-800 dark:text-zinc-200 rounded-md hover:bg-zinc-50 dark:hover:bg-zinc-600 transition-colors text-sm font-medium">Cancel</button>
-                  <button type="submit" className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors text-sm font-medium focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 dark:focus:ring-offset-zinc-800">Return Items</button>
-              </div>
-          </form>
-        )}
+      <Modal isOpen={isReturnQuantityModalOpen} onClose={() => { setIsReturnQuantityModalOpen(false); setItemForQuantityReturn(null); setQuantityToReturn(''); handleSetView(View.SCAN); }} title="Return Items to Stock">
+        {itemForQuantityReturn && itemForQuantityReturn.length > 0 && (() => {
+          const maxReturn = itemForQuantityReturn.length;
+          const packInfo = getItemPackInfo(itemForQuantityReturn[0]?.barcode, itemForQuantityReturn[0]);
+          const currentVal = parseInt(quantityToReturn, 10) || 0;
+          const isPackItem = packInfo.isPack && packInfo.packQuantity > 0;
+          const currentPacks = isPackItem ? Math.floor(currentVal / packInfo.packQuantity) : 0;
+          const remainderUnits = isPackItem ? (currentVal % packInfo.packQuantity) : 0;
+          const maxPacks = isPackItem ? Math.floor(maxReturn / packInfo.packQuantity) : 0;
+
+          const handleAdjustUnits = (delta) => {
+            const next = Math.max(1, Math.min(maxReturn, (currentVal || 0) + delta));
+            setQuantityToReturn(String(next));
+          };
+
+          const handleAdjustPacks = (delta) => {
+            if (!isPackItem) return;
+            const targetPacks = Math.max(0, currentPacks + delta);
+            const targetUnits = Math.min(maxReturn, (targetPacks * packInfo.packQuantity) + remainderUnits);
+            setQuantityToReturn(String(Math.max(1, targetUnits)));
+          };
+
+          return (
+            <form onSubmit={async (e) => {
+                e.preventDefault();
+                const numToReturn = parseInt(quantityToReturn, 10);
+                if (isNaN(numToReturn) || numToReturn <= 0) {
+                    setError("Please enter a valid quantity.");
+                    return;
+                }
+                if (numToReturn > maxReturn) {
+                    setError(`Cannot return more than ${maxReturn} items.`);
+                    return;
+                }
+                try {
+                    const targetReturnLoc = returnContext.location || (activeLocation !== 'All' ? activeLocation : (displayLocations[0] || Location.LEADING_STORES));
+                    const itemsToUpdate = itemForQuantityReturn.slice(0, numToReturn).map(i => i.id);
+                    if (itemsToUpdate.length === 1) {
+                        await updateStockItemAssignment(itemsToUpdate[0], targetReturnLoc, Team.UNASSIGNED, selectedProfile.name);
+                    } else {
+                        await bulkUpdateAssignments(itemsToUpdate, targetReturnLoc, Team.UNASSIGNED, selectedProfile.name);
+                    }
+                    await refetchStock();
+                    addToast(`Returned ${numToReturn} x ${itemForQuantityReturn[0].name} to ${targetReturnLoc}`, 'success');
+                    setIsReturnQuantityModalOpen(false);
+                    setItemForQuantityReturn(null);
+                    setQuantityToReturn('');
+                    handleSetView(View.SCAN);
+                } catch (err) {
+                    setError(err.message);
+                }
+            }} className="space-y-4">
+                <div className="p-3 bg-purple-50 dark:bg-purple-950/40 border border-purple-200 dark:border-purple-800 rounded-md text-xs text-purple-900 dark:text-purple-200 flex items-center gap-2">
+                    <BuildingStoreIcon className="w-4 h-4 flex-shrink-0 text-purple-600" />
+                    <span>Returning from <strong>{returnContext.team}</strong> to <strong>{returnContext.location || (activeLocation !== 'All' ? activeLocation : (displayLocations[0] || Location.LEADING_STORES))}</strong></span>
+                </div>
+
+                <div>
+                    <h3 className="text-lg font-bold text-zinc-900 dark:text-zinc-100">{itemForQuantityReturn[0].name}</h3>
+                    <p className="text-xs font-mono text-zinc-500 dark:text-zinc-400 mt-0.5">
+                      Barcode / Part: {itemForQuantityReturn[0].barcode}
+                    </p>
+                    <p className="text-xs text-zinc-600 dark:text-zinc-300 mt-1">
+                      Currently assigned to {returnContext.team} in last 24h: <strong className="text-zinc-900 dark:text-white font-mono">{maxReturn} units</strong>
+                    </p>
+                </div>
+
+                {/* Pack Configuration & Presets Banner */}
+                {isPackItem && (
+                  <div className="p-3 bg-blue-50/80 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 rounded-lg space-y-2.5 text-xs text-blue-900 dark:text-blue-200">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className="text-xl flex-shrink-0">📦</span>
+                        <div>
+                          <div className="font-semibold flex items-center gap-1.5 flex-wrap">
+                            <span>Supplier Pack: <strong>{packInfo.packQuantity} units / pack</strong></span>
+                            {packInfo.partNumber && (
+                              <span className="font-mono text-[10px] bg-blue-100 dark:bg-blue-900/80 px-1.5 py-0.5 rounded text-blue-800 dark:text-blue-200">
+                                Part #{packInfo.partNumber}
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-[11px] text-blue-700 dark:text-blue-300">
+                            Return full packs or partial quantities of packs easily.
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Full Pack Stepper */}
+                      <div className="flex items-center gap-1 bg-white dark:bg-zinc-800 p-1 rounded-md border border-blue-200 dark:border-blue-700 shadow-2xs shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => handleAdjustPacks(-1)}
+                          disabled={currentVal <= packInfo.packQuantity && remainderUnits === 0}
+                          className="px-2 py-1 bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-700 dark:hover:bg-zinc-600 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-700 dark:text-zinc-200 rounded font-semibold text-xs transition-colors"
+                          title={`Decrease by 1 pack (-${packInfo.packQuantity} units)`}
+                        >
+                          -1 Pack
+                        </button>
+                        <span className="font-mono font-bold text-xs text-blue-600 dark:text-blue-400 px-1.5 min-w-[50px] text-center">
+                          {currentPacks} {currentPacks === 1 ? 'Pk' : 'Pks'}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => handleAdjustPacks(1)}
+                          disabled={currentVal + packInfo.packQuantity > maxReturn}
+                          className="px-2 py-1 bg-blue-600 hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded font-semibold text-xs transition-colors shadow-2xs"
+                          title={`Increase by 1 pack (+${packInfo.packQuantity} units)`}
+                        >
+                          +1 Pack
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Quick Pack Presets */}
+                    <div>
+                      <div className="text-[11px] font-medium text-zinc-600 dark:text-zinc-400 mb-1.5 flex items-center justify-between">
+                        <span>Quick Pack Presets:</span>
+                        {currentVal > 0 && (
+                          <span className="font-mono text-blue-700 dark:text-blue-300 font-semibold">
+                            = {currentPacks} Pack{currentPacks !== 1 ? 's' : ''}{remainderUnits > 0 ? ` + ${remainderUnits} loose` : ''} ({currentVal} total units)
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        {Array.from({ length: Math.min(6, maxPacks) }, (_, i) => i + 1).map(pNum => {
+                          const totalU = pNum * packInfo.packQuantity;
+                          const isSelected = currentVal === totalU;
+                          return (
+                            <button
+                              key={pNum}
+                              type="button"
+                              onClick={() => setQuantityToReturn(String(totalU))}
+                              className={`py-1 px-2.5 rounded-md font-medium text-xs transition-all border ${
+                                isSelected
+                                  ? 'bg-blue-600 border-blue-600 text-white shadow-xs font-bold ring-2 ring-blue-300 dark:ring-blue-800'
+                                  : 'bg-white dark:bg-zinc-800 border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-300 hover:border-blue-400 hover:bg-blue-50/50 dark:hover:bg-blue-950/20'
+                              }`}
+                            >
+                              <span>{pNum} {pNum === 1 ? 'Pack' : 'Packs'} ({totalU})</span>
+                            </button>
+                          );
+                        })}
+                        <button
+                          type="button"
+                          onClick={() => setQuantityToReturn(String(maxReturn))}
+                          className={`py-1 px-2.5 rounded-md font-medium text-xs transition-all border ${
+                            currentVal === maxReturn
+                              ? 'bg-purple-600 border-purple-600 text-white shadow-xs font-bold ring-2 ring-purple-300 dark:ring-purple-800'
+                              : 'bg-white dark:bg-zinc-800 border-purple-300 dark:border-purple-700 text-purple-700 dark:text-purple-300 hover:bg-purple-50 dark:hover:bg-purple-950/30'
+                          }`}
+                          title={`Return all ${maxReturn} assigned items`}
+                        >
+                          All ({maxReturn})
+                        </button>
+                      </div>
+
+                      {/* Quick Loose Item Presets */}
+                      <div className="mt-2 pt-2 border-t border-blue-200/60 dark:border-blue-800/60">
+                        <div className="text-[11px] font-medium text-zinc-600 dark:text-zinc-400 mb-1 flex items-center justify-between">
+                          <span>Loose Items (Individual Units):</span>
+                        </div>
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          {[1, 2, 3, 5].filter(q => q <= maxReturn).map(looseQty => (
+                            <button
+                              key={looseQty}
+                              type="button"
+                              onClick={() => setQuantityToReturn(String(looseQty))}
+                              className={`py-1 px-2.5 rounded-md text-xs font-semibold transition-all border ${
+                                currentVal === looseQty
+                                  ? 'bg-amber-600 border-amber-600 text-white shadow-xs font-bold ring-2 ring-amber-300 dark:ring-amber-800'
+                                  : 'bg-white dark:bg-zinc-800 border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-300 hover:border-amber-400 hover:bg-amber-50/50 dark:hover:bg-amber-950/20'
+                              }`}
+                              title={`Return ${looseQty} loose unit${looseQty > 1 ? 's' : ''}`}
+                            >
+                              {looseQty} Loose Unit{looseQty > 1 ? 's' : ''}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Individual Quantity Input with Dedicated Stepper Buttons */}
+                <div>
+                    <div className="flex items-center justify-between mb-1.5">
+                      <label htmlFor="return-qty" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">
+                        Quantity to Return (Individual Units)
+                      </label>
+                      <div className="flex items-center gap-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+                        <span>Individual item adjust:</span>
+                        {[-5, -1, 1, 5].map(delta => (
+                          <button
+                            key={delta}
+                            type="button"
+                            onClick={() => handleAdjustUnits(delta)}
+                            className="px-1.5 py-0.5 rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-300 font-mono font-semibold transition-colors"
+                            title={`${delta > 0 ? 'Add' : 'Minus'} ${Math.abs(delta)} unit${Math.abs(delta) > 1 ? 's' : ''}`}
+                          >
+                            {delta > 0 ? `+${delta}` : delta}
+                          </button>
+                        ))}
+                        {!isPackItem && (
+                          <button
+                            type="button"
+                            onClick={() => setQuantityToReturn(String(maxReturn))}
+                            className="px-1.5 py-0.5 rounded border border-purple-200 dark:border-purple-800 bg-purple-50 dark:bg-purple-900/30 hover:bg-purple-100 text-purple-700 dark:text-purple-300 text-xs font-semibold"
+                          >
+                            Max ({maxReturn})
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => handleAdjustUnits(-1)}
+                        disabled={currentVal <= 1}
+                        className="h-10 px-3 flex items-center justify-center rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-200 disabled:opacity-40 disabled:cursor-not-allowed active:scale-95 font-bold text-xs sm:text-sm transition-all shadow-2xs select-none shrink-0"
+                        title="Decrease by 1 individual unit"
+                      >
+                        -1 Unit
+                      </button>
+
+                      <input 
+                        type="number" 
+                        id="return-qty" 
+                        min="1" 
+                        max={maxReturn} 
+                        value={quantityToReturn} 
+                        onChange={(e) => setQuantityToReturn(e.target.value)} 
+                        className={`${formInputStyle} text-center font-mono font-bold text-base flex-1`} 
+                        placeholder="Enter quantity" 
+                        required 
+                        autoFocus 
+                      />
+
+                      <button
+                        type="button"
+                        onClick={() => handleAdjustUnits(1)}
+                        disabled={currentVal >= maxReturn}
+                        className="h-10 px-3 flex items-center justify-center rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-200 disabled:opacity-40 disabled:cursor-not-allowed active:scale-95 font-bold text-xs sm:text-sm transition-all shadow-2xs select-none shrink-0"
+                        title="Increase by 1 individual unit"
+                      >
+                        +1 Unit
+                      </button>
+                    </div>
+
+                    <div className="mt-1.5 flex items-center justify-between text-xs text-zinc-500 dark:text-zinc-400">
+                      <span>Max available to return: <strong>{maxReturn}</strong></span>
+                      {currentVal > 0 && isPackItem && (
+                        <span className="text-blue-600 dark:text-blue-400 font-medium">
+                          {currentPacks} full pack{currentPacks !== 1 ? 's' : ''}{remainderUnits > 0 ? ` + ${remainderUnits} loose` : ''}
+                        </span>
+                      )}
+                    </div>
+                </div>
+
+                <div className="flex justify-end space-x-3 pt-4 border-t border-zinc-200 dark:border-zinc-700">
+                    <button type="button" onClick={() => { setIsReturnQuantityModalOpen(false); setItemForQuantityReturn(null); setQuantityToReturn(''); handleSetView(View.SCAN); }} className="px-4 py-2 bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-600 text-zinc-800 dark:text-zinc-200 rounded-md hover:bg-zinc-50 dark:hover:bg-zinc-600 transition-colors text-sm font-medium">Cancel</button>
+                    <button type="submit" className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors text-sm font-medium focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 dark:focus:ring-offset-zinc-800">
+                      {(() => {
+                        if (currentVal <= 0) return 'Return Items';
+                        if (isPackItem && currentPacks > 0) {
+                          const label = remainderUnits > 0 
+                            ? `${currentPacks} Pk + ${remainderUnits} Loose (${currentVal} Units)`
+                            : `${currentPacks} ${currentPacks === 1 ? 'Pack' : 'Packs'} (${currentVal} Units)`;
+                          return `Return ${label} to Stock`;
+                        }
+                        return `Return ${currentVal} Unit${currentVal !== 1 ? 's' : ''} to Stock`;
+                      })()}
+                    </button>
+                </div>
+            </form>
+          );
+        })()}
       </Modal>
 
       <Modal isOpen={isScanModeModalOpen} onClose={() => setIsScanModeModalOpen(false)} title="Select Action">
@@ -7469,21 +8192,191 @@ const StockManagerApp = ({
                     <h3 className="text-lg font-bold text-zinc-900 dark:text-zinc-100">{itemForQuantityAssign[0].name}</h3>
                     <p className="text-sm font-mono bg-zinc-100 dark:bg-zinc-700 p-2 rounded-md mt-2">Serial / Barcode: {itemForQuantityAssign[0].barcode}</p>
                 </div>
+                {(() => {
+                  const packInfo = getItemPackInfo(itemForQuantityAssign[0]?.barcode, itemForQuantityAssign[0]);
+                  if (packInfo.isPack && packInfo.packQuantity > 0) {
+                    const currentUnits = parseInt(quantityToAssign, 10) || 0;
+                    const currentPacks = Math.floor(currentUnits / packInfo.packQuantity);
+                    const remainder = currentUnits % packInfo.packQuantity;
+
+                    const handleAdjustPacks = (delta) => {
+                      const newPacks = Math.max(1, (currentPacks || 0) + delta);
+                      setQuantityToAssign(String(newPacks * packInfo.packQuantity));
+                    };
+
+                    return (
+                      <div className="p-3 bg-blue-50/80 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 rounded-lg space-y-2.5 text-xs text-blue-900 dark:text-blue-200">
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span className="text-xl flex-shrink-0">📦</span>
+                            <div>
+                              <div className="font-semibold flex items-center gap-1.5 flex-wrap">
+                                <span>Supplier Pack: <strong>{packInfo.packQuantity} units / pack</strong></span>
+                                {packInfo.partNumber && (
+                                  <span className="font-mono text-[10px] bg-blue-100 dark:bg-blue-900/80 px-1.5 py-0.5 rounded text-blue-800 dark:text-blue-200">
+                                    Part #{packInfo.partNumber}
+                                  </span>
+                                )}
+                              </div>
+                              <p className="text-[11px] text-blue-700 dark:text-blue-300">
+                                Tap a preset or use pack steppers to sign out multiple packs quickly.
+                              </p>
+                            </div>
+                          </div>
+
+                          {/* Pack Stepper Buttons (-1 Pack / +1 Pack) */}
+                          <div className="flex items-center gap-1 bg-white dark:bg-zinc-800 p-1 rounded-md border border-blue-200 dark:border-blue-700 shadow-2xs shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => handleAdjustPacks(-1)}
+                              disabled={currentPacks <= 1 && remainder === 0}
+                              className="px-2 py-1 bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-700 dark:hover:bg-zinc-600 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-700 dark:text-zinc-200 rounded font-semibold text-xs transition-colors"
+                              title={`Decrease by 1 pack (-${packInfo.packQuantity} units)`}
+                            >
+                              -1 Pack
+                            </button>
+                            <span className="font-mono font-bold text-xs text-blue-600 dark:text-blue-400 px-1.5 min-w-[52px] text-center">
+                              {currentPacks} {currentPacks === 1 ? 'Pack' : 'Packs'}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => handleAdjustPacks(1)}
+                              className="px-2 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded font-semibold text-xs transition-colors shadow-2xs"
+                              title={`Increase by 1 pack (+${packInfo.packQuantity} units)`}
+                            >
+                              +1 Pack
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Quick Pack Multiplier Presets */}
+                        <div>
+                          <div className="text-[11px] font-medium text-zinc-600 dark:text-zinc-400 mb-1.5 flex items-center justify-between">
+                            <span>Quick Pack Presets:</span>
+                            {currentUnits > 0 && (
+                              <span className="font-mono text-blue-700 dark:text-blue-300 font-semibold">
+                                = {currentPacks} Pack{currentPacks !== 1 ? 's' : ''}{remainder > 0 ? ` + ${remainder} loose` : ''} ({currentUnits} total units)
+                              </span>
+                            )}
+                          </div>
+                          <div className="grid grid-cols-3 sm:grid-cols-6 gap-1.5">
+                            {[1, 2, 3, 4, 5, 10].map(pNum => {
+                              const totalU = pNum * packInfo.packQuantity;
+                              const isSelected = currentUnits === totalU;
+                              return (
+                                <button
+                                  key={pNum}
+                                  type="button"
+                                  onClick={() => setQuantityToAssign(String(totalU))}
+                                  className={`py-1 px-1.5 rounded-md font-medium text-xs transition-all flex flex-col items-center justify-center border ${
+                                    isSelected
+                                      ? 'bg-blue-600 border-blue-600 text-white shadow-xs font-bold ring-2 ring-blue-300 dark:ring-blue-800'
+                                      : 'bg-white dark:bg-zinc-800 border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-300 hover:border-blue-400 dark:hover:border-blue-600 hover:bg-blue-50/50 dark:hover:bg-blue-950/20'
+                                  }`}
+                                  title={`Set quantity to ${pNum} packs (${totalU} units)`}
+                                >
+                                  <span>{pNum} {pNum === 1 ? 'Pack' : 'Packs'}</span>
+                                  <span className={`text-[10px] font-mono ${isSelected ? 'text-blue-100' : 'text-zinc-400 dark:text-zinc-500'}`}>
+                                    ({totalU} units)
+                                  </span>
+                                </button>
+                              );
+                            })}
+                          </div>
+
+                          {/* Quick Loose Item Presets */}
+                          <div className="mt-2 pt-2 border-t border-blue-200/60 dark:border-blue-800/60">
+                            <div className="text-[11px] font-medium text-zinc-600 dark:text-zinc-400 mb-1 flex items-center justify-between">
+                              <span>Loose Items (Individual Units):</span>
+                            </div>
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              {[1, 2, 3, 5].map(looseQty => (
+                                <button
+                                  key={looseQty}
+                                  type="button"
+                                  onClick={() => setQuantityToAssign(String(looseQty))}
+                                  className={`py-1 px-2.5 rounded-md text-xs font-semibold transition-all border ${
+                                    currentUnits === looseQty
+                                      ? 'bg-amber-600 border-amber-600 text-white shadow-xs font-bold ring-2 ring-amber-300 dark:ring-amber-800'
+                                      : 'bg-white dark:bg-zinc-800 border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-300 hover:border-amber-400 hover:bg-amber-50/50 dark:hover:bg-amber-950/20'
+                                  }`}
+                                  title={`Set quantity to ${looseQty} loose unit${looseQty > 1 ? 's' : ''}`}
+                                >
+                                  {looseQty} Loose Unit{looseQty > 1 ? 's' : ''}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  }
+                  return null;
+                })()}
                 <div>
-                    <label htmlFor="quantity-to-assign" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Quantity to Assign</label>
-                    <input 
-                        type="number"
-                        id="quantity-to-assign"
-                        name="quantity"
-                        min="1"
-                        step="1"
-                        required
-                        autoFocus
-                        placeholder="Enter quantity"
-                        value={quantityToAssign}
-                        onChange={(e) => setQuantityToAssign(e.target.value)}
-                        className={formInputStyle}
-                    />
+                    <div className="flex items-center justify-between mb-1.5">
+                      <label htmlFor="quantity-to-assign" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">
+                        Quantity to Assign (Total Units)
+                      </label>
+                      <div className="flex items-center gap-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+                        <span>Individual item adjust:</span>
+                        {[-5, -1, 1, 5].map(delta => (
+                          <button
+                            key={delta}
+                            type="button"
+                            onClick={() => {
+                              const cur = parseInt(quantityToAssign, 10) || 0;
+                              setQuantityToAssign(String(Math.max(1, cur + delta)));
+                            }}
+                            className="px-1.5 py-0.5 rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-300 font-mono font-semibold transition-colors"
+                            title={`${delta > 0 ? 'Add' : 'Minus'} ${Math.abs(delta)} unit${Math.abs(delta) > 1 ? 's' : ''}`}
+                          >
+                            {delta > 0 ? `+${delta}` : delta}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const cur = parseInt(quantityToAssign, 10) || 0;
+                          setQuantityToAssign(String(Math.max(1, cur - 1)));
+                        }}
+                        className="h-10 px-3 flex items-center justify-center rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-200 active:scale-95 font-bold text-xs sm:text-sm transition-all shadow-2xs select-none shrink-0"
+                        title="Decrease by 1 individual unit"
+                      >
+                        -1 Unit
+                      </button>
+
+                      <input 
+                          type="number"
+                          id="quantity-to-assign"
+                          name="quantity"
+                          min="1"
+                          step="1"
+                          required
+                          autoFocus
+                          placeholder="Enter quantity"
+                          value={quantityToAssign}
+                          onChange={(e) => setQuantityToAssign(e.target.value)}
+                          className={`${formInputStyle} text-center font-mono font-bold text-base flex-1`}
+                      />
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const cur = parseInt(quantityToAssign, 10) || 0;
+                          setQuantityToAssign(String(cur + 1));
+                        }}
+                        className="h-10 px-3 flex items-center justify-center rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-200 active:scale-95 font-bold text-xs sm:text-sm transition-all shadow-2xs select-none shrink-0"
+                        title="Increase by 1 individual unit"
+                      >
+                        +1 Unit
+                      </button>
+                    </div>
+
                     <div className="mt-1.5 flex items-center justify-between text-xs">
                       <span className="text-zinc-500 dark:text-zinc-400">
                         <strong>{itemForQuantityAssign.length}</strong> available in stock at {assignmentContext.location}.
@@ -7505,7 +8398,20 @@ const StockManagerApp = ({
                     <button type="button" onClick={() => { setIsAssignQuantityModalOpen(false); setItemForQuantityAssign(null); setQuantityToAssign(''); }} className="px-4 py-2 bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-600 text-zinc-800 dark:text-zinc-200 rounded-md hover:bg-zinc-50 dark:hover:bg-zinc-600 transition-colors text-sm font-medium">Cancel</button>
                     <button type="submit" disabled={isSubmitting} className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors disabled:bg-blue-400 dark:disabled:bg-blue-800 disabled:cursor-not-allowed flex items-center justify-center min-w-[170px] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 dark:focus:ring-offset-zinc-800">
                         {isSubmitting && <Spinner className="-ml-1 mr-3 h-5 w-5" />}
-                        {isSubmitting ? 'Processing...' : (parseInt(quantityToAssign, 10) > itemForQuantityAssign.length ? `Sign Out (${quantityToAssign} Units)` : `Assign to ${assignmentContext.team}`)}
+                        {(() => {
+                          if (isSubmitting) return 'Processing...';
+                          const qty = parseInt(quantityToAssign, 10) || 0;
+                          const packInfo = getItemPackInfo(itemForQuantityAssign[0]?.barcode, itemForQuantityAssign[0]);
+                          if (packInfo.isPack && packInfo.packQuantity > 1 && qty > 0) {
+                            const pCount = Math.floor(qty / packInfo.packQuantity);
+                            const pRem = qty % packInfo.packQuantity;
+                            const packLabel = pRem > 0 
+                              ? `${pCount} Pk + ${pRem} (${qty} Units)`
+                              : `${pCount} ${pCount === 1 ? 'Pack' : 'Packs'} (${qty} Units)`;
+                            return `Sign Out ${packLabel}`;
+                          }
+                          return parseInt(quantityToAssign, 10) > itemForQuantityAssign.length ? `Sign Out (${quantityToAssign} Units)` : `Assign to ${assignmentContext.team}`;
+                        })()}
                     </button>
                 </div>
             </form>
@@ -7670,9 +8576,16 @@ const StockManagerApp = ({
                         <tr key={item.id} className="hover:bg-zinc-50 dark:hover:bg-zinc-800/50">
                           <td className="px-3 py-2.5 font-medium text-zinc-900 dark:text-zinc-100 max-w-[180px] truncate">
                             {item.name}
-                            {item.partNumber && (
-                              <span className="block text-[10px] text-zinc-400 font-mono">Part #{item.partNumber}</span>
-                            )}
+                            <div className="flex items-center gap-1.5 flex-wrap mt-0.5">
+                              {item.partNumber && (
+                                <span className="text-[10px] text-zinc-400 font-mono">Part #{item.partNumber}</span>
+                              )}
+                              {item.isPack && (
+                                <span className="text-[9px] font-bold px-1.5 py-0.2 rounded bg-blue-100 dark:bg-blue-900/60 text-blue-800 dark:text-blue-200">
+                                  Pack ({item.packQuantity})
+                                </span>
+                              )}
+                            </div>
                           </td>
                           <td className="px-3 py-2.5 font-mono text-zinc-500 dark:text-zinc-400">
                             {item.isUnique ? (
@@ -7700,39 +8613,106 @@ const StockManagerApp = ({
                           </td>
                           <td className="px-3 py-2.5 text-center">
                             {!item.isUnique ? (
-                              <div className="inline-flex items-center gap-1.5 bg-zinc-100 dark:bg-zinc-800 px-2 py-1 rounded-md border border-zinc-200 dark:border-zinc-700">
-                                <button
-                                  type="button"
-                                  tabIndex={-1}
-                                  onMouseDown={(e) => e.preventDefault()}
-                                  onClick={(e) => {
-                                    e.preventDefault();
-                                    e.stopPropagation();
-                                    handleUpdateStagedQuantity(item.id, -1);
-                                  }}
-                                  className="w-7 h-7 sm:w-6 sm:h-6 flex items-center justify-center text-zinc-600 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-700 active:scale-95 rounded font-bold touch-manipulation select-none"
-                                  title="Decrease quantity"
-                                >
-                                  -
-                                </button>
-                                <span className="font-mono font-bold text-xs text-zinc-900 dark:text-zinc-100 min-w-[20px] text-center select-none">
-                                  {item.quantity}
-                                </span>
-                                <button
-                                  type="button"
-                                  tabIndex={-1}
-                                  onMouseDown={(e) => e.preventDefault()}
-                                  onClick={(e) => {
-                                    e.preventDefault();
-                                    e.stopPropagation();
-                                    handleUpdateStagedQuantity(item.id, 1);
-                                  }}
-                                  className="w-7 h-7 sm:w-6 sm:h-6 flex items-center justify-center text-zinc-600 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-700 active:scale-95 rounded font-bold touch-manipulation select-none"
-                                  title="Increase quantity"
-                                >
-                                  +
-                                </button>
-                              </div>
+                              item.isPack && item.packQuantity > 1 ? (
+                                <div className="inline-flex flex-col items-center gap-1">
+                                  <div className="inline-flex items-center gap-1 bg-blue-50 dark:bg-blue-950/60 p-1 rounded-lg border border-blue-200 dark:border-blue-800">
+                                    <button
+                                      type="button"
+                                      tabIndex={-1}
+                                      onMouseDown={(e) => e.preventDefault()}
+                                      onClick={(e) => {
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                        handleUpdateStagedQuantity(item.id, -item.packQuantity);
+                                      }}
+                                      className="px-2 py-0.5 flex items-center justify-center text-blue-700 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-blue-900 active:scale-95 rounded font-bold touch-manipulation select-none text-xs transition-colors"
+                                      title={`Decrease by 1 pack (-${item.packQuantity} units)`}
+                                    >
+                                      -1 Pk
+                                    </button>
+                                    <span className="font-mono font-bold text-xs text-blue-900 dark:text-blue-100 min-w-[56px] text-center select-none px-1">
+                                      {Math.floor(item.quantity / item.packQuantity)} {Math.floor(item.quantity / item.packQuantity) === 1 ? 'Pack' : 'Packs'}
+                                      {item.quantity % item.packQuantity !== 0 ? ` +${item.quantity % item.packQuantity}` : ''}
+                                    </span>
+                                    <button
+                                      type="button"
+                                      tabIndex={-1}
+                                      onMouseDown={(e) => e.preventDefault()}
+                                      onClick={(e) => {
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                        handleUpdateStagedQuantity(item.id, item.packQuantity);
+                                      }}
+                                      className="px-2 py-0.5 flex items-center justify-center text-blue-700 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-blue-900 active:scale-95 rounded font-bold touch-manipulation select-none text-xs transition-colors"
+                                      title={`Increase by 1 pack (+${item.packQuantity} units)`}
+                                    >
+                                      +1 Pk
+                                    </button>
+                                  </div>
+                                  <div className="flex items-center gap-1.5 text-[10px] text-zinc-500 dark:text-zinc-400 font-mono">
+                                    <span>({item.quantity} units)</span>
+                                    <span className="text-zinc-300 dark:text-zinc-600">&bull;</span>
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                        handleUpdateStagedQuantity(item.id, -1);
+                                      }}
+                                      className="px-1 py-0.2 rounded hover:bg-zinc-200 dark:hover:bg-zinc-700 text-zinc-600 dark:text-zinc-400"
+                                      title="Fine adjust -1 unit"
+                                    >
+                                      -1
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                        handleUpdateStagedQuantity(item.id, 1);
+                                      }}
+                                      className="px-1 py-0.2 rounded hover:bg-zinc-200 dark:hover:bg-zinc-700 text-zinc-600 dark:text-zinc-400"
+                                      title="Fine adjust +1 unit"
+                                    >
+                                      +1
+                                    </button>
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="inline-flex items-center gap-1.5 bg-zinc-100 dark:bg-zinc-800 px-2 py-1 rounded-md border border-zinc-200 dark:border-zinc-700">
+                                  <button
+                                    type="button"
+                                    tabIndex={-1}
+                                    onMouseDown={(e) => e.preventDefault()}
+                                    onClick={(e) => {
+                                      e.preventDefault();
+                                      e.stopPropagation();
+                                      handleUpdateStagedQuantity(item.id, -1);
+                                    }}
+                                    className="w-7 h-7 sm:w-6 sm:h-6 flex items-center justify-center text-zinc-600 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-700 active:scale-95 rounded font-bold touch-manipulation select-none"
+                                    title="Decrease quantity"
+                                  >
+                                    -
+                                  </button>
+                                  <span className="font-mono font-bold text-xs text-zinc-900 dark:text-zinc-100 min-w-[20px] text-center select-none">
+                                    {item.quantity}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    tabIndex={-1}
+                                    onMouseDown={(e) => e.preventDefault()}
+                                    onClick={(e) => {
+                                      e.preventDefault();
+                                      e.stopPropagation();
+                                      handleUpdateStagedQuantity(item.id, 1);
+                                    }}
+                                    className="w-7 h-7 sm:w-6 sm:h-6 flex items-center justify-center text-zinc-600 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-700 active:scale-95 rounded font-bold touch-manipulation select-none"
+                                    title="Increase quantity"
+                                  >
+                                    +
+                                  </button>
+                                </div>
+                              )
                             ) : (
                               <span className="font-mono font-semibold text-zinc-700 dark:text-zinc-300">1</span>
                             )}
@@ -8088,9 +9068,235 @@ const StockManagerApp = ({
           ) : (
             <>
                 {!selectedScannedItemType?.is_unique && (
-                    <div className="pt-4 border-t border-zinc-200 dark:border-zinc-700">
-                        <label htmlFor="scanned-quantity" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Quantity</label>
-                        <input type="number" name="quantity" id="scanned-quantity" min="1" step="1" required placeholder="Enter quantity" className={formInputStyle} value={newScannedItemDetails.quantity} onChange={(e) => setNewScannedItemDetails(prev => ({...prev, quantity: e.target.value}))}/>
+                    <div className="pt-4 border-t border-zinc-200 dark:border-zinc-700 space-y-3">
+                        {(() => {
+                          const packInfo = getItemPackInfo(newScannedItemDetails.barcode, selectedScannedItemType || newScannedItemDetails.name);
+                          if (packInfo.isPack && packInfo.packQuantity > 1) {
+                            const currentUnits = parseInt(newScannedItemDetails.quantity, 10) || 0;
+                            const currentPacks = Math.floor(currentUnits / packInfo.packQuantity);
+                            const remainder = currentUnits % packInfo.packQuantity;
+
+                            const handleAdjustPacks = (delta) => {
+                              const newPacks = Math.max(1, (currentPacks || 0) + delta);
+                              setNewScannedItemDetails(prev => ({ ...prev, quantity: String(newPacks * packInfo.packQuantity + remainder) }));
+                            };
+
+                            return (
+                              <div className="space-y-3">
+                                <div className="p-3 bg-blue-50/80 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 rounded-lg space-y-3 text-xs text-blue-900 dark:text-blue-200">
+                                  <div className="flex items-center justify-between gap-2">
+                                    <div className="flex items-center gap-2 min-w-0">
+                                      <span className="text-xl flex-shrink-0">📦</span>
+                                      <div>
+                                        <div className="font-semibold flex items-center gap-1.5 flex-wrap">
+                                          <span>Supplier Pack: <strong>{packInfo.packQuantity} units / pack</strong></span>
+                                          {packInfo.partNumber && (
+                                            <span className="font-mono text-[10px] bg-blue-100 dark:bg-blue-900/80 px-1.5 py-0.5 rounded text-blue-800 dark:text-blue-200">
+                                              Part #{packInfo.partNumber}
+                                            </span>
+                                          )}
+                                        </div>
+                                        <p className="text-[11px] text-blue-700 dark:text-blue-300">
+                                          Scan or enter number of packs to add to stock.
+                                        </p>
+                                      </div>
+                                    </div>
+                                  </div>
+
+                                  {/* Direct Number of Packs Input & Steppers */}
+                                  <div>
+                                    <label htmlFor="scanned-packs-input" className="block text-xs font-bold text-blue-900 dark:text-blue-200 mb-1.5">
+                                      Number of Packs to Sign In:
+                                    </label>
+                                    <div className="flex items-center gap-2">
+                                      <button
+                                        type="button"
+                                        onClick={() => handleAdjustPacks(-1)}
+                                        disabled={currentPacks <= 1 && remainder === 0}
+                                        className="h-11 px-3.5 flex items-center justify-center rounded-lg border border-blue-300 dark:border-blue-700 bg-white hover:bg-blue-50 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-blue-700 dark:text-blue-300 disabled:opacity-40 disabled:cursor-not-allowed font-bold text-xs sm:text-sm transition-all shadow-2xs shrink-0"
+                                        title={`Decrease by 1 pack (-${packInfo.packQuantity} units)`}
+                                      >
+                                        -1 Pack
+                                      </button>
+                                      <div className="flex-1 relative">
+                                        <input
+                                          type="number"
+                                          id="scanned-packs-input"
+                                          min="1"
+                                          step="1"
+                                          value={currentPacks || ''}
+                                          onChange={(e) => {
+                                            const p = parseInt(e.target.value, 10) || 0;
+                                            setNewScannedItemDetails(prev => ({ ...prev, quantity: String(Math.max(1, p * packInfo.packQuantity + remainder)) }));
+                                          }}
+                                          placeholder="Packs"
+                                          className={`${formInputStyle} text-center font-mono font-bold text-lg text-blue-600 dark:text-blue-400`}
+                                        />
+                                        <span className="absolute right-3 top-2.5 text-xs text-zinc-400 font-semibold pointer-events-none">Packs</span>
+                                      </div>
+                                      <button
+                                        type="button"
+                                        onClick={() => handleAdjustPacks(1)}
+                                        className="h-11 px-3.5 flex items-center justify-center rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs sm:text-sm transition-all shadow-2xs shrink-0"
+                                        title={`Increase by 1 pack (+${packInfo.packQuantity} units)`}
+                                      >
+                                        +1 Pack
+                                      </button>
+                                    </div>
+                                  </div>
+
+                                  {/* Quick Pack Presets */}
+                                  <div>
+                                    <div className="text-[11px] font-medium text-zinc-600 dark:text-zinc-400 mb-1.5 flex items-center justify-between">
+                                      <span>Quick Pack Presets:</span>
+                                      {currentUnits > 0 && (
+                                        <span className="font-mono text-blue-700 dark:text-blue-300 font-semibold">
+                                          = {currentPacks} Pack{currentPacks !== 1 ? 's' : ''}{remainder > 0 ? ` + ${remainder} loose` : ''} ({currentUnits} total units)
+                                        </span>
+                                      )}
+                                    </div>
+                                    <div className="grid grid-cols-3 sm:grid-cols-6 gap-1.5">
+                                      {[1, 2, 3, 4, 5, 10].map(pNum => {
+                                        const totalU = pNum * packInfo.packQuantity + remainder;
+                                        const isSelected = currentPacks === pNum && remainder === 0;
+                                        return (
+                                          <button
+                                            key={pNum}
+                                            type="button"
+                                            onClick={() => setNewScannedItemDetails(prev => ({ ...prev, quantity: String(pNum * packInfo.packQuantity) }))}
+                                            className={`py-1 px-1.5 rounded-md font-medium text-xs transition-all flex flex-col items-center justify-center border ${
+                                              isSelected
+                                                ? 'bg-blue-600 border-blue-600 text-white shadow-xs font-bold ring-2 ring-blue-300 dark:ring-blue-800'
+                                                : 'bg-white dark:bg-zinc-800 border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-300 hover:border-blue-400 dark:hover:border-blue-600 hover:bg-blue-50/50 dark:hover:bg-blue-950/20'
+                                            }`}
+                                            title={`Add ${pNum} packs (${pNum * packInfo.packQuantity} units)`}
+                                          >
+                                            <span>{pNum} {pNum === 1 ? 'Pack' : 'Packs'}</span>
+                                            <span className={`text-[10px] font-mono ${isSelected ? 'text-blue-100' : 'text-zinc-400 dark:text-zinc-500'}`}>
+                                              ({pNum * packInfo.packQuantity} u)
+                                            </span>
+                                          </button>
+                                        );
+                                      })}
+                                    </div>
+                                  </div>
+
+                                  {/* Loose Items (Individual Units) */}
+                                  <div className="pt-2 border-t border-blue-200/60 dark:border-blue-800/60 space-y-1.5">
+                                    <div className="flex items-center justify-between text-xs text-zinc-600 dark:text-zinc-400">
+                                      <span className="font-medium">+ Additional Loose Units (optional):</span>
+                                      <div className="flex items-center gap-1.5">
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            const cur = parseInt(newScannedItemDetails.quantity, 10) || 0;
+                                            if (cur > 1) setNewScannedItemDetails(prev => ({ ...prev, quantity: String(cur - 1) }));
+                                          }}
+                                          disabled={remainder <= 0 && currentUnits <= 1}
+                                          className="px-2 py-0.5 rounded bg-white dark:bg-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-700 disabled:opacity-40 text-zinc-700 dark:text-zinc-200 font-semibold text-xs border border-zinc-300 dark:border-zinc-600 shadow-2xs"
+                                        >
+                                          -1
+                                        </button>
+                                        <span className="font-mono font-bold text-xs px-2 text-zinc-900 dark:text-zinc-100 min-w-[28px] text-center">
+                                          {remainder} loose
+                                        </span>
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            const cur = parseInt(newScannedItemDetails.quantity, 10) || 0;
+                                            setNewScannedItemDetails(prev => ({ ...prev, quantity: String(cur + 1) }));
+                                          }}
+                                          className="px-2 py-0.5 rounded bg-white dark:bg-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-200 font-semibold text-xs border border-zinc-300 dark:border-zinc-600 shadow-2xs"
+                                        >
+                                          +1
+                                        </button>
+                                      </div>
+                                    </div>
+                                  </div>
+                                </div>
+
+                                {/* Total Summary & Scanner Gun Tip */}
+                                <div className="bg-zinc-100 dark:bg-zinc-800/80 p-2.5 rounded-lg flex items-center justify-between text-xs border border-zinc-200 dark:border-zinc-700">
+                                  <span className="text-zinc-600 dark:text-zinc-400 font-medium">Total Quantity to Sign In:</span>
+                                  <span className="font-mono font-bold text-sm text-zinc-900 dark:text-zinc-100">
+                                    {currentUnits} Total Units ({currentPacks} {currentPacks === 1 ? 'Pack' : 'Packs'}{remainder > 0 ? ` + ${remainder} loose` : ''})
+                                  </span>
+                                </div>
+
+                                <p className="text-[11px] text-zinc-500 dark:text-zinc-400 flex items-center gap-1.5 bg-blue-50/50 dark:bg-blue-950/20 p-2 rounded border border-blue-200/50 dark:border-blue-800/40">
+                                  <span>⚡</span>
+                                  <span>Scan the barcode or part number again with your scanner gun to add +1 pack per scan.</span>
+                                </p>
+                              </div>
+                            );
+                          }
+
+                          return (
+                            <div>
+                              <div className="flex items-center justify-between mb-1.5">
+                                <label htmlFor="scanned-quantity" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">
+                                  Quantity to Add (Total Units)
+                                </label>
+                                <div className="flex items-center gap-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+                                  <span>Unit adjust:</span>
+                                  {[-5, -1, 1, 5].map(delta => (
+                                    <button
+                                      key={delta}
+                                      type="button"
+                                      onClick={() => {
+                                        const cur = parseInt(newScannedItemDetails.quantity, 10) || 0;
+                                        setNewScannedItemDetails(prev => ({ ...prev, quantity: String(Math.max(1, cur + delta)) }));
+                                      }}
+                                      className="px-1.5 py-0.5 rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-300 font-mono font-semibold transition-colors"
+                                      title={`${delta > 0 ? 'Add' : 'Minus'} ${Math.abs(delta)} unit${Math.abs(delta) > 1 ? 's' : ''}`}
+                                    >
+                                      {delta > 0 ? `+${delta}` : delta}
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+
+                              <div className="flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const cur = parseInt(newScannedItemDetails.quantity, 10) || 0;
+                                    setNewScannedItemDetails(prev => ({ ...prev, quantity: String(Math.max(1, cur - 1)) }));
+                                  }}
+                                  className="h-10 px-3 flex items-center justify-center rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-200 active:scale-95 font-bold text-xs sm:text-sm transition-all shadow-2xs select-none shrink-0"
+                                  title="Decrease by 1 unit"
+                                >
+                                  -1 Unit
+                                </button>
+
+                                <input 
+                                  type="number" 
+                                  name="quantity" 
+                                  id="scanned-quantity" 
+                                  min="1" 
+                                  step="1" 
+                                  required 
+                                  placeholder="Enter quantity" 
+                                  className={`${formInputStyle} text-center font-mono font-bold text-base flex-1`}
+                                  value={newScannedItemDetails.quantity} 
+                                  onChange={(e) => setNewScannedItemDetails(prev => ({...prev, quantity: e.target.value}))}
+                                />
+
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const cur = parseInt(newScannedItemDetails.quantity, 10) || 0;
+                                    setNewScannedItemDetails(prev => ({ ...prev, quantity: String(cur + 1) }));
+                                  }}
+                                  className="h-10 px-3 flex items-center justify-center rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-200 active:scale-95 font-bold text-xs sm:text-sm transition-all shadow-2xs select-none shrink-0"
+                                  title="Increase by 1 unit"
+                                >
+                                  +1 Unit
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })()}
                     </div>
                 )}
             </>
@@ -8098,9 +9304,22 @@ const StockManagerApp = ({
 
           <div className="flex justify-end space-x-3 pt-4">
               <button type="button" onClick={() => setIsAddScannedItemModalOpen(false)} className="px-4 py-2 bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-600 text-zinc-800 dark:text-zinc-200 rounded-md hover:bg-zinc-50 dark:hover:bg-zinc-600 transition-colors text-sm font-medium">Cancel</button>
-              <button type="submit" disabled={isSubmitting || !newScannedItemDetails.name || !!scannedSerialsProcessingResult.error} className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors disabled:bg-blue-400 dark:disabled:bg-blue-800 disabled:cursor-not-allowed flex items-center justify-center min-w-[120px] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 dark:focus:ring-offset-zinc-800">
+              <button type="submit" disabled={isSubmitting || !newScannedItemDetails.name || !!scannedSerialsProcessingResult.error} className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors disabled:bg-blue-400 dark:disabled:bg-blue-800 disabled:cursor-not-allowed flex items-center justify-center min-w-[150px] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 dark:focus:ring-offset-zinc-800">
                   {isSubmitting && <Spinner className="-ml-1 mr-3 h-5 w-5" />}
-                  {isSubmitting ? 'Adding...' : 'Add Item(s)'}
+                  {(() => {
+                    if (isSubmitting) return 'Adding...';
+                    const qty = parseInt(newScannedItemDetails.quantity, 10) || 0;
+                    const packInfo = getItemPackInfo(newScannedItemDetails.barcode, selectedScannedItemType || newScannedItemDetails.name);
+                    if (packInfo.isPack && packInfo.packQuantity > 1 && qty > 0) {
+                      const pCount = Math.floor(qty / packInfo.packQuantity);
+                      const pRem = qty % packInfo.packQuantity;
+                      const packLabel = pRem > 0 
+                        ? `${pCount} Pk + ${pRem} (${qty} Units)`
+                        : `${pCount} ${pCount === 1 ? 'Pack' : 'Packs'} (${qty} Units)`;
+                      return `Add ${packLabel}`;
+                    }
+                    return qty > 0 ? `Add ${qty} Unit${qty !== 1 ? 's' : ''}` : 'Add Item(s)';
+                  })()}
               </button>
           </div>
         </form>
@@ -8128,27 +9347,253 @@ const StockManagerApp = ({
                         ))}
                     </select>
                 </div>
-                <div>
-                    <label htmlFor="quantity-to-add" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Quantity to Add</label>
-                    <input 
-                        type="number"
-                        id="quantity-to-add"
-                        name="quantity"
-                        min="1"
-                        step="1"
-                        required
-                        autoFocus
-                        placeholder="Enter quantity"
-                        value={quantityToAdd}
-                        onChange={(e) => setQuantityToAdd(e.target.value)}
-                        className={formInputStyle}
-                    />
-                </div>
+                {(() => {
+                  const packInfo = getItemPackInfo(itemForQuantityAdd.barcode, itemForQuantityAdd);
+                  if (packInfo.isPack && packInfo.packQuantity > 1) {
+                    const currentUnits = parseInt(quantityToAdd, 10) || 0;
+                    const currentPacks = Math.floor(currentUnits / packInfo.packQuantity);
+                    const remainder = currentUnits % packInfo.packQuantity;
+
+                    const handleAdjustPacks = (delta) => {
+                      const newPacks = Math.max(1, (currentPacks || 0) + delta);
+                      setQuantityToAdd(String(newPacks * packInfo.packQuantity + remainder));
+                    };
+
+                    return (
+                      <div className="space-y-3">
+                        <div className="p-3 bg-blue-50/80 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 rounded-lg space-y-3 text-xs text-blue-900 dark:text-blue-200">
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-2 min-w-0">
+                              <span className="text-xl flex-shrink-0">📦</span>
+                              <div>
+                                <div className="font-semibold flex items-center gap-1.5 flex-wrap">
+                                  <span>Supplier Pack: <strong>{packInfo.packQuantity} units / pack</strong></span>
+                                  {packInfo.partNumber && (
+                                    <span className="font-mono text-[10px] bg-blue-100 dark:bg-blue-900/80 px-1.5 py-0.5 rounded text-blue-800 dark:text-blue-200">
+                                      Part #{packInfo.partNumber}
+                                    </span>
+                                  )}
+                                </div>
+                                <p className="text-[11px] text-blue-700 dark:text-blue-300">
+                                  Scan or enter number of packs to add to stock.
+                                </p>
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* Direct Number of Packs Input & Steppers */}
+                          <div>
+                            <label htmlFor="quantity-add-packs-input" className="block text-xs font-bold text-blue-900 dark:text-blue-200 mb-1.5">
+                              Number of Packs to Sign In:
+                            </label>
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => handleAdjustPacks(-1)}
+                                disabled={currentPacks <= 1 && remainder === 0}
+                                className="h-11 px-3.5 flex items-center justify-center rounded-lg border border-blue-300 dark:border-blue-700 bg-white hover:bg-blue-50 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-blue-700 dark:text-blue-300 disabled:opacity-40 disabled:cursor-not-allowed font-bold text-xs sm:text-sm transition-all shadow-2xs shrink-0"
+                                title={`Decrease by 1 pack (-${packInfo.packQuantity} units)`}
+                              >
+                                -1 Pack
+                              </button>
+                              <div className="flex-1 relative">
+                                <input
+                                  type="number"
+                                  id="quantity-add-packs-input"
+                                  min="1"
+                                  step="1"
+                                  value={currentPacks || ''}
+                                  onChange={(e) => {
+                                    const p = parseInt(e.target.value, 10) || 0;
+                                    setQuantityToAdd(String(Math.max(1, p * packInfo.packQuantity + remainder)));
+                                  }}
+                                  placeholder="Packs"
+                                  className={`${formInputStyle} text-center font-mono font-bold text-lg text-blue-600 dark:text-blue-400`}
+                                />
+                                <span className="absolute right-3 top-2.5 text-xs text-zinc-400 font-semibold pointer-events-none">Packs</span>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => handleAdjustPacks(1)}
+                                className="h-11 px-3.5 flex items-center justify-center rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs sm:text-sm transition-all shadow-2xs shrink-0"
+                                title={`Increase by 1 pack (+${packInfo.packQuantity} units)`}
+                              >
+                                +1 Pack
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Quick Pack Presets */}
+                          <div>
+                            <div className="text-[11px] font-medium text-zinc-600 dark:text-zinc-400 mb-1.5 flex items-center justify-between">
+                              <span>Quick Pack Presets:</span>
+                              {currentUnits > 0 && (
+                                <span className="font-mono text-blue-700 dark:text-blue-300 font-semibold">
+                                  = {currentPacks} Pack{currentPacks !== 1 ? 's' : ''}{remainder > 0 ? ` + ${remainder} loose` : ''} ({currentUnits} total units)
+                                </span>
+                              )}
+                            </div>
+                            <div className="grid grid-cols-3 sm:grid-cols-6 gap-1.5">
+                              {[1, 2, 3, 4, 5, 10].map(pNum => {
+                                const totalU = pNum * packInfo.packQuantity + remainder;
+                                const isSelected = currentPacks === pNum && remainder === 0;
+                                return (
+                                  <button
+                                    key={pNum}
+                                    type="button"
+                                    onClick={() => setQuantityToAdd(String(pNum * packInfo.packQuantity))}
+                                    className={`py-1 px-1.5 rounded-md font-medium text-xs transition-all flex flex-col items-center justify-center border ${
+                                      isSelected
+                                        ? 'bg-blue-600 border-blue-600 text-white shadow-xs font-bold ring-2 ring-blue-300 dark:ring-blue-800'
+                                        : 'bg-white dark:bg-zinc-800 border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-300 hover:border-blue-400 dark:hover:border-blue-600 hover:bg-blue-50/50 dark:hover:bg-blue-950/20'
+                                    }`}
+                                    title={`Add ${pNum} packs (${pNum * packInfo.packQuantity} units)`}
+                                  >
+                                    <span>{pNum} {pNum === 1 ? 'Pack' : 'Packs'}</span>
+                                    <span className={`text-[10px] font-mono ${isSelected ? 'text-blue-100' : 'text-zinc-400 dark:text-zinc-500'}`}>
+                                      ({pNum * packInfo.packQuantity} u)
+                                    </span>
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+
+                          {/* Loose Items (Individual Units) */}
+                          <div className="pt-2 border-t border-blue-200/60 dark:border-blue-800/60 space-y-1.5">
+                            <div className="flex items-center justify-between text-xs text-zinc-600 dark:text-zinc-400">
+                              <span className="font-medium">+ Additional Loose Units (optional):</span>
+                              <div className="flex items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const cur = parseInt(quantityToAdd, 10) || 0;
+                                    if (cur > 1) setQuantityToAdd(String(cur - 1));
+                                  }}
+                                  disabled={remainder <= 0 && currentUnits <= 1}
+                                  className="px-2 py-0.5 rounded bg-white dark:bg-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-700 disabled:opacity-40 text-zinc-700 dark:text-zinc-200 font-semibold text-xs border border-zinc-300 dark:border-zinc-600 shadow-2xs"
+                                >
+                                  -1
+                                </button>
+                                <span className="font-mono font-bold text-xs px-2 text-zinc-900 dark:text-zinc-100 min-w-[28px] text-center">
+                                  {remainder} loose
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const cur = parseInt(quantityToAdd, 10) || 0;
+                                    setQuantityToAdd(String(cur + 1));
+                                  }}
+                                  className="px-2 py-0.5 rounded bg-white dark:bg-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-200 font-semibold text-xs border border-zinc-300 dark:border-zinc-600 shadow-2xs"
+                                >
+                                  +1
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Total Summary & Scanner Gun Tip */}
+                        <div className="bg-zinc-100 dark:bg-zinc-800/80 p-2.5 rounded-lg flex items-center justify-between text-xs border border-zinc-200 dark:border-zinc-700">
+                          <span className="text-zinc-600 dark:text-zinc-400 font-medium">Total Quantity to Sign In:</span>
+                          <span className="font-mono font-bold text-sm text-zinc-900 dark:text-zinc-100">
+                            {currentUnits} Total Units ({currentPacks} {currentPacks === 1 ? 'Pack' : 'Packs'}{remainder > 0 ? ` + ${remainder} loose` : ''})
+                          </span>
+                        </div>
+
+                        <p className="text-[11px] text-zinc-500 dark:text-zinc-400 flex items-center gap-1.5 bg-blue-50/50 dark:bg-blue-950/20 p-2 rounded border border-blue-200/50 dark:border-blue-800/40">
+                          <span>⚡</span>
+                          <span>Scan the barcode or part number again with your scanner gun to add +1 pack per scan.</span>
+                        </p>
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div>
+                      <div className="flex items-center justify-between mb-1.5">
+                        <label htmlFor="quantity-to-add" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">
+                          Total Quantity to Add (Units)
+                        </label>
+                        <div className="flex items-center gap-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+                          <span>Unit adjust:</span>
+                          {[-5, -1, 1, 5].map(delta => (
+                            <button
+                              key={delta}
+                              type="button"
+                              onClick={() => {
+                                const cur = parseInt(quantityToAdd, 10) || 0;
+                                setQuantityToAdd(String(Math.max(1, cur + delta)));
+                              }}
+                              className="px-1.5 py-0.5 rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-300 font-mono font-semibold transition-colors"
+                              title={`${delta > 0 ? 'Add' : 'Minus'} ${Math.abs(delta)} unit${Math.abs(delta) > 1 ? 's' : ''}`}
+                            >
+                              {delta > 0 ? `+${delta}` : delta}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const cur = parseInt(quantityToAdd, 10) || 0;
+                            setQuantityToAdd(String(Math.max(1, cur - 1)));
+                          }}
+                          className="h-10 px-3 flex items-center justify-center rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-200 active:scale-95 font-bold text-xs sm:text-sm transition-all shadow-2xs select-none shrink-0"
+                          title="Decrease by 1 unit"
+                        >
+                          -1 Unit
+                        </button>
+
+                        <input 
+                            type="number"
+                            id="quantity-to-add"
+                            name="quantity"
+                            min="1"
+                            step="1"
+                            required
+                            autoFocus
+                            placeholder="Enter quantity"
+                            value={quantityToAdd}
+                            onChange={(e) => setQuantityToAdd(e.target.value)}
+                            className={`${formInputStyle} text-center font-mono font-bold text-base flex-1`}
+                        />
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const cur = parseInt(quantityToAdd, 10) || 0;
+                            setQuantityToAdd(String(cur + 1));
+                          }}
+                          className="h-10 px-3 flex items-center justify-center rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-200 active:scale-95 font-bold text-xs sm:text-sm transition-all shadow-2xs select-none shrink-0"
+                          title="Increase by 1 unit"
+                        >
+                          +1 Unit
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })()}
                 <div className="flex justify-end space-x-3 pt-4">
                     <button type="button" onClick={() => { setIsAddQuantityModalOpen(false); setItemForQuantityAdd(null); setQuantityToAdd(''); }} className="px-4 py-2 bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-600 text-zinc-800 dark:text-zinc-200 rounded-md hover:bg-zinc-50 dark:hover:bg-zinc-600 transition-colors text-sm font-medium">Cancel</button>
-                    <button type="submit" disabled={isSubmitting} className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors disabled:bg-blue-400 dark:disabled:bg-blue-800 disabled:cursor-not-allowed flex items-center justify-center min-w-[120px] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 dark:focus:ring-offset-zinc-800">
+                    <button type="submit" disabled={isSubmitting} className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors disabled:bg-blue-400 dark:disabled:bg-blue-800 disabled:cursor-not-allowed flex items-center justify-center min-w-[150px] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 dark:focus:ring-offset-zinc-800">
                         {isSubmitting && <Spinner className="-ml-1 mr-3 h-5 w-5" />}
-                        {isSubmitting ? 'Adding...' : 'Confirm Add'}
+                        {(() => {
+                          if (isSubmitting) return 'Adding...';
+                          const qty = parseInt(quantityToAdd, 10) || 0;
+                          const packInfo = getItemPackInfo(itemForQuantityAdd.barcode, itemForQuantityAdd);
+                          if (packInfo.isPack && packInfo.packQuantity > 1 && qty > 0) {
+                            const pCount = Math.floor(qty / packInfo.packQuantity);
+                            const pRem = qty % packInfo.packQuantity;
+                            const packLabel = pRem > 0 
+                              ? `${pCount} Pk + ${pRem} (${qty} Units)`
+                              : `${pCount} ${pCount === 1 ? 'Pack' : 'Packs'} (${qty} Units)`;
+                            return `Add ${packLabel}`;
+                          }
+                          return qty > 0 ? `Add ${qty} Unit${qty !== 1 ? 's' : ''}` : 'Confirm Add';
+                        })()}
                     </button>
                 </div>
             </form>
@@ -8275,15 +9720,10 @@ const StockManagerApp = ({
                   </div>
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                  <div>
-                      <label htmlFor="type-price" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Price (£)</label>
-                      <input id="type-price" type="number" step="0.01" min="0" placeholder="0.00" value={newItemTypeInfo.price} onChange={(e) => setNewItemTypeInfo(prev => ({...prev, price: e.target.value}))} className={formInputStyle} />
-                  </div>
-                  <div>
-                      <label htmlFor="type-threshold" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Stock Threshold</label>
-                      <input id="type-threshold" type="number" min="0" step="1" placeholder="0" value={newItemTypeInfo.stock_threshold} onChange={(e) => setNewItemTypeInfo(prev => ({...prev, stock_threshold: e.target.value}))} className={formInputStyle} />
-                  </div>
+              <div>
+                  <label htmlFor="type-threshold" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Stock Threshold</label>
+                  <input id="type-threshold" type="number" min="0" step="1" placeholder="0" value={newItemTypeInfo.stock_threshold} onChange={(e) => setNewItemTypeInfo(prev => ({...prev, stock_threshold: e.target.value}))} className={formInputStyle} />
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">Item costing and valuation are calculated directly from Supplier Part Numbers (Purchase Price).</p>
               </div>
 
               <div className="p-3 bg-zinc-50 dark:bg-zinc-900/50 rounded-lg border border-zinc-200 dark:border-zinc-700 flex items-start space-x-3">
@@ -8401,15 +9841,10 @@ const StockManagerApp = ({
                      </div>
                  </div>
 
-                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                     <div>
-                         <label htmlFor="edit-type-price" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Price (£)</label>
-                         <input id="edit-type-price" type="number" step="0.01" min="0" placeholder="0.00" value={editingItemType.price || ''} onChange={(e) => setEditingItemType(prev => ({...prev, price: e.target.value}))} className={formInputStyle} />
-                     </div>
-                     <div>
-                         <label htmlFor="edit-type-threshold" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Stock Threshold</label>
-                         <input id="edit-type-threshold" type="number" min="0" step="1" placeholder="0" value={editingItemType.stock_threshold || ''} onChange={(e) => setEditingItemType(prev => ({...prev, stock_threshold: e.target.value}))} className={formInputStyle} />
-                     </div>
+                 <div>
+                     <label htmlFor="edit-type-threshold" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Stock Threshold</label>
+                     <input id="edit-type-threshold" type="number" min="0" step="1" placeholder="0" value={editingItemType.stock_threshold || ''} onChange={(e) => setEditingItemType(prev => ({...prev, stock_threshold: e.target.value}))} className={formInputStyle} />
+                     <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">Item costing and valuation are calculated directly from Supplier Part Numbers (Purchase Price).</p>
                  </div>
 
                 <div className="p-3 bg-zinc-50 dark:bg-zinc-900/50 rounded-lg border border-zinc-200 dark:border-zinc-700 flex items-start space-x-3">
@@ -9161,39 +10596,221 @@ const StockManagerApp = ({
       </Modal>
 
       <Modal isOpen={!!returnModalData} onClose={() => setReturnModalData(null)} title="Return Items to Stock">
-        {returnModalData && (
-          <form onSubmit={handleConfirmReturn} className="space-y-4">
-              <p className="text-sm text-zinc-600 dark:text-zinc-300">
-                  You are returning <strong>{returnModalData.name}</strong> from <strong>{returnModalData.assigned_to}</strong> back to stock ({(activeLocation && activeLocation !== 'All') ? activeLocation : (displayLocations[0] || Location.LEADING_STORES)}).
-              </p>
-              
-              {(returnModalData.quantity > 1 || (returnModalData.items && returnModalData.items.length > 1)) && (
-                  <div>
-                      <label htmlFor="return-quantity" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-                          Quantity to Return (Max {returnModalData.quantity || returnModalData.items.length})
-                      </label>
-                      <input 
-                          type="number" 
-                          id="return-quantity" 
-                          min="1" 
-                          max={returnModalData.quantity || returnModalData.items.length} 
-                          value={returnQuantity} 
-                          onChange={(e) => setReturnQuantity(e.target.value)}
-                          className={formInputStyle}
-                          required
-                      />
+        {returnModalData && (() => {
+          const maxReturn = returnModalData.quantity || (returnModalData.items ? returnModalData.items.length : 1);
+          const barcodeOrItem = returnModalData.barcode || returnModalData.items?.[0]?.barcode;
+          const packInfo = getItemPackInfo(barcodeOrItem, returnModalData);
+          const isPackItem = packInfo.isPack && packInfo.packQuantity > 0;
+          const currentVal = parseInt(returnQuantity, 10) || 0;
+          const currentPacks = isPackItem ? Math.floor(currentVal / packInfo.packQuantity) : 0;
+          const remainderUnits = isPackItem ? (currentVal % packInfo.packQuantity) : 0;
+          const maxPacks = isPackItem ? Math.floor(maxReturn / packInfo.packQuantity) : 0;
+          const returnLoc = (activeLocation && activeLocation !== 'All') ? activeLocation : (displayLocations[0] || Location.LEADING_STORES);
+
+          const handleAdjustUnits = (delta) => {
+            const next = Math.max(1, Math.min(maxReturn, (currentVal || 0) + delta));
+            setReturnQuantity(next);
+          };
+
+          const handleAdjustPacks = (delta) => {
+            if (!isPackItem) return;
+            const targetPacks = Math.max(0, currentPacks + delta);
+            const targetUnits = Math.min(maxReturn, (targetPacks * packInfo.packQuantity) + remainderUnits);
+            setReturnQuantity(Math.max(1, targetUnits));
+          };
+
+          return (
+            <form onSubmit={handleConfirmReturn} className="space-y-4">
+                <div className="p-3 bg-purple-50 dark:bg-purple-950/40 border border-purple-200 dark:border-purple-800 rounded-md text-xs text-purple-900 dark:text-purple-200 flex items-center gap-2">
+                    <BuildingStoreIcon className="w-4 h-4 flex-shrink-0 text-purple-600" />
+                    <span>Returning <strong>{returnModalData.name}</strong> from <strong>{returnModalData.assigned_to}</strong> to <strong>{returnLoc}</strong></span>
+                </div>
+
+                {/* Pack Configuration & Presets Banner */}
+                {isPackItem && maxReturn > 1 && (
+                  <div className="p-3 bg-blue-50/80 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 rounded-lg space-y-2.5 text-xs text-blue-900 dark:text-blue-200">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className="text-xl flex-shrink-0">📦</span>
+                        <div>
+                          <div className="font-semibold flex items-center gap-1.5 flex-wrap">
+                            <span>Supplier Pack: <strong>{packInfo.packQuantity} units / pack</strong></span>
+                            {packInfo.partNumber && (
+                              <span className="font-mono text-[10px] bg-blue-100 dark:bg-blue-900/80 px-1.5 py-0.5 rounded text-blue-800 dark:text-blue-200">
+                                Part #{packInfo.partNumber}
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-[11px] text-blue-700 dark:text-blue-300">
+                            Return full packs or partial loose items.
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Full Pack Stepper */}
+                      <div className="flex items-center gap-1 bg-white dark:bg-zinc-800 p-1 rounded-md border border-blue-200 dark:border-blue-700 shadow-2xs shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => handleAdjustPacks(-1)}
+                          disabled={currentVal <= packInfo.packQuantity && remainderUnits === 0}
+                          className="px-2 py-1 bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-700 dark:hover:bg-zinc-600 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-700 dark:text-zinc-200 rounded font-semibold text-xs transition-colors"
+                          title={`Decrease by 1 pack (-${packInfo.packQuantity} units)`}
+                        >
+                          -1 Pack
+                        </button>
+                        <span className="font-mono font-bold text-xs text-blue-600 dark:text-blue-400 px-1.5 min-w-[50px] text-center">
+                          {currentPacks} {currentPacks === 1 ? 'Pk' : 'Pks'}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => handleAdjustPacks(1)}
+                          disabled={currentVal + packInfo.packQuantity > maxReturn}
+                          className="px-2 py-1 bg-blue-600 hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded font-semibold text-xs transition-colors shadow-2xs"
+                          title={`Increase by 1 pack (+${packInfo.packQuantity} units)`}
+                        >
+                          +1 Pack
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Quick Pack Presets */}
+                    <div>
+                      <div className="text-[11px] font-medium text-zinc-600 dark:text-zinc-400 mb-1.5 flex items-center justify-between">
+                        <span>Quick Presets:</span>
+                        {currentVal > 0 && (
+                          <span className="font-mono text-blue-700 dark:text-blue-300 font-semibold">
+                            = {currentPacks} Pack{currentPacks !== 1 ? 's' : ''}{remainderUnits > 0 ? ` + ${remainderUnits} loose` : ''} ({currentVal} total units)
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        {Array.from({ length: Math.min(6, maxPacks) }, (_, i) => i + 1).map(pNum => {
+                          const totalU = pNum * packInfo.packQuantity;
+                          const isSelected = currentVal === totalU;
+                          return (
+                            <button
+                              key={pNum}
+                              type="button"
+                              onClick={() => setReturnQuantity(totalU)}
+                              className={`py-1 px-2.5 rounded-md font-medium text-xs transition-all border ${
+                                isSelected
+                                  ? 'bg-blue-600 border-blue-600 text-white shadow-xs font-bold ring-2 ring-blue-300 dark:ring-blue-800'
+                                  : 'bg-white dark:bg-zinc-800 border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-300 hover:border-blue-400 hover:bg-blue-50/50 dark:hover:bg-blue-950/20'
+                              }`}
+                            >
+                              <span>{pNum} {pNum === 1 ? 'Pack' : 'Packs'} ({totalU})</span>
+                            </button>
+                          );
+                        })}
+                        <button
+                          type="button"
+                          onClick={() => setReturnQuantity(maxReturn)}
+                          className={`py-1 px-2.5 rounded-md font-medium text-xs transition-all border ${
+                            currentVal === maxReturn
+                              ? 'bg-purple-600 border-purple-600 text-white shadow-xs font-bold ring-2 ring-purple-300 dark:ring-purple-800'
+                              : 'bg-white dark:bg-zinc-800 border-purple-300 dark:border-purple-700 text-purple-700 dark:text-purple-300 hover:bg-purple-50 dark:hover:bg-purple-950/30'
+                          }`}
+                          title={`Return all ${maxReturn} assigned items`}
+                        >
+                          All ({maxReturn})
+                        </button>
+                      </div>
+                    </div>
                   </div>
-              )}
-              
-              <div className="flex justify-end space-x-3 pt-6 border-t border-zinc-200 dark:border-zinc-700 mt-6">
-                  <button type="button" onClick={() => setReturnModalData(null)} className="px-4 py-2 bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-600 text-zinc-800 dark:text-zinc-200 rounded-md hover:bg-zinc-50 dark:hover:bg-zinc-600 transition-colors text-sm font-medium disabled:opacity-50">Cancel</button>
-                  <button type="submit" disabled={isReturningStock} className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors text-sm font-medium flex items-center disabled:bg-blue-400">
-                      {isReturningStock && <Spinner className="w-4 h-4 mr-2" />}
-                      {isReturningStock ? 'Returning...' : 'Confirm Return'}
-                  </button>
-              </div>
-          </form>
-        )}
+                )}
+                
+                {maxReturn > 1 && (
+                    <div>
+                        <div className="flex items-center justify-between mb-1.5">
+                          <label htmlFor="return-quantity" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">
+                            Quantity to Return (Individual Units)
+                          </label>
+                          <div className="flex items-center gap-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+                            <span>Unit adjust:</span>
+                            {[-5, -1, 1, 5].map(delta => (
+                              <button
+                                key={delta}
+                                type="button"
+                                onClick={() => handleAdjustUnits(delta)}
+                                className="px-1.5 py-0.5 rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-300 font-mono font-semibold transition-colors"
+                                title={`${delta > 0 ? 'Add' : 'Minus'} ${Math.abs(delta)} unit${Math.abs(delta) > 1 ? 's' : ''}`}
+                              >
+                                {delta > 0 ? `+${delta}` : delta}
+                              </button>
+                            ))}
+                            <button
+                              type="button"
+                              onClick={() => setReturnQuantity(maxReturn)}
+                              className="px-1.5 py-0.5 rounded border border-purple-200 dark:border-purple-800 bg-purple-50 dark:bg-purple-900/30 hover:bg-purple-100 text-purple-700 dark:text-purple-300 text-xs font-semibold"
+                            >
+                              Max ({maxReturn})
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => handleAdjustUnits(-1)}
+                            disabled={currentVal <= 1}
+                            className="h-10 px-3 flex items-center justify-center rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-200 disabled:opacity-40 disabled:cursor-not-allowed active:scale-95 font-bold text-xs sm:text-sm transition-all shadow-2xs select-none shrink-0"
+                            title="Decrease by 1 individual unit"
+                          >
+                            -1 Unit
+                          </button>
+
+                          <input 
+                              type="number" 
+                              id="return-quantity" 
+                              min="1" 
+                              max={maxReturn} 
+                              value={returnQuantity} 
+                              onChange={(e) => setReturnQuantity(e.target.value)}
+                              className={`${formInputStyle} text-center font-mono font-bold text-base flex-1`}
+                              required
+                          />
+
+                          <button
+                            type="button"
+                            onClick={() => handleAdjustUnits(1)}
+                            disabled={currentVal >= maxReturn}
+                            className="h-10 px-3 flex items-center justify-center rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-200 disabled:opacity-40 disabled:cursor-not-allowed active:scale-95 font-bold text-xs sm:text-sm transition-all shadow-2xs select-none shrink-0"
+                            title="Increase by 1 individual unit"
+                          >
+                            +1 Unit
+                          </button>
+                        </div>
+
+                        <div className="mt-1.5 flex items-center justify-between text-xs text-zinc-500 dark:text-zinc-400">
+                          <span>Max available to return: <strong>{maxReturn}</strong></span>
+                          {currentVal > 0 && isPackItem && (
+                            <span className="text-blue-600 dark:text-blue-400 font-medium">
+                              {currentPacks} full pack{currentPacks !== 1 ? 's' : ''}{remainderUnits > 0 ? ` + ${remainderUnits} loose` : ''}
+                            </span>
+                          )}
+                        </div>
+                    </div>
+                )}
+                
+                <div className="flex justify-end space-x-3 pt-6 border-t border-zinc-200 dark:border-zinc-700 mt-6">
+                    <button type="button" onClick={() => setReturnModalData(null)} className="px-4 py-2 bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-600 text-zinc-800 dark:text-zinc-200 rounded-md hover:bg-zinc-50 dark:hover:bg-zinc-600 transition-colors text-sm font-medium disabled:opacity-50">Cancel</button>
+                    <button type="submit" disabled={isReturningStock} className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors text-sm font-medium flex items-center disabled:bg-blue-400">
+                        {isReturningStock && <Spinner className="w-4 h-4 mr-2" />}
+                        {isReturningStock ? 'Returning...' : (() => {
+                          if (currentVal <= 0) return 'Confirm Return';
+                          if (isPackItem && currentPacks > 0) {
+                            const label = remainderUnits > 0 
+                              ? `${currentPacks} Pk + ${remainderUnits} Loose (${currentVal} Units)`
+                              : `${currentPacks} ${currentPacks === 1 ? 'Pack' : 'Packs'} (${currentVal} Units)`;
+                            return `Confirm Return: ${label}`;
+                          }
+                          return maxReturn > 1 ? `Confirm Return (${currentVal} Units)` : 'Confirm Return';
+                        })()}
+                    </button>
+                </div>
+            </form>
+          );
+        })()}
       </Modal>
 
       <Modal isOpen={confirmationModal.isOpen} onClose={() => setConfirmationModal({isOpen: false})} title={confirmationModal.title}>
@@ -9852,6 +11469,40 @@ const StockManagerApp = ({
                                   placeholder="e.g. 14"
                                 />
                               </div>
+                              <div>
+                                <label className="block text-xs font-medium text-zinc-600 dark:text-zinc-400">Supplier Pack Qty</label>
+                                <input
+                                  type="number"
+                                  min="1"
+                                  step="1"
+                                  value={editingPartNumber.pack_quantity ?? ''}
+                                  onChange={(e) => setEditingPartNumber(prev => ({ ...prev, pack_quantity: e.target.value }))}
+                                  className={`${formInputStyle} !mt-0 text-xs py-1.5 font-mono`}
+                                  placeholder="e.g. 10"
+                                />
+                              </div>
+                            </div>
+
+                            <div className="p-2 bg-blue-50/60 dark:bg-blue-950/20 rounded border border-blue-200 dark:border-blue-900/40 flex items-start space-x-2">
+                              <input
+                                type="checkbox"
+                                id={`edit-pack-toggle-${part.id}`}
+                                checked={Boolean(editingPartNumber.send_in_packs)}
+                                onChange={(e) => setEditingPartNumber(prev => ({
+                                  ...prev,
+                                  send_in_packs: e.target.checked,
+                                  pack_quantity: e.target.checked && (!prev.pack_quantity || parseInt(prev.pack_quantity, 10) < 1) ? '10' : prev.pack_quantity
+                                }))}
+                                className="mt-0.5 h-4 w-4 rounded border-zinc-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+                              />
+                              <div className="text-xs">
+                                <label htmlFor={`edit-pack-toggle-${part.id}`} className="font-semibold text-zinc-900 dark:text-zinc-100 cursor-pointer">
+                                  Sent out in packs
+                                </label>
+                                <p className="text-[11px] text-zinc-500 dark:text-zinc-400 mt-0.5">
+                                  When scanned during sign out, automatically default the quantity to this pack size.
+                                </p>
+                              </div>
                             </div>
                             <div>
                               <label className="block text-xs font-medium text-zinc-600 dark:text-zinc-400">Notes</label>
@@ -9903,6 +11554,18 @@ const StockManagerApp = ({
                                 <span className="text-xs font-semibold text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 px-2 py-0.5 rounded-full flex items-center gap-1">
                                   ⏱️ Lead Time: {part.lead_time_days} days
                                 </span>
+                              )}
+                              {part.send_in_packs ? (
+                                <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/50 text-blue-800 dark:text-blue-200 border border-blue-200 dark:border-blue-800 flex items-center gap-1">
+                                  <span>📦 Pack of {part.pack_quantity || 1}</span>
+                                  <span className="text-[10px] text-blue-600 dark:text-blue-300 font-normal">(Auto Sign-Out)</span>
+                                </span>
+                              ) : (
+                                (parseInt(part.pack_quantity, 10) > 1) && (
+                                  <span className="text-xs font-medium px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 border border-zinc-200 dark:border-zinc-700">
+                                    Pack: {part.pack_quantity}
+                                  </span>
+                                )
                               )}
                             </div>
                             <div className="flex items-center gap-3 text-xs text-zinc-500 dark:text-zinc-400 mt-1 flex-wrap">
@@ -10032,6 +11695,46 @@ const StockManagerApp = ({
                   </div>
                 </div>
 
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 p-3 bg-blue-50/60 dark:bg-blue-950/20 rounded-lg border border-blue-200 dark:border-blue-900/40">
+                  <div>
+                    <label className="block text-xs font-semibold text-zinc-700 dark:text-zinc-300 mb-1">
+                      Supplier Pack Quantity
+                    </label>
+                    <input
+                      type="number"
+                      min="1"
+                      step="1"
+                      placeholder="e.g. 10"
+                      value={newPartNumberInfo.pack_quantity}
+                      onChange={(e) => setNewPartNumberInfo(prev => ({ ...prev, pack_quantity: e.target.value }))}
+                      className={formInputStyle + " text-sm py-2 font-mono"}
+                    />
+                    <span className="text-[11px] text-zinc-500 dark:text-zinc-400">Total units contained in one supplier pack.</span>
+                  </div>
+
+                  <div className="flex items-start gap-2.5 pt-1 sm:pt-4">
+                    <input
+                      type="checkbox"
+                      id="new-send-in-packs"
+                      checked={Boolean(newPartNumberInfo.send_in_packs)}
+                      onChange={(e) => setNewPartNumberInfo(prev => ({
+                        ...prev,
+                        send_in_packs: e.target.checked,
+                        pack_quantity: e.target.checked && (!prev.pack_quantity || parseInt(prev.pack_quantity, 10) < 1) ? '10' : prev.pack_quantity
+                      }))}
+                      className="mt-0.5 h-4 w-4 rounded border-zinc-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+                    />
+                    <div>
+                      <label htmlFor="new-send-in-packs" className="text-xs font-semibold text-zinc-900 dark:text-zinc-100 cursor-pointer">
+                        Sent out in packs
+                      </label>
+                      <p className="text-[11px] text-zinc-500 dark:text-zinc-400 mt-0.5">
+                        When scanned during sign out, automatically default the quantity to this pack size.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
                 <div>
                   <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
                     Notes / Description (Optional)
@@ -10066,7 +11769,7 @@ const StockManagerApp = ({
                   setIsManagePartNumbersModalOpen(false);
                   setSelectedItemTypeForParts(null);
                   setEditingPartNumber(null);
-                  setNewPartNumberInfo({ supplier_id: '', supplier_name: '', part_number: '', barcode: '', purchase_price: '', notes: '' });
+                  setNewPartNumberInfo({ supplier_id: '', supplier_name: '', part_number: '', barcode: '', purchase_price: '', pack_quantity: '10', send_in_packs: false, lead_time_days: '', notes: '' });
                 }}
                 className="px-4 py-2 bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-700 dark:hover:bg-zinc-600 text-zinc-800 dark:text-zinc-200 text-sm font-medium rounded-md transition-colors"
               >
@@ -10505,9 +12208,6 @@ const StockManagerApp = ({
                 <span className="px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-900/40 text-amber-900 dark:text-amber-200 font-medium">
                   Currently With: {transferTeamData.fromTeam}
                 </span>
-                <span className="px-2 py-0.5 rounded bg-blue-100 dark:bg-blue-900/40 text-blue-800 dark:text-blue-300 font-medium">
-                  Storehouse: {transferTeamData.location}
-                </span>
               </div>
             </div>
           ) : (
@@ -10627,25 +12327,6 @@ const StockManagerApp = ({
                   ))}
               </select>
             </div>
-          </div>
-
-          <div>
-            <label htmlFor="transfer-team-loc" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-              Storehouse / Depot Location
-            </label>
-            <select
-              id="transfer-team-loc"
-              value={transferTeamData.location}
-              onChange={(e) => setTransferTeamData(prev => ({ ...prev, location: e.target.value }))}
-              className={formInputStyle + " text-sm py-2"}
-            >
-              {displayLocations.map(loc => (
-                <option key={loc} value={loc}>{loc}</option>
-              ))}
-            </select>
-            <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">
-              Storehouse associated with this stock movement.
-            </p>
           </div>
 
           {/* Serial Number Selection or Quantity Input */}

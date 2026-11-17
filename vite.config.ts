@@ -8,6 +8,9 @@ export default defineConfig(({ mode }) => {
       server: {
         port: 3000,
         host: '0.0.0.0',
+        warmup: {
+          clientFiles: ['./index.html', './main.jsx', './App.jsx'],
+        },
       },
       plugins: [react()],
       define: {

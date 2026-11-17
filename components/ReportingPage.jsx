@@ -175,6 +175,74 @@ export const ReportingPage = ({
   const [assignedPartFilter, setAssignedPartFilter] = useState('All');
   const [expandedTeamItemKey, setExpandedTeamItemKey] = useState(null);
 
+  // Stock Thresholds tab view & filter states
+  const [showAllStockThresholds, setShowAllStockThresholds] = useState(false);
+  const [thresholdStatusFilter, setThresholdStatusFilter] = useState('ALL'); // 'ALL', 'CRITICAL', 'WARNING', 'HEALTHY'
+  const [thresholdSearchTerm, setThresholdSearchTerm] = useState('');
+  // 30-day company-wide sign-outs map { [itemName]: count } for weeks remaining calculation
+  const [usageStatsByItem, setUsageStatsByItem] = useState({});
+
+  const fetchUsageStats = useCallback(async () => {
+    try {
+      const thirtyDaysAgoIso = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+      if (isTrainingMode) {
+        const movs = trainingManager.movements || [];
+        const counts = {};
+        movs.forEach(m => {
+          if (m.movement_type === 'OUT' && m.created_at >= thirtyDaysAgoIso) {
+            counts[m.item_name] = (counts[m.item_name] || 0) + 1;
+          }
+        });
+        setUsageStatsByItem(counts);
+        return;
+      }
+
+      const pageSize = 1000;
+      let from = 0;
+      let hasMore = true;
+      const counts = {};
+
+      while (hasMore) {
+        const { data, error } = await supabase
+          .from('stock_movements')
+          .select('item_name')
+          .eq('movement_type', 'OUT')
+          .gte('created_at', thirtyDaysAgoIso)
+          .range(from, from + pageSize - 1);
+
+        if (error) {
+          console.warn("Usage stats query error:", error);
+          break;
+        }
+
+        if (data && data.length > 0) {
+          data.forEach(m => {
+            if (m.item_name) {
+              counts[m.item_name] = (counts[m.item_name] || 0) + 1;
+            }
+          });
+          if (data.length < pageSize) {
+            hasMore = false;
+          } else {
+            from += pageSize;
+          }
+        } else {
+          hasMore = false;
+        }
+      }
+      setUsageStatsByItem(counts);
+    } catch (err) {
+      console.warn("Could not fetch 30-day usage stats:", err);
+    }
+  }, [isTrainingMode]);
+
+  useEffect(() => {
+    fetchUsageStats();
+  }, [fetchUsageStats, lastRefreshedAt]);
+
+  // Movements tab mobile view mode
+  const [movementsMobileViewMode, setMovementsMobileViewMode] = useState('cards'); // 'cards' | 'table'
+
   // Part Number modal details state
   const [viewAssociatedBarcodesModal, setViewAssociatedBarcodesModal] = useState(null);
   const [barcodeSearchModalTerm, setBarcodeSearchModalTerm] = useState('');
@@ -788,7 +856,7 @@ export const ReportingPage = ({
   }, [stock, isUniqueItem, effectiveSupplierPartNumbers]);
 
   // --- Stock Thresholds Data ---
-  const thresholdData = useMemo(() => {
+  const allThresholdItems = useMemo(() => {
     const stockCounts = {};
     stock.forEach(item => {
       if (!item.assigned_to || item.assigned_to === Team.UNASSIGNED) {
@@ -813,41 +881,130 @@ export const ReportingPage = ({
         leadTimeDays = parseInt(partMatch.lead_time_days, 10) || 0;
       }
 
+      // 30-day sign-outs usage
+      let signOutCount30d = 0;
+      if (usageStatsByItem && typeof usageStatsByItem[type.name] === 'number') {
+        signOutCount30d = usageStatsByItem[type.name];
+      } else if (reportData && Array.isArray(reportData)) {
+        signOutCount30d = reportData.filter(m => m.item_name === type.name && m.movement_type === 'OUT').length;
+      }
+
+      // Measured weekly burn rate based on actual 30-day usage
+      const weeklyUsage = (signOutCount30d / 30) * 7;
+
+      // Weeks of stock remaining based on usage
+      let weeksRemaining = null;
+      if (currentStock === 0) {
+        weeksRemaining = 0;
+      } else if (weeklyUsage > 0) {
+        weeksRemaining = currentStock / weeklyUsage;
+      } else {
+        // No recorded sign-outs in 30 days
+        weeksRemaining = null;
+      }
+
       // Factor in lead time buffer: lead time buffer adds safety buffer based on lead time days
-      const estimatedDailyUsage = Math.max(1, Math.ceil(baseThreshold / 14));
-      const leadTimeBuffer = leadTimeDays > 0 ? (leadTimeDays * estimatedDailyUsage) : 0;
+      const estimatedDailyUsage = weeklyUsage > 0
+        ? Math.max(0.5, weeklyUsage / 7)
+        : Math.max(1, Math.ceil(baseThreshold / 14));
+      const leadTimeBuffer = leadTimeDays > 0 ? Math.ceil(leadTimeDays * estimatedDailyUsage) : 0;
       const effectiveThreshold = baseThreshold + leadTimeBuffer;
 
-      let status = 'OK';
-      if (currentStock <= effectiveThreshold) {
-        status = 'CRITICAL';
-      } else if (effectiveThreshold > 0 && currentStock <= effectiveThreshold * 1.5) {
-        status = 'WARNING';
+      let status = 'HEALTHY';
+      let suggestedOrder = 0;
+
+      if (effectiveThreshold > 0) {
+        if (currentStock <= effectiveThreshold) {
+          status = 'CRITICAL';
+          suggestedOrder = Math.max(1, effectiveThreshold - currentStock);
+        } else if (currentStock <= effectiveThreshold * 1.5) {
+          status = 'WARNING';
+          suggestedOrder = Math.max(0, Math.ceil(effectiveThreshold * 1.25) - currentStock);
+        } else {
+          status = 'HEALTHY';
+          suggestedOrder = 0;
+        }
+      } else {
+        // If threshold not set (base threshold is 0)
+        if (currentStock === 0) {
+          status = 'CRITICAL';
+          suggestedOrder = 5;
+        } else {
+          status = 'HEALTHY';
+          suggestedOrder = 0;
+        }
       }
 
-      if (status !== 'OK') {
-        const suggestedOrder = Math.max(0, effectiveThreshold - currentStock);
-
-        report.push({
-          name: type.name,
-          currentStock,
-          baseThreshold,
-          effectiveThreshold,
-          leadTimeDays,
-          suggestedOrder,
-          status,
-          isUnique: isUniqueItem(type.name),
-          partNumber: pNum,
-          supplierName: sName
-        });
-      }
+      report.push({
+        id: type.id,
+        name: type.name,
+        category: type.category,
+        currentStock,
+        baseThreshold,
+        effectiveThreshold,
+        leadTimeDays,
+        suggestedOrder,
+        status,
+        isUnique: isUniqueItem(type.name) || Boolean(type.is_unique),
+        partNumber: pNum,
+        supplierName: sName,
+        signOutCount30d,
+        weeklyUsage,
+        weeksRemaining
+      });
     });
 
     return report.sort((a, b) => {
-      if (a.status === b.status) return a.currentStock - b.currentStock;
-      return a.status === 'CRITICAL' ? -1 : 1;
+      // Sort by RAG priority: CRITICAL first, then WARNING, then HEALTHY
+      const rank = { CRITICAL: 1, WARNING: 2, HEALTHY: 3 };
+      if (rank[a.status] !== rank[b.status]) {
+        return rank[a.status] - rank[b.status];
+      }
+      if (a.status === 'CRITICAL' || a.status === 'WARNING') {
+        if (a.currentStock !== b.currentStock) return a.currentStock - b.currentStock;
+      }
+      return a.name.localeCompare(b.name);
     });
-  }, [stock, itemTypes, isUniqueItem, effectiveSupplierPartNumbers]);
+  }, [stock, itemTypes, isUniqueItem, effectiveSupplierPartNumbers, usageStatsByItem, reportData]);
+
+  const thresholdStats = useMemo(() => {
+    let critical = 0;
+    let warning = 0;
+    let healthy = 0;
+    allThresholdItems.forEach(item => {
+      if (item.status === 'CRITICAL') critical++;
+      else if (item.status === 'WARNING') warning++;
+      else if (item.status === 'HEALTHY') healthy++;
+    });
+    return { critical, warning, healthy, total: allThresholdItems.length };
+  }, [allThresholdItems]);
+
+  const thresholdData = useMemo(() => {
+    return allThresholdItems.filter(item => {
+      // 1. Text search
+      if (thresholdSearchTerm.trim()) {
+        const q = thresholdSearchTerm.toLowerCase();
+        const nameMatch = item.name.toLowerCase().includes(q);
+        const partMatch = item.partNumber && item.partNumber.toLowerCase().includes(q);
+        const suppMatch = item.supplierName && item.supplierName.toLowerCase().includes(q);
+        const catMatch = item.category && item.category.toLowerCase().includes(q);
+        if (!nameMatch && !partMatch && !suppMatch && !catMatch) return false;
+      }
+
+      // 2. Specific status pill filter:
+      if (thresholdStatusFilter === 'CRITICAL') return item.status === 'CRITICAL';
+      if (thresholdStatusFilter === 'WARNING') return item.status === 'WARNING';
+      if (thresholdStatusFilter === 'HEALTHY') return item.status === 'HEALTHY';
+
+      // 3. Overall toggle:
+      // If showAllStockThresholds is false, only show items needing order (CRITICAL)
+      if (!showAllStockThresholds) {
+        return item.status === 'CRITICAL';
+      }
+
+      return true;
+    });
+  }, [allThresholdItems, thresholdSearchTerm, thresholdStatusFilter, showAllStockThresholds]);
 
   // --- Unique Item Serial Audit Trail Handler ---
   const handlePerformSerialAudit = useCallback(async (serialToLookup) => {
@@ -1850,95 +2007,137 @@ export const ReportingPage = ({
               </div>
             ) : (
               <>
-                {/* Mobile View: Cards */}
-                <div className="md:hidden divide-y divide-zinc-200 dark:divide-zinc-700">
-                  {groupedReportData.map(move => (
-                    <div key={move.id} className="p-4 space-y-2">
-                      <div className="flex justify-between items-start gap-2">
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-1.5 flex-wrap">
-                            <p className="font-semibold text-zinc-900 dark:text-zinc-100 text-sm">{move.item_name}</p>
-                            {move.isUnique && (
-                              <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-300">
-                                ⚡ Meter / Unique
-                              </span>
-                            )}
-                            {move.partNumber && (
-                              <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-mono font-medium bg-zinc-100 text-zinc-800 dark:bg-zinc-700 dark:text-zinc-200">
-                                Part: {move.partNumber}
-                              </span>
-                            )}
-                          </div>
-                          <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">
-                            {new Date(move.created_at).toLocaleString()}
-                          </p>
-                        </div>
-
-                        <span className={`px-2.5 py-0.5 text-xs font-semibold rounded-full whitespace-nowrap shrink-0 inline-flex items-center ${
-                          move.movement_type === 'IN'
-                            ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900 dark:text-emerald-300'
-                            : 'bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-300'
-                        }`}>
-                          {move.movement_type === 'IN' ? 'Sign In' : 'Sign Out'}
-                        </span>
-                      </div>
-
-                      <div className="text-xs text-zinc-600 dark:text-zinc-300 grid grid-cols-2 gap-1 pt-1">
-                        <p><span className="text-zinc-400">From:</span> {move.location_from}</p>
-                        <p><span className="text-zinc-400">To:</span> {move.location_to}</p>
-                        <p><span className="text-zinc-400">User:</span> {formatUsername(move.username)}</p>
-                        <p><span className="text-zinc-400">Quantity:</span> {move.quantity}</p>
-                      </div>
-
-                      {/* Barcodes / Serials display */}
-                      {move.barcodes.length > 0 && (
-                        <div className="pt-2 border-t border-zinc-100 dark:border-zinc-700/60 flex items-center justify-between">
-                          <div className="text-xs font-mono text-zinc-600 dark:text-zinc-400 truncate max-w-[200px]">
-                            {move.isUnique ? (
-                              move.barcodes.length === 1 ? (
-                                <span>SN: {move.barcodes[0]}</span>
-                              ) : (
-                                <span>{formatSerialRangeDisplay(move.barcodes)}</span>
-                              )
-                            ) : (
-                              <span>Barcode: {move.barcodes[0]}</span>
-                            )}
-                          </div>
-                          {move.isUnique && (
-                            move.barcodes.length > 1 ? (
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setViewSerialsModalData(move);
-                                  setSerialSearchTerm('');
-                                }}
-                                className="text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
-                              >
-                                View All Serials ({move.barcodes.length})
-                              </button>
-                            ) : (
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setActiveTab('audit');
-                                  setAuditSearchQuery(move.barcodes[0]);
-                                  handlePerformSerialAudit(move.barcodes[0]);
-                                }}
-                                className="text-xs text-blue-600 dark:text-blue-400 hover:underline"
-                              >
-                                Audit Serial
-                              </button>
-                            )
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  ))}
+                {/* Mobile View Toggle: Cards vs Table */}
+                <div className="md:hidden flex items-center justify-between p-3 bg-zinc-50 dark:bg-zinc-900/60 border-b border-zinc-200 dark:border-zinc-700">
+                  <span className="text-xs font-medium text-zinc-600 dark:text-zinc-400">View Format:</span>
+                  <div className="inline-flex rounded-lg bg-zinc-200 dark:bg-zinc-800 p-0.5 text-xs font-semibold">
+                    <button
+                      type="button"
+                      onClick={() => setMovementsMobileViewMode('cards')}
+                      className={`px-3 py-1 rounded-md transition-all ${
+                        movementsMobileViewMode === 'cards'
+                          ? 'bg-white dark:bg-zinc-700 text-zinc-900 dark:text-white shadow-xs font-bold'
+                          : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'
+                      }`}
+                    >
+                      🗂️ Cards
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setMovementsMobileViewMode('table')}
+                      className={`px-3 py-1 rounded-md transition-all ${
+                        movementsMobileViewMode === 'table'
+                          ? 'bg-white dark:bg-zinc-700 text-zinc-900 dark:text-white shadow-xs font-bold'
+                          : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'
+                      }`}
+                    >
+                      📊 Scrollable Table
+                    </button>
+                  </div>
                 </div>
 
-                {/* Desktop View: Table */}
-                <div className="hidden md:block overflow-x-auto">
-                  <table className="min-w-full divide-y divide-zinc-200 dark:divide-zinc-700">
+                {/* Mobile View: Cards */}
+                {movementsMobileViewMode === 'cards' && (
+                  <div className="md:hidden divide-y divide-zinc-200 dark:divide-zinc-700">
+                    {groupedReportData.map(move => (
+                      <div key={move.id} className="p-4 space-y-2">
+                        <div className="flex justify-between items-start gap-2">
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <p className="font-semibold text-zinc-900 dark:text-zinc-100 text-sm">{move.item_name}</p>
+                              {move.isUnique && (
+                                <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-300">
+                                  ⚡ Meter / Unique
+                                </span>
+                              )}
+                              {move.partNumber && (
+                                <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-mono font-medium bg-zinc-100 text-zinc-800 dark:bg-zinc-700 dark:text-zinc-200">
+                                  Part: {move.partNumber}
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">
+                              {new Date(move.created_at).toLocaleString()}
+                            </p>
+                          </div>
+
+                          <span className={`px-2.5 py-0.5 text-xs font-semibold rounded-full whitespace-nowrap shrink-0 inline-flex items-center ${
+                            move.movement_type === 'IN'
+                              ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900 dark:text-emerald-300'
+                              : 'bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-300'
+                          }`}>
+                            {move.movement_type === 'IN' ? 'Sign In' : 'Sign Out'}
+                          </span>
+                        </div>
+
+                        <div className="text-xs text-zinc-600 dark:text-zinc-300 grid grid-cols-2 gap-1 pt-1">
+                          <p><span className="text-zinc-400">From:</span> {move.location_from}</p>
+                          <p><span className="text-zinc-400">To:</span> {move.location_to}</p>
+                          <p><span className="text-zinc-400">User:</span> {formatUsername(move.username)}</p>
+                          <p><span className="text-zinc-400">Quantity:</span> {move.quantity}</p>
+                        </div>
+
+                        {/* Barcodes / Serials display */}
+                        {move.barcodes.length > 0 && (
+                          <div className="pt-2 border-t border-zinc-100 dark:border-zinc-700/60 flex items-center justify-between">
+                            <div className="text-xs font-mono text-zinc-600 dark:text-zinc-400 truncate max-w-[200px]">
+                              {move.isUnique ? (
+                                move.barcodes.length === 1 ? (
+                                  <span>SN: {move.barcodes[0]}</span>
+                                ) : (
+                                  <span>{formatSerialRangeDisplay(move.barcodes)}</span>
+                                )
+                              ) : (
+                                <span>Barcode: {move.barcodes[0]}</span>
+                              )}
+                            </div>
+                            {move.isUnique && (
+                              move.barcodes.length > 1 ? (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setViewSerialsModalData(move);
+                                    setSerialSearchTerm('');
+                                  }}
+                                  className="text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
+                                >
+                                  View All Serials ({move.barcodes.length})
+                                </button>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setActiveTab('audit');
+                                    setAuditSearchQuery(move.barcodes[0]);
+                                    handlePerformSerialAudit(move.barcodes[0]);
+                                  }}
+                                  className="text-xs text-blue-600 dark:text-blue-400 hover:underline"
+                                >
+                                  Audit Serial
+                                </button>
+                              )
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Table View (Desktop default, mobile selectable) */}
+                <div className={`${movementsMobileViewMode === 'cards' ? 'hidden md:block' : 'block'} overflow-x-auto w-full scrollbar-thin`}>
+                  {movementsMobileViewMode === 'table' && (
+                    <div className="md:hidden px-4 py-2 bg-blue-50/60 dark:bg-blue-950/30 border-b border-blue-200/50 dark:border-blue-800/40 flex items-center justify-between text-[11px] text-blue-900 dark:text-blue-200">
+                      <span className="flex items-center gap-1 font-medium">
+                        <span>⇄</span>
+                        <span>Swipe horizontally to view all columns</span>
+                      </span>
+                      <span className="font-mono text-[10px] bg-blue-100 dark:bg-blue-900/80 px-2 py-0.5 rounded font-bold">
+                        {groupedReportData.length} records
+                      </span>
+                    </div>
+                  )}
+                  <table className="min-w-[950px] w-full divide-y divide-zinc-200 dark:divide-zinc-700">
                     <thead className="bg-zinc-50 dark:bg-zinc-800">
                       <tr>
                         <th scope="col" className="px-4 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Date & Time</th>
@@ -2553,94 +2752,380 @@ export const ReportingPage = ({
 
       {/* ================= TAB 4: STOCK THRESHOLDS ================= */}
       {activeTab === 'thresholds' && (
-        <div className="space-y-6">
-          <div className="bg-white dark:bg-zinc-800/60 p-5 rounded-xl shadow-sm border border-zinc-200 dark:border-zinc-700">
-            <h2 className="text-base font-semibold text-zinc-900 dark:text-white flex items-center gap-2">
-              <AlertTriangleIcon className="w-5 h-5 text-amber-500" />
-              Stock Thresholds & Replenishment Monitor
-            </h2>
-            <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">
-              Real-time stock alerts for items and meters dropping below minimum thresholds, with supplier part numbers for replenishment.
-            </p>
+        <div className="space-y-4 sm:space-y-6">
+          <div className="bg-white dark:bg-zinc-800/60 p-4 sm:p-5 rounded-xl shadow-sm border border-zinc-200 dark:border-zinc-700 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <h2 className="text-base font-semibold text-zinc-900 dark:text-white flex items-center gap-2">
+                  <AlertTriangleIcon className="w-5 h-5 text-amber-500" />
+                  Stock Thresholds & Replenishment Monitor
+                </h2>
+                <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">
+                  Monitor stock levels against re-order thresholds, safety lead times, and replenishment needs.
+                </p>
+              </div>
+
+              {/* Prominent Toggle Button: Show All Items vs Needs Order Only */}
+              <div className="flex items-center gap-2 self-start sm:self-auto shrink-0">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (showAllStockThresholds && thresholdStatusFilter === 'ALL') {
+                      setShowAllStockThresholds(false);
+                      setThresholdStatusFilter('CRITICAL');
+                    } else {
+                      setShowAllStockThresholds(true);
+                      setThresholdStatusFilter('ALL');
+                    }
+                  }}
+                  className={`inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-bold transition-all border shadow-xs ${
+                    showAllStockThresholds && thresholdStatusFilter === 'ALL'
+                      ? 'bg-blue-600 hover:bg-blue-700 text-white border-blue-600 ring-2 ring-blue-300 dark:ring-blue-900'
+                      : 'bg-white hover:bg-zinc-50 dark:bg-zinc-700 dark:hover:bg-zinc-600 text-zinc-700 dark:text-zinc-200 border-zinc-300 dark:border-zinc-600'
+                  }`}
+                  title="Toggle displaying all items or only items needing replenishment"
+                >
+                  <span className={`w-2 h-2 rounded-full ${showAllStockThresholds && thresholdStatusFilter === 'ALL' ? 'bg-white animate-pulse' : 'bg-red-500'}`}></span>
+                  <span>{showAllStockThresholds && thresholdStatusFilter === 'ALL' ? '✓ Showing All Items' : 'Show All Stock Items'}</span>
+                  <span className={`ml-1 text-[11px] px-1.5 py-0.5 rounded-full font-mono ${
+                    showAllStockThresholds && thresholdStatusFilter === 'ALL'
+                      ? 'bg-blue-700 text-white'
+                      : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300'
+                  }`}>
+                    {showAllStockThresholds && thresholdStatusFilter === 'ALL' ? `${thresholdStats.total} items` : `${thresholdStats.critical} needs order`}
+                  </span>
+                </button>
+              </div>
+            </div>
+
+            {/* Quick Stat Badges & Filter Pills */}
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-3 border-t border-zinc-100 dark:border-zinc-700/60">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowAllStockThresholds(true);
+                    setThresholdStatusFilter('ALL');
+                  }}
+                  className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all border flex items-center gap-1.5 ${
+                    showAllStockThresholds && thresholdStatusFilter === 'ALL'
+                      ? 'bg-zinc-800 dark:bg-zinc-100 text-white dark:text-zinc-900 border-zinc-800 dark:border-zinc-100 shadow-2xs'
+                      : 'bg-white dark:bg-zinc-800/80 text-zinc-600 dark:text-zinc-300 border-zinc-200 dark:border-zinc-700 hover:border-zinc-400'
+                  }`}
+                >
+                  <span>All Items</span>
+                  <span className="font-mono text-[10px] px-1.5 py-0.2 rounded-full bg-zinc-200 dark:bg-zinc-700 text-zinc-700 dark:text-zinc-300 font-bold">
+                    {thresholdStats.total}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowAllStockThresholds(false);
+                    setThresholdStatusFilter('CRITICAL');
+                  }}
+                  className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all border flex items-center gap-1.5 ${
+                    thresholdStatusFilter === 'CRITICAL' || (!showAllStockThresholds && thresholdStatusFilter === 'ALL')
+                      ? 'bg-red-600 text-white border-red-700 shadow-2xs'
+                      : 'bg-white dark:bg-zinc-800/80 text-red-700 dark:text-red-400 border-zinc-200 dark:border-zinc-700 hover:border-red-400'
+                  }`}
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-red-500"></span>
+                  <span>Needs Order</span>
+                  <span className={`font-mono text-[10px] px-1.5 py-0.2 rounded-full font-bold ${
+                    thresholdStatusFilter === 'CRITICAL' || (!showAllStockThresholds && thresholdStatusFilter === 'ALL')
+                      ? 'bg-red-700 text-white'
+                      : 'bg-red-100 dark:bg-red-900/60 text-red-800 dark:text-red-200'
+                  }`}>
+                    {thresholdStats.critical}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowAllStockThresholds(true);
+                    setThresholdStatusFilter('WARNING');
+                  }}
+                  className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all border flex items-center gap-1.5 ${
+                    thresholdStatusFilter === 'WARNING'
+                      ? 'bg-amber-600 text-white border-amber-700 shadow-2xs'
+                      : 'bg-white dark:bg-zinc-800/80 text-amber-700 dark:text-amber-400 border-zinc-200 dark:border-zinc-700 hover:border-amber-400'
+                  }`}
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span>
+                  <span>Warning</span>
+                  <span className={`font-mono text-[10px] px-1.5 py-0.2 rounded-full font-bold ${
+                    thresholdStatusFilter === 'WARNING'
+                      ? 'bg-amber-700 text-white'
+                      : 'bg-amber-100 dark:bg-amber-900/60 text-amber-800 dark:text-amber-200'
+                  }`}>
+                    {thresholdStats.warning}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowAllStockThresholds(true);
+                    setThresholdStatusFilter('HEALTHY');
+                  }}
+                  className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all border flex items-center gap-1.5 ${
+                    thresholdStatusFilter === 'HEALTHY'
+                      ? 'bg-emerald-600 text-white border-emerald-700 shadow-2xs'
+                      : 'bg-white dark:bg-zinc-800/80 text-emerald-700 dark:text-emerald-400 border-zinc-200 dark:border-zinc-700 hover:border-emerald-400'
+                  }`}
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+                  <span>Healthy</span>
+                  <span className={`font-mono text-[10px] px-1.5 py-0.2 rounded-full font-bold ${
+                    thresholdStatusFilter === 'HEALTHY'
+                      ? 'bg-emerald-700 text-white'
+                      : 'bg-emerald-100 dark:bg-emerald-900/60 text-emerald-800 dark:text-emerald-200'
+                  }`}>
+                    {thresholdStats.healthy}
+                  </span>
+                </button>
+              </div>
+
+              {/* Text Search filter */}
+              <div className="relative w-full sm:w-64">
+                <SearchIcon className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400" />
+                <input
+                  type="text"
+                  placeholder="Search item, part # or category..."
+                  value={thresholdSearchTerm}
+                  onChange={e => setThresholdSearchTerm(e.target.value)}
+                  className="w-full pl-9 pr-3 py-1.5 bg-zinc-50 dark:bg-zinc-800/80 border border-zinc-200 dark:border-zinc-700 rounded-lg text-xs text-zinc-900 dark:text-zinc-100 placeholder-zinc-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+                {thresholdSearchTerm && (
+                  <button
+                    type="button"
+                    onClick={() => setThresholdSearchTerm('')}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-xs text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 font-bold"
+                  >
+                    ×
+                  </button>
+                )}
+              </div>
+            </div>
           </div>
 
+          {/* Table Container with Horizontal Scroll on Mobile */}
           <div className="bg-white dark:bg-zinc-800/60 rounded-xl shadow-sm border border-zinc-200 dark:border-zinc-700 overflow-hidden">
+            {/* Mobile swipe helper banner */}
+            <div className="sm:hidden px-4 py-2 bg-blue-50/60 dark:bg-blue-950/30 border-b border-blue-200/50 dark:border-blue-800/40 flex items-center justify-between text-[11px] text-blue-900 dark:text-blue-200">
+              <span className="flex items-center gap-1 font-medium">
+                <span className="text-sm">⇄</span>
+                <span>Swipe table horizontally to view all columns</span>
+              </span>
+              <span className="font-mono text-[10px] bg-blue-100 dark:bg-blue-900/80 px-2 py-0.5 rounded font-bold text-blue-800 dark:text-blue-200">
+                {thresholdData.length} item{thresholdData.length === 1 ? '' : 's'}
+              </span>
+            </div>
+
             {thresholdData.length === 0 ? (
-              <div className="p-12 text-center text-zinc-500 dark:text-zinc-400">
-                <CheckCircleIcon className="w-12 h-12 mx-auto text-emerald-500 mb-3" />
-                <p className="font-semibold text-zinc-700 dark:text-zinc-300">All stock levels healthy!</p>
-                <p className="text-xs mt-1 text-zinc-400">No items or meters are currently below their minimum threshold.</p>
+              <div className="p-12 text-center text-zinc-500 dark:text-zinc-400 space-y-3">
+                {thresholdSearchTerm ? (
+                  <>
+                    <SearchIcon className="w-10 h-10 mx-auto text-zinc-300 dark:text-zinc-600" />
+                    <p className="font-semibold text-zinc-700 dark:text-zinc-300">No matching stock items found</p>
+                    <p className="text-xs text-zinc-400">No item names or part numbers matched "{thresholdSearchTerm}".</p>
+                    <button
+                      type="button"
+                      onClick={() => setThresholdSearchTerm('')}
+                      className="px-3 py-1.5 rounded-lg bg-zinc-100 dark:bg-zinc-700 hover:bg-zinc-200 dark:hover:bg-zinc-600 text-xs font-semibold text-zinc-800 dark:text-zinc-200"
+                    >
+                      Clear Search
+                    </button>
+                  </>
+                ) : !showAllStockThresholds ? (
+                  <>
+                    <CheckCircleIcon className="w-12 h-12 mx-auto text-emerald-500" />
+                    <p className="font-bold text-base text-zinc-800 dark:text-zinc-100">All Stock Levels Healthy!</p>
+                    <p className="text-xs text-zinc-500 dark:text-zinc-400 max-w-sm mx-auto">
+                      There are currently no items dropping below their minimum threshold or lead-time safety buffer.
+                    </p>
+                    <div className="pt-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowAllStockThresholds(true);
+                          setThresholdStatusFilter('ALL');
+                        }}
+                        className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-bold transition-colors shadow-sm inline-flex items-center gap-1.5"
+                      >
+                        <span>View All {thresholdStats.total} Stock Quantities</span>
+                        <span>➔</span>
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <BoxIcon className="w-12 h-12 mx-auto text-zinc-300 dark:text-zinc-600" />
+                    <p className="font-semibold text-zinc-700 dark:text-zinc-300">No items in this category</p>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowAllStockThresholds(true);
+                        setThresholdStatusFilter('ALL');
+                      }}
+                      className="px-3 py-1.5 rounded-lg bg-zinc-100 dark:bg-zinc-700 text-xs font-semibold"
+                    >
+                      Reset Filters
+                    </button>
+                  </>
+                )}
               </div>
             ) : (
-              <table className="min-w-full divide-y divide-zinc-200 dark:divide-zinc-700">
-                <thead className="bg-zinc-50 dark:bg-zinc-800">
-                  <tr>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Status</th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Item Name</th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Supplier Part #</th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-amber-600 dark:text-amber-400 uppercase tracking-wider">Lead Time</th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Type</th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Current Stock</th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Base / Adj. Threshold</th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-blue-600 dark:text-blue-400 uppercase tracking-wider">Order to Replenish</th>
-                  </tr>
-                </thead>
-                <tbody className="bg-white dark:bg-zinc-800/40 divide-y divide-zinc-200 dark:border-zinc-700">
-                  {thresholdData.map((item, idx) => (
-                    <tr key={idx} className="hover:bg-zinc-50 dark:hover:bg-zinc-700/30">
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        {item.status === 'CRITICAL' ? (
-                          <span className="px-2.5 py-0.5 inline-flex text-xs leading-5 font-bold rounded-full bg-red-100 text-red-800 dark:bg-red-900/60 dark:text-red-300">
-                            Needs Order
-                          </span>
-                        ) : (
-                          <span className="px-2.5 py-0.5 inline-flex text-xs leading-5 font-bold rounded-full bg-amber-100 text-amber-800 dark:bg-amber-900/60 dark:text-amber-300">
-                            Warning
-                          </span>
-                        )}
-                      </td>
-                      <td className="px-6 py-4 font-medium text-sm text-zinc-900 dark:text-zinc-100">{item.name}</td>
-                      <td className="px-6 py-4 whitespace-nowrap text-xs">
-                        {item.partNumber ? (
-                          <span className="font-mono font-semibold text-blue-600 dark:text-blue-400">
-                            {item.partNumber}
-                          </span>
-                        ) : (
-                          <span className="text-zinc-400">—</span>
-                        )}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-xs font-mono">
-                        {item.leadTimeDays > 0 ? (
-                          <span className="px-2 py-0.5 rounded-full bg-amber-50 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 font-bold border border-amber-200 dark:border-amber-800">
-                            ⏱️ {item.leadTimeDays} days
-                          </span>
-                        ) : (
-                          <span className="text-zinc-400">Standard</span>
-                        )}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-xs">
-                        {item.isUnique ? (
-                          <span className="text-blue-600 dark:text-blue-400 font-semibold">⚡ Meter / Unique</span>
-                        ) : (
-                          <span className="text-zinc-500">Standard Bulk</span>
-                        )}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-zinc-900 dark:text-zinc-100 font-medium">{item.currentStock}</td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-zinc-500 dark:text-zinc-400">
-                        {item.leadTimeDays > 0 ? (
-                          <div>
-                            <span className="font-semibold text-zinc-800 dark:text-zinc-200">{item.effectiveThreshold}</span>
-                            <span className="block text-[10px] text-zinc-400">(Base: {item.baseThreshold} + {item.effectiveThreshold - item.baseThreshold} lead buffer)</span>
-                          </div>
-                        ) : (
-                          <span>{item.baseThreshold}</span>
-                        )}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm font-bold text-blue-600 dark:text-blue-400">{item.suggestedOrder || 0}</td>
+              <div className="overflow-x-auto w-full scrollbar-thin">
+                <table className="min-w-[980px] w-full divide-y divide-zinc-200 dark:divide-zinc-700">
+                  <thead className="bg-zinc-50 dark:bg-zinc-800">
+                    <tr>
+                      <th scope="col" className="px-5 py-3 text-left text-xs font-semibold text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Status</th>
+                      <th scope="col" className="px-5 py-3 text-left text-xs font-semibold text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Item Name</th>
+                      <th scope="col" className="px-5 py-3 text-left text-xs font-semibold text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Supplier Part #</th>
+                      <th scope="col" className="px-5 py-3 text-left text-xs font-semibold text-amber-600 dark:text-amber-400 uppercase tracking-wider">Lead Time</th>
+                      <th scope="col" className="px-5 py-3 text-left text-xs font-semibold text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Type</th>
+                      <th scope="col" className="px-5 py-3 text-left text-xs font-semibold text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Current Stock</th>
+                      <th scope="col" className="px-5 py-3 text-left text-xs font-semibold text-blue-600 dark:text-blue-400 uppercase tracking-wider">Weeks Left (Usage)</th>
+                      <th scope="col" className="px-5 py-3 text-left text-xs font-semibold text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Base / Adj. Threshold</th>
+                      <th scope="col" className="px-5 py-3 text-left text-xs font-semibold text-blue-600 dark:text-blue-400 uppercase tracking-wider">Order to Replenish</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody className="bg-white dark:bg-zinc-800/40 divide-y divide-zinc-200 dark:divide-zinc-700">
+                    {thresholdData.map((item, idx) => (
+                      <tr key={item.id || idx} className="hover:bg-zinc-50 dark:hover:bg-zinc-700/30 transition-colors">
+                        <td className="px-5 py-3.5 whitespace-nowrap">
+                          {item.status === 'CRITICAL' ? (
+                            <span className="px-2.5 py-1 inline-flex items-center gap-1.5 text-xs font-bold rounded-full bg-red-100 text-red-800 dark:bg-red-900/60 dark:text-red-300 border border-red-200 dark:border-red-800">
+                              <span className="w-1.5 h-1.5 rounded-full bg-red-600 animate-pulse"></span>
+                              Needs Order
+                            </span>
+                          ) : item.status === 'WARNING' ? (
+                            <span className="px-2.5 py-1 inline-flex items-center gap-1.5 text-xs font-bold rounded-full bg-amber-100 text-amber-800 dark:bg-amber-900/60 dark:text-amber-300 border border-amber-200 dark:border-amber-800">
+                              <span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span>
+                              Warning
+                            </span>
+                          ) : (
+                            <span className="px-2.5 py-1 inline-flex items-center gap-1.5 text-xs font-bold rounded-full bg-emerald-100 text-emerald-800 dark:bg-emerald-900/60 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800">
+                              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+                              Healthy
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-5 py-3.5 font-medium text-sm text-zinc-900 dark:text-zinc-100">
+                          <div>
+                            <span>{item.name}</span>
+                            {item.category && (
+                              <span className="block text-[11px] text-zinc-400 font-normal">
+                                {item.category}
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="px-5 py-3.5 whitespace-nowrap text-xs">
+                          {item.partNumber ? (
+                            <div>
+                              <span className="font-mono font-semibold text-blue-600 dark:text-blue-400">
+                                {item.partNumber}
+                              </span>
+                              {item.supplierName && (
+                                <span className="block text-[10px] text-zinc-400 truncate max-w-[140px]">
+                                  {item.supplierName}
+                                </span>
+                              )}
+                            </div>
+                          ) : (
+                            <span className="text-zinc-400">—</span>
+                          )}
+                        </td>
+                        <td className="px-5 py-3.5 whitespace-nowrap text-xs font-mono">
+                          {item.leadTimeDays > 0 ? (
+                            <span className="px-2 py-0.5 rounded-full bg-amber-50 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 font-bold border border-amber-200 dark:border-amber-800">
+                              ⏱️ {item.leadTimeDays} days
+                            </span>
+                          ) : (
+                            <span className="text-zinc-400">Standard</span>
+                          )}
+                        </td>
+                        <td className="px-5 py-3.5 whitespace-nowrap text-xs">
+                          {item.isUnique ? (
+                            <span className="text-blue-600 dark:text-blue-400 font-semibold">⚡ Meter / Unique</span>
+                          ) : (
+                            <span className="text-zinc-500">Standard Bulk</span>
+                          )}
+                        </td>
+                        <td className="px-5 py-3.5 whitespace-nowrap text-sm font-bold text-zinc-900 dark:text-zinc-100">
+                          <span className={`inline-block px-2 py-0.5 rounded ${
+                            item.status === 'CRITICAL'
+                              ? 'bg-red-50 text-red-700 dark:bg-red-950/40 dark:text-red-300 font-mono font-bold'
+                              : item.status === 'WARNING'
+                              ? 'bg-amber-50 text-amber-700 dark:bg-amber-950/40 dark:text-amber-300 font-mono font-bold'
+                              : 'font-mono'
+                          }`}>
+                            {item.currentStock}
+                          </span>
+                        </td>
+                        <td className="px-5 py-3.5 whitespace-nowrap text-xs">
+                          {item.currentStock === 0 ? (
+                            <div>
+                              <span className="px-2.5 py-1 inline-flex text-xs font-mono font-bold rounded-full bg-red-100 text-red-800 dark:bg-red-900/60 dark:text-red-300 border border-red-200 dark:border-red-800">
+                                0.0 wks
+                              </span>
+                              <span className="block text-[10px] text-zinc-400 mt-0.5">Out of stock</span>
+                            </div>
+                          ) : item.weeklyUsage > 0 ? (
+                            <div>
+                              <span className={`px-2.5 py-1 inline-flex text-xs font-mono font-bold rounded-full border ${
+                                item.weeksRemaining < 1
+                                  ? 'bg-red-100 text-red-800 dark:bg-red-900/60 dark:text-red-300 border-red-200 dark:border-red-800'
+                                  : item.weeksRemaining <= 2.5
+                                  ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/60 dark:text-amber-300 border-amber-200 dark:border-amber-800'
+                                  : 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/60 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800'
+                              }`}>
+                                {item.weeksRemaining < 10 ? `${item.weeksRemaining.toFixed(1)} wks` : `${Math.round(item.weeksRemaining)} wks`}
+                              </span>
+                              <span className="block text-[10px] text-zinc-500 dark:text-zinc-400 mt-0.5 font-mono">
+                                ~{item.weeklyUsage >= 10 ? Math.round(item.weeklyUsage) : item.weeklyUsage.toFixed(1)} / wk
+                              </span>
+                            </div>
+                          ) : (
+                            <div>
+                              <span className="px-2.5 py-1 inline-flex text-xs font-mono font-semibold rounded-full bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300 border border-zinc-200 dark:border-zinc-700">
+                                &gt; 8 wks
+                              </span>
+                              <span className="block text-[10px] text-zinc-400 mt-0.5">0 used in 30d</span>
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-5 py-3.5 whitespace-nowrap text-sm text-zinc-500 dark:text-zinc-400">
+                          {item.leadTimeDays > 0 ? (
+                            <div>
+                              <span className="font-semibold text-zinc-800 dark:text-zinc-200">{item.effectiveThreshold}</span>
+                              <span className="block text-[10px] text-zinc-400">(Base: {item.baseThreshold} + {item.effectiveThreshold - item.baseThreshold} lead buffer)</span>
+                            </div>
+                          ) : (
+                            <span className="font-medium text-zinc-700 dark:text-zinc-300">{item.baseThreshold}</span>
+                          )}
+                        </td>
+                        <td className="px-5 py-3.5 whitespace-nowrap text-sm font-bold">
+                          {item.suggestedOrder > 0 ? (
+                            <span className="text-blue-600 dark:text-blue-400 font-mono font-bold">
+                              +{item.suggestedOrder} units
+                            </span>
+                          ) : (
+                            <span className="text-emerald-600 dark:text-emerald-400 font-medium text-xs flex items-center gap-1">
+                              ✓ Sufficient
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             )}
           </div>
         </div>

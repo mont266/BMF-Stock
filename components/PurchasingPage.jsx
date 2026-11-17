@@ -26,7 +26,7 @@ const POStatusBadge = ({ status }) => {
     );
 };
 
-const PurchaseOrderForm = ({ existingPO, onSave, onCancel, isSubmitting, suppliers, itemTypes, groupedItemTypes }) => {
+const PurchaseOrderForm = ({ existingPO, onSave, onCancel, isSubmitting, suppliers, itemTypes, groupedItemTypes, supplierPartNumbers = [] }) => {
     const [poHeader, setPoHeader] = useState({
         id: existingPO?.id || undefined,
         supplier_id: existingPO?.supplier_id || '',
@@ -56,8 +56,15 @@ const PurchaseOrderForm = ({ existingPO, onSave, onCancel, isSubmitting, supplie
             const selectedType = itemTypes.find(it => it.name === value);
             newItems[index].item_type_id = selectedType?.id || null;
             newItems[index].name = value;
-            // Reset cost when item changes
-            newItems[index].cost_per_item = selectedType?.price || 0;
+            // Resolve supplier purchase price from supplierPartNumbers
+            const matchedParts = Array.isArray(supplierPartNumbers) 
+                ? supplierPartNumbers.filter(sp => (selectedType && sp.item_type_id === selectedType.id) || sp.item_name === value || sp.item_types?.name === value) 
+                : [];
+            const headerSupId = poHeader.supplier_id ? parseInt(poHeader.supplier_id, 10) : null;
+            const chosenPart = (headerSupId ? matchedParts.find(p => p.supplier_id === headerSupId && parseFloat(p.purchase_price) > 0) : null)
+                || matchedParts.find(p => parseFloat(p.purchase_price) > 0)
+                || matchedParts[0];
+            newItems[index].cost_per_item = chosenPart ? (parseFloat(chosenPart.purchase_price) || 0) : 0;
         } else {
             newItems[index][field] = value;
         }
@@ -732,7 +739,7 @@ const ReceiveStockModal = ({ isOpen, onClose, po, userProfile, selectedProfile, 
     );
 };
 
-const PurchasingPage = ({ userProfile, selectedProfile, setError, setSuccessMessage, itemTypes, suppliers, groupedItemTypes, refetchStock, navigateTo }) => {
+const PurchasingPage = ({ userProfile, selectedProfile, setError, setSuccessMessage, itemTypes, suppliers, groupedItemTypes, refetchStock, navigateTo, supplierPartNumbers = [] }) => {
     const [purchaseOrders, setPurchaseOrders] = useState([]);
     const [poLoading, setPoLoading] = useState(true);
     const [currentView, setCurrentView] = useState('list'); // 'list', 'create', 'detail', 'edit'
@@ -984,6 +991,7 @@ const PurchasingPage = ({ userProfile, selectedProfile, setError, setSuccessMess
                 suppliers={suppliers}
                 itemTypes={itemTypes}
                 groupedItemTypes={groupedItemTypes}
+                supplierPartNumbers={supplierPartNumbers}
             />
         );
     }
