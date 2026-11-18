@@ -5448,7 +5448,7 @@ const StockManagerApp = ({
                   </button>
               </div>
               <div className="mt-2 text-center">
-                  <span className="text-[10px] font-medium text-zinc-400 dark:text-zinc-500 tracking-wider">V0.15</span>
+                  <span className="text-[10px] font-medium text-zinc-400 dark:text-zinc-500 tracking-wider">V0.16</span>
               </div>
           </div>
         </aside>
