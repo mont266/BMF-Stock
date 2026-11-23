@@ -1,4 +1,5 @@
 import React, { useState, useCallback, useMemo, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { useStock } from '../hooks/useStock';
 import { View, Location, Team, TeamType, StockCategory, POStatus } from '../types';
 import { LOCATIONS, STOCK_CATEGORIES } from '../constants';
@@ -712,7 +713,7 @@ const StockManagerApp = ({
 
   // --- State for new Scan Out flow ---
   const [isAssignmentSetupModalOpen, setIsAssignmentSetupModalOpen] = useState(false);
-  const [assignmentContext, setAssignmentContext] = useState({ location: Location.LEADING_STORES, team: '' });
+  const [assignmentContext, setAssignmentContext] = useState({ location: '', team: '' });
   const [isScanOutModeSelectionOpen, setIsScanOutModeSelectionOpen] = useState(false);
   const [isAssignQuantityModalOpen, setIsAssignQuantityModalOpen] = useState(false);
   const [itemForQuantityAssign, setItemForQuantityAssign] = useState(null);
@@ -722,6 +723,12 @@ const StockManagerApp = ({
   const isProcessingScanRef = useRef(false);
   const [rapidScanSummary, setRapidScanSummary] = useState({});
   const [stagedBatchItems, setStagedBatchItems] = useState([]);
+  const stagedBatchItemsRef = useRef([]);
+  useEffect(() => {
+    stagedBatchItemsRef.current = stagedBatchItems;
+  }, [stagedBatchItems]);
+  const [meterBoxPackAutoExpand, setMeterBoxPackAutoExpand] = useState(true);
+  const [expandedBatchPackIds, setExpandedBatchPackIds] = useState({});
   const [isBatchConfirmModalOpen, setIsBatchConfirmModalOpen] = useState(false);
   const [isSubmittingBatchSignOut, setIsSubmittingBatchSignOut] = useState(false);
   const [teamBarcodeInput, setTeamBarcodeInput] = useState('');
@@ -741,7 +748,6 @@ const StockManagerApp = ({
 
   useEffect(() => {
     if (activeLocation && activeLocation !== 'All') {
-      setAssignmentContext(prev => ({ ...prev, location: activeLocation }));
       setReturnContext(prev => ({ ...prev, location: activeLocation }));
     }
   }, [activeLocation]);
@@ -750,6 +756,20 @@ const StockManagerApp = ({
   const [itemForQuantityReturn, setItemForQuantityReturn] = useState(null);
   const [quantityToReturn, setQuantityToReturn] = useState('');
   const [rangeAssignDetails, setRangeAssignDetails] = useState({ firstSerial: '', lastSerial: '' });
+  const [isReturnRangeModalOpen, setIsReturnRangeModalOpen] = useState(false);
+  const [rangeReturnMode, setRangeReturnMode] = useState('endSerial'); // 'endSerial' | 'quantity'
+  const [rangeReturnDetails, setRangeReturnDetails] = useState({
+    firstSerial: '',
+    lastSerial: '',
+    quantityCount: '',
+    team: 'All',
+    location: '',
+    includeOtherTeams: false
+  });
+  const [rangeReturnError, setRangeReturnError] = useState(null);
+  const [isReturningRange, setIsReturningRange] = useState(false);
+  const [returnRangeScanTarget, setReturnRangeScanTarget] = useState(null); // null | 'first' | 'last'
+  const [isReturnRangePreviewExpanded, setIsReturnRangePreviewExpanded] = useState(false);
 
   // --- App Settings State ---
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
@@ -859,16 +879,19 @@ const StockManagerApp = ({
     setToasts([]);
     setRapidScanSummary({});
     setStagedBatchItems([]);
+    setExpandedBatchPackIds({});
     setStagedReturnItems([]);
     setIsBatchConfirmModalOpen(false);
     setIsReturnBatchConfirmModalOpen(false);
+    setAssignmentContext(prev => ({ ...prev, location: '' }));
   }, [handleSetView]);
 
   // --- Native App Back Button/Gesture Handling ---
   useEffect(() => {
     if (Capacitor.isNativePlatform()) {
       const listener = CapacitorApp.addListener('backButton', () => {
-        // Priority 1: Close any open modal
+        // Priority 1: Close any open modal or error popup
+        if (error) { setError(null); return; }
         if (isTransferLocationModalOpen) { setIsTransferLocationModalOpen(false); return; }
         if (isTransferTeamModalOpen) { setIsTransferTeamModalOpen(false); return; }
         if (scannedItem) { setScannedItem(null); return; }
@@ -897,6 +920,8 @@ const StockManagerApp = ({
         if (isScanReturnModeSelectionOpen) { setIsScanReturnModeSelectionOpen(false); return; }
         if (isAssignQuantityModalOpen) { setIsAssignQuantityModalOpen(false); return; }
         if (isAssignRangeModalOpen) { setIsAssignRangeModalOpen(false); setRangeAssignDetails({ firstSerial: '', lastSerial: '' }); return; }
+        if (returnRangeScanTarget) { setReturnRangeScanTarget(null); return; }
+        if (isReturnRangeModalOpen) { setIsReturnRangeModalOpen(false); setRangeReturnError(null); return; }
         if (isAddScannedItemModalOpen) { setIsAddScannedItemModalOpen(false); return; }
         if (isAddQuantityModalOpen) { setIsAddQuantityModalOpen(false); return; }
         if (isReturnSetupModalOpen) { setIsReturnSetupModalOpen(false); return; }
@@ -930,6 +955,7 @@ const StockManagerApp = ({
       };
     }
   }, [
+    error,
     currentView,
     scannedItem,
     isSettingsModalOpen,
@@ -951,6 +977,8 @@ const StockManagerApp = ({
     isScanReturnModeSelectionOpen,
     isAssignQuantityModalOpen,
     isAssignRangeModalOpen,
+    isReturnRangeModalOpen,
+    returnRangeScanTarget,
     isAddScannedItemModalOpen,
     isAddQuantityModalOpen,
     isReturnSetupModalOpen,
@@ -963,6 +991,17 @@ const StockManagerApp = ({
     navigateTo,
     handleCancelScan
   ]);
+
+  useEffect(() => {
+    if (!error) return;
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        setError(null);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [error]);
 
 
   useEffect(() => {
@@ -1597,6 +1636,142 @@ const StockManagerApp = ({
     setStagedBatchItems(prev => prev.filter(item => item.id !== id));
   }, []);
 
+  const handleRemoveSerialFromBatchBox = useCallback((boxId, serialToRemove) => {
+    const targetLower = String(serialToRemove || '').trim().toLowerCase();
+    setStagedBatchItems(prev => prev.flatMap(entry => {
+      if (entry.id !== boxId || !entry.isPackBox) return [entry];
+      const remaining = (entry.serials || []).filter(s => String(s.serial || '').trim().toLowerCase() !== targetLower);
+      if (remaining.length === 0) return [];
+      const firstSerial = remaining[0].serial;
+      const lastSerial = remaining[remaining.length - 1].serial;
+      return [{
+        ...entry,
+        serials: remaining,
+        firstSerial,
+        lastSerial,
+        barcode: remaining.length > 1 ? `${firstSerial} – ${lastSerial}` : firstSerial,
+        quantity: remaining.length,
+        availableCount: remaining.filter(s => s.status === 'available').length
+      }];
+    }));
+  }, []);
+
+  const handleKeepOnlyFirstInBatchBox = useCallback((boxId) => {
+    setStagedBatchItems(prev => prev.map(entry => {
+      if (entry.id !== boxId || !entry.isPackBox || !entry.serials || entry.serials.length <= 1) return entry;
+      const firstEntry = entry.serials[0];
+      return {
+        ...entry,
+        serials: [firstEntry],
+        firstSerial: firstEntry.serial,
+        lastSerial: firstEntry.serial,
+        barcode: firstEntry.serial,
+        quantity: 1,
+        availableCount: firstEntry.status === 'available' ? 1 : 0
+      };
+    }));
+  }, []);
+
+  const batchConfirmationAnalysis = useMemo(() => {
+    const targetLoc = (assignmentContext.location && assignmentContext.location !== 'All')
+      ? assignmentContext.location
+      : (activeLocation !== 'All' ? activeLocation : (displayLocations[0] || Location.LEADING_STORES));
+
+    const stockByLowerBarcode = new Map();
+    for (const item of stock) {
+      if (!item.barcode) continue;
+      const key = String(item.barcode).trim().toLowerCase();
+      if (!stockByLowerBarcode.has(key)) stockByLowerBarcode.set(key, []);
+      stockByLowerBarcode.get(key).push(item);
+    }
+
+    const resolveSerial = (serialStr) => {
+      const key = String(serialStr || '').trim().toLowerCase();
+      const candidates = stockByLowerBarcode.get(key) || [];
+      if (candidates.length === 0) {
+        return { serial: serialStr, status: 'not_found', stockItem: null, reason: 'Not in stock' };
+      }
+      const availHere = candidates.find(c =>
+        c.assigned_to === Team.UNASSIGNED &&
+        (targetLoc === 'All' || c.location === targetLoc)
+      );
+      if (availHere) {
+        return { serial: availHere.barcode || serialStr, status: 'available', stockItem: availHere, location: availHere.location };
+      }
+      const availElsewhere = candidates.find(c => c.assigned_to === Team.UNASSIGNED);
+      if (availElsewhere) {
+        return {
+          serial: availElsewhere.barcode || serialStr,
+          status: 'other_location',
+          stockItem: availElsewhere,
+          location: availElsewhere.location,
+          reason: `At ${availElsewhere.location || 'another storehouse'}`
+        };
+      }
+      const assignedItem = candidates[0];
+      return {
+        serial: assignedItem.barcode || serialStr,
+        status: 'already_assigned',
+        stockItem: assignedItem,
+        assigned_to: assignedItem.assigned_to,
+        reason: `Assigned to ${assignedItem.assigned_to}`
+      };
+    };
+
+    const resolvedByBoxId = {};
+    let totalUnavailableBoxSerials = 0;
+    let totalAvailableUnits = 0;
+
+    for (const entry of stagedBatchItems) {
+      if (entry.isUnique && entry.isPackBox) {
+        const resolvedList = (entry.serials || []).map(s => resolveSerial(s.serial));
+        const availableCount = resolvedList.filter(r => r.status === 'available').length;
+        const unavailableCount = resolvedList.length - availableCount;
+        totalUnavailableBoxSerials += unavailableCount;
+        totalAvailableUnits += availableCount;
+        resolvedByBoxId[entry.id] = {
+          serials: resolvedList,
+          availableCount,
+          unavailableCount
+        };
+      } else if (entry.isUnique) {
+        const res = resolveSerial(entry.serial || entry.barcode);
+        resolvedByBoxId[entry.id] = { singleStatus: res };
+        if (res.status === 'available') totalAvailableUnits += 1;
+      } else {
+        totalAvailableUnits += (entry.quantity || 1);
+      }
+    }
+
+    return {
+      targetLoc,
+      resolvedByBoxId,
+      totalUnavailableBoxSerials,
+      totalAvailableUnits
+    };
+  }, [stagedBatchItems, stock, assignmentContext.location, activeLocation, displayLocations]);
+
+  const handleRemoveUnavailableFromBatch = useCallback(() => {
+    const { resolvedByBoxId } = batchConfirmationAnalysis;
+    setStagedBatchItems(prev => prev.flatMap(entry => {
+      if (!entry.isUnique || !entry.isPackBox) return [entry];
+      const resolved = resolvedByBoxId[entry.id]?.serials || entry.serials || [];
+      const valid = resolved.filter(s => s.status === 'available');
+      if (valid.length === 0) return [];
+      const firstSerial = valid[0].serial;
+      const lastSerial = valid[valid.length - 1].serial;
+      return [{
+        ...entry,
+        serials: valid,
+        firstSerial,
+        lastSerial,
+        barcode: valid.length > 1 ? `${firstSerial} – ${lastSerial}` : firstSerial,
+        quantity: valid.length,
+        availableCount: valid.length
+      }];
+    }));
+  }, [batchConfirmationAnalysis]);
+
   const stagedReturnTotalCount = useMemo(() => {
     return stagedReturnItems.reduce((sum, item) => sum + (item.quantity || 1), 0);
   }, [stagedReturnItems]);
@@ -1618,6 +1793,51 @@ const StockManagerApp = ({
   const handleRemoveStagedReturnItem = useCallback((id) => {
     setStagedReturnItems(prev => prev.filter(item => item.id !== id));
   }, []);
+
+  const calculateReturnEndSerial = useCallback((firstSerial, quantityStr) => {
+    const start = firstSerial?.trim();
+    const qty = parseInt(quantityStr, 10);
+    if (!start || isNaN(qty) || qty < 1 || qty > 1000) return '';
+    const expansion = expandRangeByQuantity(start, qty);
+    if (expansion.error || !expansion.result?.length) return '';
+    return expansion.result[expansion.result.length - 1];
+  }, []);
+
+  const calculateReturnRangeQuantity = useCallback((firstSerial, lastSerial) => {
+    const start = firstSerial?.trim();
+    const end = lastSerial?.trim();
+    if (!start || !end) return '';
+    const expansion = expandRange(start, end);
+    if (expansion.error || !expansion.result) return '';
+    return String(expansion.result.length);
+  }, []);
+
+  const handleOpenReturnRange = useCallback((prefill = {}) => {
+    const defaultLoc = (prefill.location && prefill.location !== 'All')
+      ? prefill.location
+      : ((returnContext.location && returnContext.location !== 'All')
+        ? returnContext.location
+        : (activeLocation && activeLocation !== 'All' ? activeLocation : (displayLocations[0] || Location.LEADING_STORES)));
+    const defaultTeam = prefill.team !== undefined
+      ? (prefill.team || 'All')
+      : (returnContext.team || (assignmentFilters.team && assignmentFilters.team !== 'All' ? assignmentFilters.team : 'All'));
+    const first = prefill.firstSerial || '';
+    const last = prefill.lastSerial || '';
+    const qty = (first && last) ? calculateReturnRangeQuantity(first, last) : '';
+
+    setRangeReturnMode('endSerial');
+    setRangeReturnDetails({
+      firstSerial: first,
+      lastSerial: last,
+      quantityCount: qty,
+      team: defaultTeam,
+      location: defaultLoc,
+      includeOtherTeams: false
+    });
+    setRangeReturnError(null);
+    setIsReturnRangePreviewExpanded(false);
+    setIsReturnRangeModalOpen(true);
+  }, [returnContext.location, returnContext.team, activeLocation, displayLocations, assignmentFilters.team, calculateReturnRangeQuantity]);
 
   const handleScanSuccess = useCallback(async (decodedText) => {
     setError(null);
@@ -1650,19 +1870,33 @@ const StockManagerApp = ({
             }
 
             setAssignmentContext(prev => ({ ...prev, team: matchedTeamByBarcode.name }));
+            const hasSelectedSignOutLocation = Boolean(assignmentContext.location && assignmentContext.location !== 'All');
             
             if (scanMode === 'team-scan') {
                 handleSetView(View.LIST);
-                setIsAssignmentSetupModalOpen(false);
-                setIsScanOutModeSelectionOpen(true);
-                addToast(`Team set to: ${matchedTeamByBarcode.name}`, 'success', decodedText);
+                setScanMode(null);
+                if (!hasSelectedSignOutLocation) {
+                    setIsAssignmentSetupModalOpen(true);
+                    addToast(`Team set to: ${matchedTeamByBarcode.name}. Now select a storehouse / location.`, 'info', decodedText);
+                } else {
+                    setIsAssignmentSetupModalOpen(false);
+                    setIsScanOutModeSelectionOpen(true);
+                    addToast(`Team set to: ${matchedTeamByBarcode.name}`, 'success', decodedText);
+                }
             } else if (scanMode === 'out-batch') {
                 addToast(`Team switched to: ${matchedTeamByBarcode.name}`, 'success', decodedText);
             } else if (!scanMode) {
-                // If scanned in general scanner, auto-start batch sign out for this team!
-                setScanMode('out-batch');
-                setStagedBatchItems([]);
-                addToast(`Team: ${matchedTeamByBarcode.name}. Now scan items to sign out.`, 'success', decodedText);
+                if (!hasSelectedSignOutLocation) {
+                    // Require user to explicitly select a storehouse before scanning items out
+                    handleSetView(View.LIST);
+                    setIsAssignmentSetupModalOpen(true);
+                    addToast(`Team: ${matchedTeamByBarcode.name}. Please select a storehouse / location first.`, 'info', decodedText);
+                } else {
+                    // Start batch sign out when storehouse is already selected
+                    setScanMode('out-batch');
+                    setStagedBatchItems([]);
+                    addToast(`Team: ${matchedTeamByBarcode.name}. Now scan items to sign out.`, 'success', decodedText);
+                }
             } else {
                 addToast(`Team set to: ${matchedTeamByBarcode.name}`, 'success', decodedText);
             }
@@ -1713,19 +1947,165 @@ const StockManagerApp = ({
                         const targetName = matchedItemType?.name || partLookup?.itemTypeName;
                         items = stock.filter(i => (targetName && i.name === targetName) || (i.barcode && String(i.barcode).trim().toLowerCase() === lowerScan));
                     }
-                    const itemTypeDetails = items.length > 0 ? itemTypes.find(it => it.name === items[0].name) : (matchedItemType || null);
-                    const isUnique = !!itemTypeDetails?.is_unique;
+                    const inferredName = items[0]?.name || matchedItemType?.name || '';
+                    const itemTypeDetails = items.length > 0
+                        ? (itemTypes.find(it => it.name === items[0].name) || matchedItemType || null)
+                        : (matchedItemType || null);
+                    const isMeterType = Boolean(
+                        itemTypeDetails?.category === StockCategory.METERS ||
+                        (itemTypeDetails?.category || '').toLowerCase() === 'meters' ||
+                        inferredName.toLowerCase().includes('meter')
+                    );
+                    const isUnique = Boolean(itemTypeDetails?.is_unique || isMeterType);
                     const packInfo = getItemPackInfo(decodedText, matchedItemType || (items.length > 0 ? items[0] : null));
                     const basePackQty = (!isUnique && packInfo.isPack && packInfo.packQuantity > 0) ? packInfo.packQuantity : 1;
                     const incrementQty = (!isUnique && packInfo.isPack) ? basePackQty : 1;
                     const packNote = (!isUnique && packInfo.isPack && packInfo.packQuantity > 0) ? ` (Pack of ${basePackQty})` : '';
+
+                    // Unique item Pack / Box expansion (e.g., Meters 10 to a pack)
+                    const uniquePackSize = (packInfo.isPack && packInfo.packQuantity > 1)
+                        ? packInfo.packQuantity
+                        : (isMeterType ? 10 : 1);
+                    const isScannedSerialNotPartCode = !partLookup || items.some(i => String(i.barcode || '').trim().toLowerCase() === lowerScan);
+                    const shouldExpandUniqueBox = isUnique && meterBoxPackAutoExpand && uniquePackSize > 1 && isScannedSerialNotPartCode;
+
+                    if (shouldExpandUniqueBox) {
+                        const expansion = expandRangeByQuantity(trimmedScan, uniquePackSize);
+                        const candidateSerials = (!expansion.error && expansion.result?.length) ? expansion.result : [trimmedScan];
+
+                        // Fetch live stock for all serials in the box when online & not in training mode
+                        const liveByLowerBarcode = new Map();
+                        if (!isTrainingMode && !isOffline && candidateSerials.length > 0) {
+                            const { data: liveRows } = await supabase
+                                .from('stock_items')
+                                .select('*')
+                                .in('barcode', candidateSerials);
+                            if (liveRows) {
+                                for (const row of liveRows) {
+                                    const k = String(row.barcode || '').trim().toLowerCase();
+                                    if (!liveByLowerBarcode.has(k)) liveByLowerBarcode.set(k, []);
+                                    liveByLowerBarcode.get(k).push(row);
+                                }
+                            }
+                        }
+
+                        const localByLowerBarcode = new Map();
+                        for (const sItem of stock) {
+                            if (!sItem.barcode) continue;
+                            const k = String(sItem.barcode).trim().toLowerCase();
+                            if (!localByLowerBarcode.has(k)) localByLowerBarcode.set(k, []);
+                            localByLowerBarcode.get(k).push(sItem);
+                        }
+
+                        // Collect already-staged unique serials to prevent duplicates across boxes
+                        const alreadyStagedSerials = new Set();
+                        for (const entry of stagedBatchItemsRef.current) {
+                            if (entry.isUnique) {
+                                if (entry.isPackBox && Array.isArray(entry.serials)) {
+                                    entry.serials.forEach(s => alreadyStagedSerials.add(String(s.serial || '').trim().toLowerCase()));
+                                } else {
+                                    if (entry.serial) alreadyStagedSerials.add(String(entry.serial).trim().toLowerCase());
+                                    if (entry.barcode) alreadyStagedSerials.add(String(entry.barcode).trim().toLowerCase());
+                                }
+                            }
+                        }
+
+                        const newSerials = candidateSerials.filter(s => !alreadyStagedSerials.has(s.toLowerCase()));
+                        if (newSerials.length === 0) {
+                            addToast(`All ${candidateSerials.length} serials starting at ${trimmedScan} are already staged`, 'warning', decodedText);
+                            triggerScanFeedback('warning');
+                            return;
+                        }
+
+                        let resolvedItemName = inferredName;
+                        const resolvedSerialEntries = newSerials.map(serialStr => {
+                            const key = serialStr.toLowerCase();
+                            const candidates = liveByLowerBarcode.get(key) || localByLowerBarcode.get(key) || [];
+                            if (!resolvedItemName && candidates.length > 0 && candidates[0].name) {
+                                resolvedItemName = candidates[0].name;
+                            }
+                            if (candidates.length === 0) {
+                                return { serial: serialStr, status: 'not_found', stockItem: null, reason: 'Not in stock' };
+                            }
+                            const availHere = candidates.find(c =>
+                                c.assigned_to === Team.UNASSIGNED &&
+                                (targetLoc === 'All' || c.location === targetLoc)
+                            );
+                            if (availHere) {
+                                return { serial: availHere.barcode || serialStr, status: 'available', stockItem: availHere, location: availHere.location };
+                            }
+                            const availElsewhere = candidates.find(c => c.assigned_to === Team.UNASSIGNED);
+                            if (availElsewhere) {
+                                return {
+                                    serial: availElsewhere.barcode || serialStr,
+                                    status: 'other_location',
+                                    stockItem: availElsewhere,
+                                    location: availElsewhere.location,
+                                    reason: `At ${availElsewhere.location || 'another storehouse'}`
+                                };
+                            }
+                            const assignedItem = candidates[0];
+                            return {
+                                serial: assignedItem.barcode || serialStr,
+                                status: 'already_assigned',
+                                stockItem: assignedItem,
+                                assigned_to: assignedItem.assigned_to,
+                                reason: `Assigned to ${assignedItem.assigned_to}`
+                            };
+                        });
+
+                        if (!resolvedItemName) {
+                            logUnrecognizedBarcode(decodedText);
+                            addToast(`Unrecognised barcode: ${decodedText}`, 'error', decodedText);
+                            triggerScanFeedback('error');
+                            return;
+                        }
+
+                        const firstSerial = resolvedSerialEntries[0].serial;
+                        const lastSerial = resolvedSerialEntries[resolvedSerialEntries.length - 1].serial;
+                        const availCount = resolvedSerialEntries.filter(r => r.status === 'available').length;
+                        const boxId = `pack-unique-${trimmedScan}-${Date.now()}`;
+
+                        const newBoxEntry = {
+                            id: boxId,
+                            name: resolvedItemName,
+                            barcode: resolvedSerialEntries.length > 1 ? `${firstSerial} – ${lastSerial}` : firstSerial,
+                            firstSerial,
+                            lastSerial,
+                            isUnique: true,
+                            isPackBox: true,
+                            isPack: true,
+                            packQuantity: uniquePackSize,
+                            serials: resolvedSerialEntries,
+                            quantity: resolvedSerialEntries.length,
+                            location: targetLoc,
+                            availableCount: availCount,
+                            partNumber: partLookup?.partNumber || ''
+                        };
+
+                        setStagedBatchItems(prev => [...prev, newBoxEntry]);
+                        setExpandedBatchPackIds(prev => ({ ...prev, [boxId]: true }));
+
+                        if (availCount === resolvedSerialEntries.length) {
+                            addToast(`+${resolvedSerialEntries.length} ${resolvedItemName} (${firstSerial} – ${lastSerial}) staged`, 'success', decodedText);
+                            triggerScanFeedback('success');
+                        } else {
+                            addToast(`${availCount}/${resolvedSerialEntries.length} ${resolvedItemName} in stock (${firstSerial} – ${lastSerial}) — check review`, 'warning', decodedText);
+                            triggerScanFeedback('warning');
+                        }
+                        return;
+                    }
 
                     if (items.length === 0) {
                         if (matchedItemType) {
                             const itemName = matchedItemType.name;
                             setStagedBatchItems(prev => {
                                 if (isUnique) {
-                                    const alreadyStaged = prev.some(entry => entry.barcode === decodedText || entry.serial === decodedText);
+                                    const alreadyStaged = prev.some(entry =>
+                                        entry.barcode === decodedText ||
+                                        entry.serial === decodedText ||
+                                        (entry.isPackBox && Array.isArray(entry.serials) && entry.serials.some(s => String(s.serial).toLowerCase() === lowerScan))
+                                    );
                                     if (alreadyStaged) {
                                         addToast(`Serial ${decodedText} is already scanned in this batch`, 'warning', decodedText);
                                         triggerScanFeedback('warning');
@@ -1794,7 +2174,11 @@ const StockManagerApp = ({
                         const itemName = items[0].name;
                         setStagedBatchItems(prev => {
                             if (isUnique) {
-                                const alreadyStaged = prev.some(entry => entry.barcode === decodedText || entry.serial === decodedText);
+                                const alreadyStaged = prev.some(entry =>
+                                    entry.barcode === decodedText ||
+                                    entry.serial === decodedText ||
+                                    (entry.isPackBox && Array.isArray(entry.serials) && entry.serials.some(s => String(s.serial).toLowerCase() === lowerScan))
+                                );
                                 if (alreadyStaged) {
                                     addToast(`Serial ${decodedText} is already scanned in this batch`, 'warning', decodedText);
                                     triggerScanFeedback('warning');
@@ -1853,7 +2237,11 @@ const StockManagerApp = ({
 
                     setStagedBatchItems(prev => {
                         if (isUnique) {
-                            const alreadyStaged = prev.some(entry => entry.barcode === decodedText || entry.serial === decodedText);
+                            const alreadyStaged = prev.some(entry =>
+                                entry.barcode === decodedText ||
+                                entry.serial === decodedText ||
+                                (entry.isPackBox && Array.isArray(entry.serials) && entry.serials.some(s => String(s.serial).toLowerCase() === lowerScan))
+                            );
                             if (alreadyStaged) {
                                 addToast(`Serial ${decodedText} is already scanned in this batch`, 'warning', decodedText);
                                 triggerScanFeedback('warning');
@@ -2349,6 +2737,15 @@ const StockManagerApp = ({
             handleSetView(View.LIST); // Stop scanner
             setRangeAssignDetails({ firstSerial: decodedText, lastSerial: decodedText });
             setIsAssignRangeModalOpen(true);
+        } else if (scanMode === 'return-range-start') {
+            playBeep('success');
+            handleSetView(View.LIST); // Stop scanner
+            handleOpenReturnRange({
+                firstSerial: decodedText,
+                lastSerial: decodedText,
+                team: returnContext.team || 'All',
+                location: returnContext.location
+            });
         } else {
             // Default scanner mode (opened directly without pre-choosing an action)
             playBeep('success');
@@ -2384,7 +2781,7 @@ const StockManagerApp = ({
         setError(`Failed to process scan: ${e.message}`);
         handleSetView(View.LIST);
     }
-  }, [getStockItemsByBarcode, handleSetView, scanMode, itemTypes, itemTypeBarcodesMap, partNumberLookupMap, teamBarcodeLookup, assignmentContext, returnContext, selectedProfile, isAdminProfile, playBeep, triggerScanFeedback, addToast, setStock, updateStockItemAssignment, logUnrecognizedBarcode, activeLocation, displayLocations, getItemSupplierPurchasePrice, getItemPackInfo]);
+  }, [getStockItemsByBarcode, handleSetView, scanMode, itemTypes, itemTypeBarcodesMap, partNumberLookupMap, teamBarcodeLookup, assignmentContext, returnContext, selectedProfile, isAdminProfile, playBeep, triggerScanFeedback, addToast, setStock, updateStockItemAssignment, logUnrecognizedBarcode, activeLocation, displayLocations, getItemSupplierPurchasePrice, getItemPackInfo, handleOpenReturnRange, meterBoxPackAutoExpand, isTrainingMode, isOffline, stock]);
   
   const handleScanError = useCallback((err) => {
     handleSetView(View.LIST);
@@ -2904,25 +3301,80 @@ const StockManagerApp = ({
       const user = session?.user;
       const loc = assignmentContext.location;
       const team = assignmentContext.team;
+      if (!loc || loc === 'All') {
+        throw new Error('Please select a storehouse / location before signing out items.');
+      }
       const profileName = selectedProfile?.name || 'Unknown';
 
       const allItemIdsToAssign = [];
+      const assignedIdSet = new Set();
       const excessItemsToCreate = [];
       let totalAssignedCount = 0;
       const discrepancies = [];
 
+      // Pre-fetch live stock rows for any staged unique serials so fresh DB items are always matched
+      const allStagedUniqueSerials = [];
       for (const entry of stagedBatchItems) {
         if (entry.isUnique) {
-          const found = stock.find(i => 
-            i.barcode === entry.barcode && 
-            i.assigned_to === Team.UNASSIGNED &&
-            (loc === 'All' || i.location === loc)
-          );
-          if (found) {
-            allItemIdsToAssign.push(found.id);
-            totalAssignedCount += 1;
-          } else {
-            discrepancies.push(`Stock Discrepancy: Unique item "${entry.name}" (${entry.barcode}) was staged but could not be located in stock at ${loc}.`);
+          if (entry.isPackBox && Array.isArray(entry.serials)) {
+            entry.serials.forEach(s => {
+              if (s.serial) allStagedUniqueSerials.push(s.serial);
+            });
+          } else if (entry.serial || entry.barcode) {
+            allStagedUniqueSerials.push(entry.serial || entry.barcode);
+          }
+        }
+      }
+
+      const liveUniqueByLowerBarcode = new Map();
+      if (!isTrainingMode && !isOffline && allStagedUniqueSerials.length > 0) {
+        const CHUNK_SIZE = 150;
+        for (let i = 0; i < allStagedUniqueSerials.length; i += CHUNK_SIZE) {
+          const chunk = allStagedUniqueSerials.slice(i, i + CHUNK_SIZE);
+          const { data: liveRows, error: fetchErr } = await supabase
+            .from('stock_items')
+            .select('id, barcode, name, assigned_to, location')
+            .in('barcode', chunk);
+          if (fetchErr) throw fetchErr;
+          if (liveRows) {
+            for (const row of liveRows) {
+              const k = String(row.barcode || '').trim().toLowerCase();
+              if (!liveUniqueByLowerBarcode.has(k)) liveUniqueByLowerBarcode.set(k, []);
+              liveUniqueByLowerBarcode.get(k).push(row);
+            }
+          }
+        }
+      }
+
+      const localUniqueByLowerBarcode = new Map();
+      for (const sItem of stock) {
+        if (!sItem.barcode) continue;
+        const k = String(sItem.barcode).trim().toLowerCase();
+        if (!localUniqueByLowerBarcode.has(k)) localUniqueByLowerBarcode.set(k, []);
+        localUniqueByLowerBarcode.get(k).push(sItem);
+      }
+
+      for (const entry of stagedBatchItems) {
+        if (entry.isUnique) {
+          const serialsForEntry = (entry.isPackBox && Array.isArray(entry.serials))
+            ? entry.serials.map(s => s.serial)
+            : [entry.serial || entry.barcode];
+
+          for (const serialCode of serialsForEntry) {
+            const key = String(serialCode || '').trim().toLowerCase();
+            const candidates = liveUniqueByLowerBarcode.get(key) || localUniqueByLowerBarcode.get(key) || [];
+            const found = candidates.find(i =>
+              !assignedIdSet.has(i.id) &&
+              i.assigned_to === Team.UNASSIGNED &&
+              (loc === 'All' || i.location === loc)
+            );
+            if (found) {
+              assignedIdSet.add(found.id);
+              allItemIdsToAssign.push(found.id);
+              totalAssignedCount += 1;
+            } else {
+              discrepancies.push(`Stock Discrepancy: Unique item "${entry.name}" (${serialCode}) was staged but could not be located in stock at ${loc}.`);
+            }
           }
         } else {
           // Bulk item
@@ -3119,11 +3571,278 @@ const StockManagerApp = ({
         setTimeout(() => setSuccessMessage(null), 3000);
         setIsAssignRangeModalOpen(false);
         setRangeAssignDetails({ firstSerial: '', lastSerial: '' });
+        setAssignmentContext(prev => ({ ...prev, location: '' }));
         await refetchStock();
     } catch (err) {
         setError(err.message);
     } finally {
         setIsSubmitting(false);
+    }
+  };
+
+  const rangeReturnProcessingResult = useMemo(() => {
+    const start = rangeReturnDetails.firstSerial?.trim() || '';
+    const end = rangeReturnDetails.lastSerial?.trim() || '';
+    const qtyNum = parseInt(rangeReturnDetails.quantityCount, 10);
+
+    let expansion = null;
+    if (rangeReturnMode === 'quantity') {
+      if (!start || !rangeReturnDetails.quantityCount) {
+        return {
+          serials: [],
+          error: null,
+          entries: [],
+          readyToReturn: [],
+          otherTeamItems: [],
+          alreadyUnassigned: [],
+          notFoundSerials: [],
+          teamBreakdown: {},
+          itemNames: []
+        };
+      }
+      if (isNaN(qtyNum) || qtyNum < 1) {
+        return { serials: [], error: 'Box quantity must be at least 1.', entries: [], readyToReturn: [], otherTeamItems: [], alreadyUnassigned: [], notFoundSerials: [], teamBreakdown: {}, itemNames: [] };
+      }
+      if (qtyNum > 1000) {
+        return { serials: [], error: 'Range is too large. A maximum of 1000 items can be returned at once.', entries: [], readyToReturn: [], otherTeamItems: [], alreadyUnassigned: [], notFoundSerials: [], teamBreakdown: {}, itemNames: [] };
+      }
+      expansion = expandRangeByQuantity(start, qtyNum);
+    } else {
+      if (!start || !end) {
+        return {
+          serials: [],
+          error: null,
+          entries: [],
+          readyToReturn: [],
+          otherTeamItems: [],
+          alreadyUnassigned: [],
+          notFoundSerials: [],
+          teamBreakdown: {},
+          itemNames: []
+        };
+      }
+      expansion = expandRange(start, end);
+    }
+
+    if (expansion.error) {
+      return {
+        serials: [],
+        error: expansion.error,
+        entries: [],
+        readyToReturn: [],
+        otherTeamItems: [],
+        alreadyUnassigned: [],
+        notFoundSerials: [],
+        teamBreakdown: {},
+        itemNames: []
+      };
+    }
+
+    const expanded = expansion.result || [];
+    if (expanded.length > 1000) {
+      return {
+        serials: [],
+        error: `Range is too large. A maximum of 1000 items can be returned at once, but this range contains ${expanded.length}.`,
+        entries: [],
+        readyToReturn: [],
+        otherTeamItems: [],
+        alreadyUnassigned: [],
+        notFoundSerials: [],
+        teamBreakdown: {},
+        itemNames: []
+      };
+    }
+
+    const selectedTeam = rangeReturnDetails.team || 'All';
+    const selectedTeamLower = selectedTeam.trim().toLowerCase();
+    const isSpecificTeam = selectedTeam !== 'All';
+
+    // Index stock by lowercase barcode, preferring assigned items matching selected team
+    const stockByLowerBarcode = new Map();
+    for (const item of stock) {
+      if (!item.barcode) continue;
+      const key = String(item.barcode).trim().toLowerCase();
+      if (!stockByLowerBarcode.has(key)) {
+        stockByLowerBarcode.set(key, []);
+      }
+      stockByLowerBarcode.get(key).push(item);
+    }
+
+    const entries = [];
+    const readyToReturn = [];
+    const otherTeamItems = [];
+    const alreadyUnassigned = [];
+    const notFoundSerials = [];
+    const teamBreakdown = {};
+    const itemNameSet = new Set();
+
+    for (const serial of expanded) {
+      const candidates = stockByLowerBarcode.get(serial.toLowerCase()) || [];
+      if (candidates.length === 0) {
+        notFoundSerials.push(serial);
+        entries.push({ serial, status: 'not_found', item: null });
+        continue;
+      }
+
+      let matchedItem = null;
+      if (isSpecificTeam) {
+        matchedItem = candidates.find(c => String(c.assigned_to || '').trim().toLowerCase() === selectedTeamLower)
+          || candidates.find(c => c.assigned_to && c.assigned_to !== Team.UNASSIGNED)
+          || candidates[0];
+      } else {
+        matchedItem = candidates.find(c => c.assigned_to && c.assigned_to !== Team.UNASSIGNED) || candidates[0];
+      }
+
+      if (matchedItem.name) itemNameSet.add(matchedItem.name);
+
+      if (!matchedItem.assigned_to || matchedItem.assigned_to === Team.UNASSIGNED) {
+        alreadyUnassigned.push(matchedItem);
+        entries.push({ serial, status: 'already_in_stock', item: matchedItem });
+      } else if (isSpecificTeam && String(matchedItem.assigned_to).trim().toLowerCase() !== selectedTeamLower && !rangeReturnDetails.includeOtherTeams) {
+        otherTeamItems.push(matchedItem);
+        entries.push({ serial, status: 'other_team', item: matchedItem });
+      } else {
+        readyToReturn.push(matchedItem);
+        const holder = matchedItem.assigned_to || 'Assigned';
+        teamBreakdown[holder] = (teamBreakdown[holder] || 0) + 1;
+        entries.push({ serial, status: 'ready', item: matchedItem });
+      }
+    }
+
+    return {
+      serials: expanded,
+      error: null,
+      entries,
+      readyToReturn,
+      otherTeamItems,
+      alreadyUnassigned,
+      notFoundSerials,
+      teamBreakdown,
+      itemNames: Array.from(itemNameSet)
+    };
+  }, [rangeReturnMode, rangeReturnDetails, stock]);
+
+  const handleReturnRangeSubmit = async (e) => {
+    e.preventDefault();
+    setRangeReturnError(null);
+    setError(null);
+    setIsReturningRange(true);
+    try {
+      const { serials, error: processingError } = rangeReturnProcessingResult;
+      if (processingError) throw new Error(processingError);
+      if (serials.length === 0) throw new Error('Please provide a valid serial number range.');
+
+      const targetLoc = (rangeReturnDetails.location && rangeReturnDetails.location !== 'All')
+        ? rangeReturnDetails.location
+        : (activeLocation && activeLocation !== 'All' ? activeLocation : (displayLocations[0] || Location.LEADING_STORES));
+
+      // Verify against live database when online & not in training mode so stale cache never causes misses
+      const liveItemsByLowerBarcode = new Map();
+      if (!isTrainingMode && !isOffline) {
+        const CHUNK_SIZE = 150;
+        for (let i = 0; i < serials.length; i += CHUNK_SIZE) {
+          const chunk = serials.slice(i, i + CHUNK_SIZE);
+          const { data, error: fetchErr } = await supabase
+            .from('stock_items')
+            .select('id, barcode, name, assigned_to, location')
+            .in('barcode', chunk);
+          if (fetchErr) throw fetchErr;
+          if (data) {
+            for (const row of data) {
+              const key = String(row.barcode || '').trim().toLowerCase();
+              if (!liveItemsByLowerBarcode.has(key)) liveItemsByLowerBarcode.set(key, []);
+              liveItemsByLowerBarcode.get(key).push(row);
+            }
+          }
+        }
+      }
+
+      const localItemsByLowerBarcode = new Map();
+      for (const item of stock) {
+        if (!item.barcode) continue;
+        const key = String(item.barcode).trim().toLowerCase();
+        if (!localItemsByLowerBarcode.has(key)) localItemsByLowerBarcode.set(key, []);
+        localItemsByLowerBarcode.get(key).push(item);
+      }
+
+      const selectedTeam = rangeReturnDetails.team || 'All';
+      const selectedTeamLower = selectedTeam.trim().toLowerCase();
+      const isSpecificTeam = selectedTeam !== 'All';
+
+      const itemsToReturn = [];
+      let alreadyInStockCount = 0;
+      let otherTeamCount = 0;
+      let notFoundCount = 0;
+
+      for (const serial of serials) {
+        const key = serial.toLowerCase();
+        const candidates = liveItemsByLowerBarcode.get(key) || localItemsByLowerBarcode.get(key) || [];
+        if (candidates.length === 0) {
+          notFoundCount++;
+          continue;
+        }
+
+        let matched = null;
+        if (isSpecificTeam) {
+          matched = candidates.find(c => String(c.assigned_to || '').trim().toLowerCase() === selectedTeamLower)
+            || candidates.find(c => c.assigned_to && c.assigned_to !== Team.UNASSIGNED)
+            || candidates[0];
+        } else {
+          matched = candidates.find(c => c.assigned_to && c.assigned_to !== Team.UNASSIGNED) || candidates[0];
+        }
+
+        if (!matched.assigned_to || matched.assigned_to === Team.UNASSIGNED) {
+          alreadyInStockCount++;
+          continue;
+        }
+
+        if (isSpecificTeam && String(matched.assigned_to).trim().toLowerCase() !== selectedTeamLower && !rangeReturnDetails.includeOtherTeams) {
+          otherTeamCount++;
+          continue;
+        }
+
+        itemsToReturn.push(matched);
+      }
+
+      if (itemsToReturn.length === 0) {
+        if (otherTeamCount > 0) {
+          throw new Error(`None of the serials in this range are assigned to ${selectedTeam} (${otherTeamCount} assigned to other team(s)). Switch team filter to "Any Team" or enable returning items from other teams.`);
+        }
+        if (alreadyInStockCount > 0 && notFoundCount === 0) {
+          throw new Error(`All ${alreadyInStockCount} item(s) in this range are already unassigned in stock.`);
+        }
+        throw new Error('No assigned items found in inventory for the specified serial range.');
+      }
+
+      const itemIdsToUpdate = itemsToReturn.map(i => i.id);
+      const profileName = selectedProfile?.name || 'Unknown';
+      await bulkUpdateAssignments(itemIdsToUpdate, targetLoc, Team.UNASSIGNED, profileName);
+      await refetchStock();
+
+      const skippedNotes = [];
+      if (alreadyInStockCount > 0) skippedNotes.push(`${alreadyInStockCount} already in stock`);
+      if (otherTeamCount > 0) skippedNotes.push(`${otherTeamCount} on other teams`);
+      if (notFoundCount > 0) skippedNotes.push(`${notFoundCount} not found`);
+
+      const msg = `Successfully returned ${itemIdsToUpdate.length} item(s) back into ${targetLoc}${skippedNotes.length > 0 ? ` (${skippedNotes.join(', ')} skipped)` : ''}.`;
+      setSuccessMessage(msg);
+      addToast(`Returned ${itemIdsToUpdate.length} item(s) to ${targetLoc}`, 'success');
+      setTimeout(() => setSuccessMessage(null), 5000);
+
+      setIsReturnRangeModalOpen(false);
+      setRangeReturnDetails({
+        firstSerial: '',
+        lastSerial: '',
+        quantityCount: '',
+        team: 'All',
+        location: targetLoc,
+        includeOtherTeams: false
+      });
+      setRangeReturnError(null);
+    } catch (err) {
+      setRangeReturnError(err.message);
+    } finally {
+      setIsReturningRange(false);
     }
   };
 
@@ -5448,7 +6167,7 @@ const StockManagerApp = ({
                   </button>
               </div>
               <div className="mt-2 text-center">
-                  <span className="text-[10px] font-medium text-zinc-400 dark:text-zinc-500 tracking-wider">V0.16</span>
+                  <span className="text-[10px] font-medium text-zinc-400 dark:text-zinc-500 tracking-wider">V0.17</span>
               </div>
           </div>
         </aside>
@@ -5610,18 +6329,61 @@ const StockManagerApp = ({
               </div>
           )}
 
+          {/* --- ERROR POPUP MODAL --- */}
+          {error && (() => {
+            const errorPopup = (
+              <div
+                className="fixed inset-0 z-[10050] bg-black/60 backdrop-blur-[1px] flex items-center justify-center p-4"
+                role="alertdialog"
+                aria-modal="true"
+                aria-labelledby="app-error-dialog-title"
+                onClick={() => setError(null)}
+              >
+                <div
+                  className="bg-white dark:bg-zinc-800 rounded-xl shadow-2xl border border-red-300 dark:border-red-700/70 w-full max-w-md overflow-hidden animate-in fade-in zoom-in-95 duration-150"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <div className="px-5 py-4 bg-red-50 dark:bg-red-950/50 border-b border-red-200 dark:border-red-800/70 flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2.5">
+                      <div className="w-8 h-8 rounded-full bg-red-100 dark:bg-red-900/60 flex items-center justify-center shrink-0">
+                        <XCircleIcon className="w-5 h-5 text-red-600 dark:text-red-400" />
+                      </div>
+                      <h3 id="app-error-dialog-title" className="text-base font-bold text-red-900 dark:text-red-100">
+                        Error
+                      </h3>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setError(null)}
+                      className="text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-200 rounded-full p-1 transition-colors focus:outline-none focus:ring-2 focus:ring-red-500"
+                      aria-label="Close error popup"
+                    >
+                      <XIcon className="w-5 h-5" />
+                    </button>
+                  </div>
+                  <div className="p-5">
+                    <p className="text-sm text-zinc-700 dark:text-zinc-200 leading-relaxed break-words">
+                      {error}
+                    </p>
+                  </div>
+                  <div className="px-5 py-3.5 bg-zinc-50 dark:bg-zinc-900/50 border-t border-zinc-200 dark:border-zinc-700 flex justify-end">
+                    <button
+                      type="button"
+                      autoFocus
+                      onClick={() => setError(null)}
+                      className="px-5 py-2 bg-red-600 hover:bg-red-700 text-white text-sm font-semibold rounded-lg shadow-xs transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500 dark:focus:ring-offset-zinc-800"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+            return typeof document !== 'undefined' ? createPortal(errorPopup, document.body) : errorPopup;
+          })()}
+
           {/* --- MAIN CONTENT --- */}
           <main className="flex-1 overflow-y-auto pb-32 md:pb-0 relative">
-               {error && (
-                 <div className="m-4 sm:m-6 lg:m-8 p-4 bg-red-100 dark:bg-red-900/20 border border-red-400 dark:border-red-500/50 text-red-700 dark:text-red-300 rounded-md relative" role="alert">
-                   <strong className="font-bold">Error:</strong>
-                   <span className="block sm:inline ml-2">{error}</span>
-                   <button onClick={() => setError(null)} className="absolute top-0 bottom-0 right-0 px-4 py-3" aria-label="Close">
-                     <svg className="fill-current h-6 w-6 text-red-500" role="button" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><title>Close</title><path d="M14.348 14.849a1.2 1.2 0 0 1-1.697 0L10 11.819l-2.651 3.029a1.2 1.2 0 1 1-1.697-1.697l2.758-3.15-2.759-3.152a1.2 1.2 0 1 1 1.697-1.697L10 8.183l2.651-3.031a1.2 1.2 0 1 1 1.697 1.697l-2.758 3.152 2.758 3.15a1.2 1.2 0 0 1 0 1.698z"/></svg>
-                   </button>
-                 </div>
-               )}
-               
                {successMessage && (
                   <div className="m-4 sm:m-6 lg:m-8 p-4 bg-green-100 dark:bg-green-900/20 border border-green-400 dark:border-green-500/50 text-green-700 dark:text-green-300 rounded-md" role="status">
                       {successMessage}
@@ -5653,45 +6415,73 @@ const StockManagerApp = ({
                             <div className="pointer-events-auto bg-zinc-900/95 backdrop-blur-xl shadow-xl rounded-full p-1 flex border border-zinc-700/50 shadow-[0_8px_30px_rgb(0,0,0,0.5)]">
                                 <button
                                     onClick={() => setScanMode('return-batch')}
-                                    className={`px-4 sm:px-5 py-2 rounded-full text-xs font-bold transition-all ${scanMode === 'return-batch' ? 'bg-purple-600 text-white shadow-sm' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'}`}
+                                    className={`px-3.5 sm:px-5 py-2 rounded-full text-xs font-bold transition-all ${scanMode === 'return-batch' ? 'bg-purple-600 text-white shadow-sm' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'}`}
                                 >
                                     Scan & Confirm
                                 </button>
                                 <button
                                     onClick={() => { setScanMode('return-rapid'); setRapidScanSummary({}); }}
-                                    className={`px-4 sm:px-5 py-2 rounded-full text-xs font-bold transition-all ${scanMode === 'return-rapid' ? 'bg-purple-600 text-white shadow-sm' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'}`}
+                                    className={`px-3.5 sm:px-5 py-2 rounded-full text-xs font-bold transition-all ${scanMode === 'return-rapid' ? 'bg-purple-600 text-white shadow-sm' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'}`}
                                 >
                                     Rapid
                                 </button>
                                 <button
                                     onClick={() => setScanMode('return-quantity')}
-                                    className={`px-4 sm:px-5 py-2 rounded-full text-xs font-bold transition-all ${scanMode === 'return-quantity' ? 'bg-indigo-600 text-white shadow-sm' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'}`}
+                                    className={`px-3.5 sm:px-5 py-2 rounded-full text-xs font-bold transition-all ${scanMode === 'return-quantity' ? 'bg-indigo-600 text-white shadow-sm' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'}`}
                                 >
                                     Quantity
+                                </button>
+                                <button
+                                    onClick={() => setScanMode('return-range-start')}
+                                    className={`px-3.5 sm:px-5 py-2 rounded-full text-xs font-bold transition-all ${scanMode === 'return-range-start' ? 'bg-purple-600 text-white shadow-sm' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'}`}
+                                >
+                                    Range
                                 </button>
                             </div>
                         </div>
                       )}
                       
-                      {(scanMode === 'out-rapid' || scanMode === 'return-rapid' || scanMode === 'return-quantity') && (
+                      {(scanMode === 'out-rapid' || scanMode === 'return-rapid' || scanMode === 'return-quantity' || scanMode === 'return-range-start') && (
                         <div className="fixed inset-x-0 bottom-0 z-[10000] p-4 sm:p-6 pb-safe-bottom pointer-events-none flex flex-col items-center gap-2" style={{ paddingBottom: 'calc(env(safe-area-inset-bottom) + 1.5rem)' }}>
                           
                           {(scanMode === 'out-rapid' || scanMode === 'return-rapid') && (
                               <RapidScanSummary summary={rapidScanSummary} className="mb-1" />
                           )}
 
-                          <div className="w-full max-w-sm mx-auto p-2.5 bg-zinc-900/95 backdrop-blur-xl pointer-events-auto shadow-[0_8px_30px_rgb(0,0,0,0.5)] rounded-2xl flex justify-between items-center border border-zinc-700/50">
+                          <div className="w-full max-w-sm mx-auto p-2.5 bg-zinc-900/95 backdrop-blur-xl pointer-events-auto shadow-[0_8px_30px_rgb(0,0,0,0.5)] rounded-2xl flex justify-between items-center border border-zinc-700/50 gap-2">
                             <div className="flex flex-col px-2 overflow-hidden">
-                              <p className="text-[10px] text-zinc-400 uppercase tracking-wider font-semibold leading-tight mb-0.5">{scanMode && scanMode.startsWith('return') ? 'Returning from' : 'Assigning to'}</p>
-                              <p className="font-bold text-white text-sm leading-tight truncate">{scanMode && scanMode.startsWith('return') ? returnContext.team : assignmentContext.team}</p>
+                              <p className="text-[10px] text-zinc-400 uppercase tracking-wider font-semibold leading-tight mb-0.5">
+                                {scanMode === 'return-range-start' ? 'Scan First Serial of Box/Range' : (scanMode && scanMode.startsWith('return') ? 'Returning from' : 'Assigning to')}
+                              </p>
+                              <p className="font-bold text-white text-sm leading-tight truncate">
+                                {scanMode && scanMode.startsWith('return') ? (returnContext.team || 'Any Team') : assignmentContext.team}
+                              </p>
                             </div>
-                            <button 
-                              onClick={handleCancelScan}
-                              className="shrink-0 ml-3 px-4 py-2 bg-red-600 hover:bg-red-500 text-white rounded-xl text-xs font-bold shadow-md transition-colors flex items-center gap-1.5"
-                            >
-                              <XIcon className="w-3.5 h-3.5" />
-                              Finish
-                            </button>
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              {scanMode === 'return-range-start' && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    handleSetView(View.LIST);
+                                    setScanMode(null);
+                                    handleOpenReturnRange({
+                                      team: returnContext.team || 'All',
+                                      location: returnContext.location
+                                    });
+                                  }}
+                                  className="px-3 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-xl text-xs font-bold shadow-md transition-colors"
+                                >
+                                  Type Range
+                                </button>
+                              )}
+                              <button 
+                                onClick={handleCancelScan}
+                                className="px-3.5 py-2 bg-red-600 hover:bg-red-500 text-white rounded-xl text-xs font-bold shadow-md transition-colors flex items-center gap-1.5"
+                              >
+                                <XIcon className="w-3.5 h-3.5" />
+                                Finish
+                              </button>
+                            </div>
                           </div>
                         </div>
                       )}
@@ -5905,14 +6695,37 @@ const StockManagerApp = ({
                                 <span className="text-[11px] text-zinc-400">From: {assignmentContext.location} &bull; 💡 Scan team code anytime to switch</span>
                               </div>
                               <span className="text-xs font-mono font-bold px-2.5 py-1 bg-zinc-800 rounded-full border border-zinc-700 text-blue-400">
-                                {stagedTotalCount} unit{stagedTotalCount !== 1 ? 's' : ''} ({stagedBatchItems.length} types)
+                                {stagedTotalCount} unit{stagedTotalCount !== 1 ? 's' : ''} ({stagedBatchItems.length} entr{stagedBatchItems.length === 1 ? 'y' : 'ies'})
                               </span>
+                            </div>
+
+                            {/* Meter Pack Mode Toggle */}
+                            <div className="flex items-center justify-between gap-2 bg-zinc-800/80 px-2.5 py-1.5 rounded-xl border border-zinc-700/70">
+                              <span className="text-[11px] text-zinc-300 font-medium">
+                                Meter Scan Mode:
+                              </span>
+                              <div className="flex items-center bg-zinc-900 p-0.5 rounded-lg border border-zinc-700 text-[11px]">
+                                <button
+                                  type="button"
+                                  onClick={() => setMeterBoxPackAutoExpand(true)}
+                                  className={`px-2 py-0.5 rounded font-semibold transition-colors ${meterBoxPackAutoExpand ? 'bg-blue-600 text-white' : 'text-zinc-400 hover:text-white'}`}
+                                >
+                                  Box (+10 Serials)
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setMeterBoxPackAutoExpand(false)}
+                                  className={`px-2 py-0.5 rounded font-semibold transition-colors ${!meterBoxPackAutoExpand ? 'bg-blue-600 text-white' : 'text-zinc-400 hover:text-white'}`}
+                                >
+                                  Single (1)
+                                </button>
+                              </div>
                             </div>
 
                             {/* Staged items preview list */}
                             {stagedBatchItems.length === 0 ? (
                               <div className="py-4 text-center text-xs text-zinc-400">
-                                <span>No items scanned yet. Scan barcodes to stage them for <strong>{assignmentContext.team}</strong>.</span>
+                                <span>No items scanned yet. Scan barcodes (or first serial of each meter box) to stage for <strong>{assignmentContext.team}</strong>.</span>
                               </div>
                             ) : (
                               <div className="max-h-36 overflow-y-auto space-y-1.5 pr-1 divide-y divide-zinc-800">
@@ -6029,6 +6842,14 @@ const StockManagerApp = ({
                                             </button>
                                           </div>
                                         )
+                                      ) : item.isPackBox ? (
+                                        <span className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded border ${
+                                          item.availableCount === item.quantity
+                                            ? 'bg-emerald-950/60 text-emerald-300 border-emerald-700/70'
+                                            : 'bg-amber-950/60 text-amber-300 border-amber-700/70'
+                                        }`}>
+                                          Box ({item.availableCount}/{item.quantity})
+                                        </span>
                                       ) : (
                                         <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-zinc-800 text-zinc-300 border border-zinc-700">
                                           Unique
@@ -6515,16 +7336,22 @@ const StockManagerApp = ({
                                             <span className="ml-3 text-sm font-medium text-zinc-700 dark:text-zinc-300">Assigned by me</span>
                                         </label>
                                       </div>
-                                      <div className="flex justify-start lg:justify-end space-x-2">
+                                      <div className="flex flex-wrap justify-start lg:justify-end gap-2">
+                                          <button 
+                                              onClick={() => handleOpenReturnRange({ team: assignmentFilters.team !== 'All' ? assignmentFilters.team : 'All', location: assignmentFilters.location !== 'All' ? assignmentFilters.location : undefined })}
+                                              className="w-full sm:w-auto px-4 py-2 bg-purple-50 dark:bg-purple-900/30 border border-purple-200 dark:border-purple-800 text-purple-700 dark:text-purple-300 rounded-md hover:bg-purple-100 dark:hover:bg-purple-900/50 transition-colors text-sm font-medium flex items-center justify-center whitespace-nowrap"
+                                          >
+                                              Return Range
+                                          </button>
                                           <button 
                                               onClick={handleOpenBatchReturn}
-                                              className="w-full lg:w-auto px-4 py-2 bg-indigo-50 dark:bg-indigo-900/30 border border-indigo-200 dark:border-indigo-800 text-indigo-700 dark:text-indigo-300 rounded-md hover:bg-indigo-100 dark:hover:bg-indigo-900/50 transition-colors text-sm font-medium flex items-center justify-center whitespace-nowrap"
+                                              className="w-full sm:w-auto px-4 py-2 bg-indigo-50 dark:bg-indigo-900/30 border border-indigo-200 dark:border-indigo-800 text-indigo-700 dark:text-indigo-300 rounded-md hover:bg-indigo-100 dark:hover:bg-indigo-900/50 transition-colors text-sm font-medium flex items-center justify-center whitespace-nowrap"
                                           >
                                               Batch Return
                                           </button>
                                           <button 
                                               onClick={() => setAssignmentFilters({ team: 'All', itemType: 'All', location: 'All', assignedByMe: false })}
-                                              className="w-full lg:w-auto px-4 py-2 bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-600 text-zinc-800 dark:text-zinc-200 rounded-md hover:bg-zinc-50 dark:hover:bg-zinc-600 transition-colors text-sm font-medium"
+                                              className="w-full sm:w-auto px-4 py-2 bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-600 text-zinc-800 dark:text-zinc-200 rounded-md hover:bg-zinc-50 dark:hover:bg-zinc-600 transition-colors text-sm font-medium"
                                           >
                                               Clear Filters
                                           </button>
@@ -7622,10 +8449,24 @@ const StockManagerApp = ({
                     onClick={() => { setIsReturnSetupModalOpen(false); setIsScanReturnModeSelectionOpen(true); }}
                     className="w-full sm:w-auto px-3 py-2 text-xs font-medium text-zinc-500 hover:text-zinc-800 dark:text-zinc-400 dark:hover:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-md transition-colors text-center"
                 >
-                    Other Modes (Rapid / Quantity)
+                    Other Modes (Rapid / Qty / Range)
                 </button>
-                <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
-                    <button type="button" onClick={() => setIsReturnSetupModalOpen(false)} className="px-4 py-2 bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-600 text-zinc-800 dark:text-zinc-200 rounded-md hover:bg-zinc-50 dark:hover:bg-zinc-600 transition-colors text-sm font-medium">Cancel</button>
+                <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto justify-end">
+                    <button type="button" onClick={() => setIsReturnSetupModalOpen(false)} className="px-3.5 py-2 bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-600 text-zinc-800 dark:text-zinc-200 rounded-md hover:bg-zinc-50 dark:hover:bg-zinc-600 transition-colors text-sm font-medium">Cancel</button>
+                    <button
+                        type="button"
+                        onClick={() => {
+                            setIsReturnSetupModalOpen(false);
+                            handleOpenReturnRange({
+                                team: returnContext.team || 'All',
+                                location: returnContext.location
+                            });
+                        }}
+                        className="px-3.5 py-2 bg-purple-50 dark:bg-purple-900/30 border border-purple-300 dark:border-purple-700 text-purple-700 dark:text-purple-300 rounded-md hover:bg-purple-100 dark:hover:bg-purple-900/50 transition-colors text-sm font-semibold flex items-center justify-center gap-1.5"
+                    >
+                        <BarcodeIcon className="w-4 h-4" />
+                        <span>Return Range</span>
+                    </button>
                     <button 
                         type="button" 
                         disabled={!returnContext.team} 
@@ -7650,18 +8491,19 @@ const StockManagerApp = ({
           <div className="p-3 bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800 rounded-md text-xs text-purple-900 dark:text-purple-200 flex items-center justify-between gap-2">
             <div className="flex items-center gap-2">
               <BuildingStoreIcon className="w-4 h-4 flex-shrink-0 text-purple-600" />
-              <span>Returning from: <strong>{returnContext.team}</strong> &rarr; <strong>{returnContext.location || (activeLocation !== 'All' ? activeLocation : (displayLocations[0] || Location.LEADING_STORES))}</strong></span>
+              <span>Returning from: <strong>{returnContext.team || 'Any Team'}</strong> &rarr; <strong>{returnContext.location || (activeLocation !== 'All' ? activeLocation : (displayLocations[0] || Location.LEADING_STORES))}</strong></span>
             </div>
           </div>
 
           <button
+              disabled={!returnContext.team}
               onClick={() => { 
                   setScanMode('return-batch'); 
                   setStagedReturnItems([]); 
                   setIsScanReturnModeSelectionOpen(false); 
                   handleSetView(View.SCAN); 
               }}
-              className="w-full text-left p-4 bg-purple-50/70 dark:bg-purple-900/20 border-2 border-purple-500/60 dark:border-purple-700 rounded-lg hover:bg-purple-100/60 dark:hover:bg-purple-900/40 transition-colors shadow-xs"
+              className="w-full text-left p-4 bg-purple-50/70 dark:bg-purple-900/20 border-2 border-purple-500/60 dark:border-purple-700 rounded-lg hover:bg-purple-100/60 dark:hover:bg-purple-900/40 transition-colors shadow-xs disabled:opacity-50 disabled:cursor-not-allowed"
           >
               <div className="flex items-center justify-between mb-1">
                   <p className="font-bold text-purple-900 dark:text-purple-200 text-sm">Scan & Confirm (Batch Return)</p>
@@ -7671,19 +8513,54 @@ const StockManagerApp = ({
           </button>
 
           <button
+              disabled={!returnContext.team}
               onClick={() => { setScanMode('return-rapid'); setIsScanReturnModeSelectionOpen(false); setToasts([]); setRapidScanSummary({}); handleSetView(View.SCAN); }}
-              className="w-full text-left p-4 bg-white dark:bg-zinc-700/50 border border-zinc-200 dark:border-zinc-700 rounded-lg hover:bg-zinc-50 dark:hover:bg-zinc-700 transition-colors"
+              className="w-full text-left p-4 bg-white dark:bg-zinc-700/50 border border-zinc-200 dark:border-zinc-700 rounded-lg hover:bg-zinc-50 dark:hover:bg-zinc-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
               <p className="font-semibold text-zinc-800 dark:text-zinc-100">Rapid Return Mode</p>
               <p className="text-xs text-zinc-500 dark:text-zinc-400">Scan an item to instantly return one unit assigned to this team. Best for speed.</p>
           </button>
           <button
+              disabled={!returnContext.team}
               onClick={() => { setScanMode('return-quantity'); setIsScanReturnModeSelectionOpen(false); handleSetView(View.SCAN); }}
-              className="w-full text-left p-4 bg-white dark:bg-zinc-700/50 border border-zinc-200 dark:border-zinc-700 rounded-lg hover:bg-zinc-50 dark:hover:bg-zinc-700 transition-colors"
+              className="w-full text-left p-4 bg-white dark:bg-zinc-700/50 border border-zinc-200 dark:border-zinc-700 rounded-lg hover:bg-zinc-50 dark:hover:bg-zinc-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
               <p className="font-semibold text-zinc-800 dark:text-zinc-100">Quantity Return Mode</p>
               <p className="text-xs text-zinc-500 dark:text-zinc-400">Scan an item, then enter the quantity to return. Best for bulk items.</p>
           </button>
+          <div className="p-4 bg-white dark:bg-zinc-700/50 border border-zinc-200 dark:border-zinc-700 rounded-lg space-y-2.5">
+              <div>
+                  <p className="font-semibold text-zinc-800 dark:text-zinc-100">Range Return Mode (Box of Serials)</p>
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400">Return a full box or range of unique serial numbers back into stock by first &amp; last serial or box quantity.</p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                  <button
+                      type="button"
+                      onClick={() => {
+                          setScanMode('return-range-start');
+                          setIsScanReturnModeSelectionOpen(false);
+                          handleSetView(View.SCAN);
+                      }}
+                      className="flex-1 px-3 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-md text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors"
+                  >
+                      <ScanIcon className="w-3.5 h-3.5" />
+                      <span>Scan First Serial</span>
+                  </button>
+                  <button
+                      type="button"
+                      onClick={() => {
+                          setIsScanReturnModeSelectionOpen(false);
+                          handleOpenReturnRange({
+                              team: returnContext.team || 'All',
+                              location: returnContext.location
+                          });
+                      }}
+                      className="flex-1 px-3 py-2 bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-600 dark:hover:bg-zinc-500 text-zinc-800 dark:text-zinc-100 rounded-md text-xs font-semibold transition-colors"
+                  >
+                      Enter Range Manually
+                  </button>
+              </div>
+          </div>
         </div>
       </Modal>
 
@@ -7999,8 +8876,9 @@ const StockManagerApp = ({
                       setIsScanModeModalOpen(false); 
                       setAssignmentContext(prev => ({
                           ...prev,
-                          location: activeLocation !== 'All' ? activeLocation : (displayLocations[0] || Location.LEADING_STORES)
+                          location: ''
                       }));
+                      setTeamBarcodeInput('');
                       setIsAssignmentSetupModalOpen(true); 
                   }}
                   className="flex flex-col items-center justify-center p-4 bg-white dark:bg-zinc-700/50 border border-zinc-200 dark:border-zinc-700 rounded-lg hover:bg-yellow-50 dark:hover:bg-yellow-900/20 hover:border-yellow-400 dark:hover:border-yellow-600 transition-all text-center"
@@ -8050,90 +8928,119 @@ const StockManagerApp = ({
       </Modal>
 
       <Modal isOpen={isAssignmentSetupModalOpen} onClose={() => setIsAssignmentSetupModalOpen(false)} title="Sign Out Stock...">
-        <div className="space-y-4">
-            <div>
-                <label htmlFor="assign-location" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-                    Sign Out From Storehouse / Location
-                </label>
-                <select id="assign-location" value={assignmentContext.location} onChange={(e) => setAssignmentContext(prev => ({ ...prev, location: e.target.value }))} className={`${formInputStyle} py-2.5`}>
-                    {displayLocations.map(loc => <option key={loc} value={loc}>{loc}</option>)}
-                </select>
-                <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">Stock will be deducted specifically from this storehouse.</p>
-            </div>
-            <div>
-                <label htmlFor="assign-team" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Assign to Team / Surveyor</label>
-                <select id="assign-team" required value={assignmentContext.team} onChange={(e) => setAssignmentContext(prev => ({ ...prev, team: e.target.value }))} className={`${formInputStyle} py-2.5`}>
-                    {teamsLoading ? <option disabled>Loading teams...</option> : teams.map(team => (
-                        <option key={team.id} value={team.name}>
-                            {team.name} {team.barcode ? `(Barcode: ${team.barcode})` : ''}
-                        </option>
-                    ))}
-                </select>
-
-                <div className="mt-2.5 flex items-center gap-2">
-                    <div className="relative flex-1">
-                        <div className="absolute inset-y-0 left-0 pl-2.5 flex items-center pointer-events-none text-zinc-400">
-                            <BarcodeIcon className="w-3.5 h-3.5" />
-                        </div>
-                        <input
-                            type="text"
-                            placeholder="Scan or type team barcode..."
-                            value={teamBarcodeInput}
-                            onChange={(e) => {
-                                const val = e.target.value;
-                                setTeamBarcodeInput(val);
-                                const match = teamBarcodeLookup[val.trim().toLowerCase()];
-                                if (match) {
-                                    setAssignmentContext(prev => ({ ...prev, team: match.name }));
-                                    playBeep('success');
-                                    addToast(`Selected: ${match.name}`, 'success');
-                                }
-                            }}
-                            className="w-full text-xs font-mono pl-8 pr-2.5 py-2 border border-zinc-300 dark:border-zinc-700 rounded-md bg-zinc-50 dark:bg-zinc-800 text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                        />
-                    </div>
-                    <button
-                        type="button"
-                        onClick={() => {
-                            setIsAssignmentSetupModalOpen(false);
-                            setScanMode('team-scan');
-                            handleSetView(View.SCAN);
-                        }}
-                        className="px-2.5 py-2 bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-700 dark:hover:bg-zinc-600 text-zinc-700 dark:text-zinc-200 text-xs font-medium rounded-md flex items-center gap-1.5 transition-colors shrink-0"
-                        title="Scan Team Badge / Barcode with Camera/Scanner"
+        {(() => {
+          const isAssignmentLocationSelected = Boolean(assignmentContext.location && assignmentContext.location !== 'All');
+          return (
+            <div className="space-y-4">
+                <div>
+                    <label htmlFor="assign-location" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                        Sign Out From Storehouse / Location <span className="text-red-500 font-bold">*</span>
+                    </label>
+                    <select
+                        id="assign-location"
+                        required
+                        value={assignmentContext.location}
+                        onChange={(e) => setAssignmentContext(prev => ({ ...prev, location: e.target.value }))}
+                        className={`py-2.5 w-full px-3 rounded-md shadow-xs text-sm focus:outline-none transition-all ${
+                            !isAssignmentLocationSelected
+                                ? 'border-2 border-amber-500 dark:border-amber-400 bg-amber-50/70 dark:bg-amber-950/30 text-amber-900 dark:text-amber-100 font-semibold ring-2 ring-amber-400/30 focus:ring-amber-500 focus:border-amber-500'
+                                : `${formInputStyle} border-emerald-500/70 dark:border-emerald-600/70`
+                        }`}
                     >
-                        <ScanIcon className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
-                        <span>Scan Badge</span>
-                    </button>
+                        <option value="" disabled>-- Please select storehouse / location --</option>
+                        {displayLocations.map(loc => <option key={loc} value={loc}>{loc}</option>)}
+                    </select>
+                    {!isAssignmentLocationSelected ? (
+                        <div className="mt-1.5 flex items-center gap-1.5 text-xs font-semibold text-amber-700 dark:text-amber-400">
+                            <AlertTriangleIcon className="w-3.5 h-3.5 shrink-0" />
+                            <span>Required: Please choose which storehouse stock is being taken from.</span>
+                        </div>
+                    ) : (
+                        <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">
+                            Stock will be deducted specifically from <strong>{assignmentContext.location}</strong>.
+                        </p>
+                    )}
                 </div>
-            </div>
-            <div className="flex flex-col-reverse sm:flex-row sm:justify-between items-center gap-2 pt-4 border-t border-zinc-200 dark:border-zinc-700">
-                <button 
-                    type="button" 
-                    onClick={() => { setIsAssignmentSetupModalOpen(false); setIsScanOutModeSelectionOpen(true); }}
-                    className="w-full sm:w-auto px-3 py-2 text-xs font-medium text-zinc-500 hover:text-zinc-800 dark:text-zinc-400 dark:hover:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-md transition-colors text-center"
-                >
-                    Other Modes (Rapid / Qty / Range)
-                </button>
-                <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
-                    <button type="button" onClick={() => setIsAssignmentSetupModalOpen(false)} className="px-4 py-2 bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-600 text-zinc-800 dark:text-zinc-200 rounded-md hover:bg-zinc-50 dark:hover:bg-zinc-600 transition-colors text-sm font-medium">Cancel</button>
+                <div>
+                    <label htmlFor="assign-team" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Assign to Team / Surveyor</label>
+                    <select id="assign-team" required value={assignmentContext.team} onChange={(e) => setAssignmentContext(prev => ({ ...prev, team: e.target.value }))} className={`${formInputStyle} py-2.5`}>
+                        {teamsLoading ? <option disabled>Loading teams...</option> : teams.map(team => (
+                            <option key={team.id} value={team.name}>
+                                {team.name} {team.barcode ? `(Barcode: ${team.barcode})` : ''}
+                            </option>
+                        ))}
+                    </select>
+
+                    <div className="mt-2.5 flex items-center gap-2">
+                        <div className="relative flex-1">
+                            <div className="absolute inset-y-0 left-0 pl-2.5 flex items-center pointer-events-none text-zinc-400">
+                                <BarcodeIcon className="w-3.5 h-3.5" />
+                            </div>
+                            <input
+                                type="text"
+                                placeholder="Scan or type team barcode..."
+                                value={teamBarcodeInput}
+                                onChange={(e) => {
+                                    const val = e.target.value;
+                                    setTeamBarcodeInput(val);
+                                    const match = teamBarcodeLookup[val.trim().toLowerCase()];
+                                    if (match) {
+                                        setAssignmentContext(prev => ({ ...prev, team: match.name }));
+                                        playBeep('success');
+                                        addToast(`Selected: ${match.name}`, 'success');
+                                    }
+                                }}
+                                className="w-full text-xs font-mono pl-8 pr-2.5 py-2 border border-zinc-300 dark:border-zinc-700 rounded-md bg-zinc-50 dark:bg-zinc-800 text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                            />
+                        </div>
+                        <button
+                            type="button"
+                            onClick={() => {
+                                setIsAssignmentSetupModalOpen(false);
+                                setScanMode('team-scan');
+                                handleSetView(View.SCAN);
+                            }}
+                            className="px-2.5 py-2 bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-700 dark:hover:bg-zinc-600 text-zinc-700 dark:text-zinc-200 text-xs font-medium rounded-md flex items-center gap-1.5 transition-colors shrink-0"
+                            title="Scan Team Badge / Barcode with Camera/Scanner"
+                        >
+                            <ScanIcon className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+                            <span>Scan Badge</span>
+                        </button>
+                    </div>
+                </div>
+                <div className="flex flex-col-reverse sm:flex-row sm:justify-between items-center gap-2 pt-4 border-t border-zinc-200 dark:border-zinc-700">
                     <button 
                         type="button" 
-                        disabled={!assignmentContext.team}
-                        onClick={() => { 
-                            setScanMode('out-batch'); 
-                            setStagedBatchItems([]); 
-                            setIsAssignmentSetupModalOpen(false); 
-                            handleSetView(View.SCAN); 
-                        }} 
-                        className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors text-sm font-semibold disabled:bg-blue-400 dark:disabled:bg-blue-800 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 dark:focus:ring-offset-zinc-800 flex items-center justify-center gap-1.5 shadow-sm"
+                        disabled={!isAssignmentLocationSelected || !assignmentContext.team}
+                        onClick={() => { setIsAssignmentSetupModalOpen(false); setIsScanOutModeSelectionOpen(true); }}
+                        title={!isAssignmentLocationSelected ? 'Select a storehouse / location first' : undefined}
+                        className="w-full sm:w-auto px-3 py-2 text-xs font-medium text-zinc-500 hover:text-zinc-800 dark:text-zinc-400 dark:hover:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-md transition-colors text-center disabled:opacity-45 disabled:cursor-not-allowed disabled:hover:bg-transparent"
                     >
-                        <ScanIcon className="w-4 h-4" />
-                        <span>Scan Items to Sign Out</span>
+                        Other Modes (Rapid / Qty / Range)
                     </button>
+                    <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
+                        <button type="button" onClick={() => setIsAssignmentSetupModalOpen(false)} className="px-4 py-2 bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-600 text-zinc-800 dark:text-zinc-200 rounded-md hover:bg-zinc-50 dark:hover:bg-zinc-600 transition-colors text-sm font-medium">Cancel</button>
+                        <button 
+                            type="button" 
+                            disabled={!isAssignmentLocationSelected || !assignmentContext.team}
+                            title={!isAssignmentLocationSelected ? 'Select a storehouse / location first' : undefined}
+                            onClick={() => { 
+                                if (!isAssignmentLocationSelected) return;
+                                setScanMode('out-batch'); 
+                                setStagedBatchItems([]); 
+                                setIsAssignmentSetupModalOpen(false); 
+                                handleSetView(View.SCAN); 
+                            }} 
+                            className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors text-sm font-semibold disabled:bg-blue-400 dark:disabled:bg-blue-800 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 dark:focus:ring-offset-zinc-800 flex items-center justify-center gap-1.5 shadow-sm"
+                        >
+                            <ScanIcon className="w-4 h-4" />
+                            <span>Scan Items to Sign Out</span>
+                        </button>
+                    </div>
                 </div>
             </div>
-        </div>
+          );
+        })()}
       </Modal>
 
       <Modal isOpen={isScanOutModeSelectionOpen} onClose={() => setIsScanOutModeSelectionOpen(false)} title="Choose Scan Out Mode">
@@ -8158,7 +9065,7 @@ const StockManagerApp = ({
                   <p className="font-bold text-blue-900 dark:text-blue-200 text-sm">Scan & Confirm (Batch Sign Out)</p>
                   <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full bg-blue-600 text-white">Recommended</span>
               </div>
-              <p className="text-xs text-zinc-600 dark:text-zinc-300">Scan all the items you want to sign out to this team, review the staged list, and confirm before deducting stock.</p>
+              <p className="text-xs text-zinc-600 dark:text-zinc-300">Scan all items (or scan the first serial of each 10-pack meter box) to assign to this team, verify all serial numbers, and confirm before deducting stock.</p>
           </button>
 
           <button
@@ -8508,6 +9415,28 @@ const StockManagerApp = ({
             </div>
           </div>
 
+          {/* Unavailable unique box serials warning banner */}
+          {batchConfirmationAnalysis.totalUnavailableBoxSerials > 0 && (
+            <div className="p-3 bg-red-50 dark:bg-red-950/40 border border-red-300 dark:border-red-700/60 rounded-lg text-xs text-red-900 dark:text-red-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+              <div className="flex items-start gap-2.5">
+                <AlertTriangleIcon className="w-4 h-4 text-red-600 dark:text-red-400 flex-shrink-0 mt-0.5" />
+                <div>
+                  <p className="font-semibold">Verify Serial Numbers Before Confirming</p>
+                  <p className="mt-0.5 text-red-800 dark:text-red-300">
+                    {batchConfirmationAnalysis.totalUnavailableBoxSerials} serial number{batchConfirmationAnalysis.totalUnavailableBoxSerials === 1 ? ' is' : 's are'} not available in stock at {batchConfirmationAnalysis.targetLoc}. Check that you scanned the FIRST serial of each box or remove unavailable serials below.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleRemoveUnavailableFromBatch}
+                className="px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-md font-semibold text-xs shrink-0 transition-colors"
+              >
+                Remove Unavailable ({batchConfirmationAnalysis.totalUnavailableBoxSerials})
+              </button>
+            </div>
+          )}
+
           {/* Discrepancy warning banner if any item exceeds available count */}
           {stagedBatchItems.some(item => !item.isUnique && item.quantity > item.availableCount) && (
             <div className="p-3 bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700/60 rounded-lg text-xs text-amber-900 dark:text-amber-200 flex items-start gap-2.5">
@@ -8522,49 +9451,70 @@ const StockManagerApp = ({
           )}
 
           {/* Scan additional items directly in confirmation modal */}
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              if (batchConfirmBarcodeInput.trim()) {
-                handleScanSuccess(batchConfirmBarcodeInput.trim());
-                setBatchConfirmBarcodeInput('');
-              }
-            }}
-            className="flex gap-2"
-          >
-            <div className="relative flex-1">
-              <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-zinc-400">
-                <BarcodeIcon className="w-4 h-4" />
+          <div className="space-y-2">
+            <div className="flex items-center justify-between gap-2 text-xs">
+              <span className="text-zinc-500 dark:text-zinc-400 font-medium">Meter Pack Mode for New Scans:</span>
+              <div className="flex items-center bg-zinc-100 dark:bg-zinc-800 p-0.5 rounded-lg border border-zinc-200 dark:border-zinc-700 text-[11px]">
+                <button
+                  type="button"
+                  onClick={() => setMeterBoxPackAutoExpand(true)}
+                  className={`px-2.5 py-1 rounded font-semibold transition-colors ${meterBoxPackAutoExpand ? 'bg-blue-600 text-white shadow-2xs' : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'}`}
+                >
+                  Box (+10 Serials)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMeterBoxPackAutoExpand(false)}
+                  className={`px-2.5 py-1 rounded font-semibold transition-colors ${!meterBoxPackAutoExpand ? 'bg-blue-600 text-white shadow-2xs' : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'}`}
+                >
+                  Single (1)
+                </button>
               </div>
-              <input
-                type="text"
-                autoFocus
-                placeholder="Scan or type barcode / serial to stage more products..."
-                value={batchConfirmBarcodeInput}
-                onChange={(e) => setBatchConfirmBarcodeInput(e.target.value)}
-                className="w-full text-xs font-mono pl-9 pr-3 py-2 border border-zinc-300 dark:border-zinc-700 rounded-lg bg-zinc-50 dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              />
             </div>
-            <button
-              type="submit"
-              disabled={!batchConfirmBarcodeInput.trim()}
-              className="px-3.5 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-zinc-200 dark:disabled:bg-zinc-800 disabled:text-zinc-400 text-white rounded-lg text-xs font-semibold transition-colors flex items-center gap-1 shrink-0"
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (batchConfirmBarcodeInput.trim()) {
+                  handleScanSuccess(batchConfirmBarcodeInput.trim());
+                  setBatchConfirmBarcodeInput('');
+                }
+              }}
+              className="flex gap-2"
             >
-              <AddIcon className="w-3.5 h-3.5" />
-              <span>Add</span>
-            </button>
-          </form>
+              <div className="relative flex-1">
+                <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-zinc-400">
+                  <BarcodeIcon className="w-4 h-4" />
+                </div>
+                <input
+                  type="text"
+                  autoFocus
+                  placeholder="Scan or type barcode / 1st serial of meter box to add..."
+                  value={batchConfirmBarcodeInput}
+                  onChange={(e) => setBatchConfirmBarcodeInput(e.target.value)}
+                  className="w-full text-xs font-mono pl-9 pr-3 py-2 border border-zinc-300 dark:border-zinc-700 rounded-lg bg-zinc-50 dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+              <button
+                type="submit"
+                disabled={!batchConfirmBarcodeInput.trim()}
+                className="px-3.5 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-zinc-200 dark:disabled:bg-zinc-800 disabled:text-zinc-400 text-white rounded-lg text-xs font-semibold transition-colors flex items-center gap-1 shrink-0"
+              >
+                <AddIcon className="w-3.5 h-3.5" />
+                <span>Add</span>
+              </button>
+            </form>
+          </div>
 
           {/* Staged Items Table */}
           <div className="border border-zinc-200 dark:border-zinc-700 rounded-lg overflow-hidden">
-            <div className="max-h-72 overflow-y-auto">
+            <div className="max-h-80 overflow-y-auto">
               {stagedBatchItems.length === 0 ? (
                 <div className="p-6 text-center text-sm text-zinc-500 dark:text-zinc-400">
                   No items staged for sign out yet.
                 </div>
               ) : (
                 <table className="min-w-full divide-y divide-zinc-200 dark:divide-zinc-700 text-xs">
-                  <thead className="bg-zinc-50 dark:bg-zinc-800/80 sticky top-0">
+                  <thead className="bg-zinc-50 dark:bg-zinc-800/80 sticky top-0 z-10">
                     <tr>
                       <th className="px-3 py-2 text-left font-semibold text-zinc-600 dark:text-zinc-300">Item</th>
                       <th className="px-3 py-2 text-left font-semibold text-zinc-600 dark:text-zinc-300">Type / Barcode</th>
@@ -8576,15 +9526,27 @@ const StockManagerApp = ({
                   <tbody className="divide-y divide-zinc-200 dark:divide-zinc-800">
                     {stagedBatchItems.map((item) => {
                       const isExcess = !item.isUnique && item.quantity > item.availableCount;
+                      const boxMeta = item.isUnique && item.isPackBox ? batchConfirmationAnalysis.resolvedByBoxId[item.id] : null;
+                      const resolvedBoxSerials = boxMeta?.serials || item.serials || [];
+                      const boxAvailableCount = boxMeta ? boxMeta.availableCount : (item.availableCount ?? 0);
+                      const boxUnavailableCount = boxMeta ? boxMeta.unavailableCount : 0;
+                      const isBoxExpanded = expandedBatchPackIds[item.id] !== false;
+                      const singleUniqueStatus = (item.isUnique && !item.isPackBox) ? batchConfirmationAnalysis.resolvedByBoxId[item.id]?.singleStatus : null;
+
                       return (
-                        <tr key={item.id} className="hover:bg-zinc-50 dark:hover:bg-zinc-800/50">
+                        <React.Fragment key={item.id}>
+                        <tr className="hover:bg-zinc-50 dark:hover:bg-zinc-800/50">
                           <td className="px-3 py-2.5 font-medium text-zinc-900 dark:text-zinc-100 max-w-[180px] truncate">
                             {item.name}
                             <div className="flex items-center gap-1.5 flex-wrap mt-0.5">
                               {item.partNumber && (
                                 <span className="text-[10px] text-zinc-400 font-mono">Part #{item.partNumber}</span>
                               )}
-                              {item.isPack && (
+                              {item.isPackBox ? (
+                                <span className="text-[9px] font-bold px-1.5 py-0.2 rounded bg-blue-100 dark:bg-blue-900/60 text-blue-800 dark:text-blue-200">
+                                  Box ({item.quantity})
+                                </span>
+                              ) : item.isPack && (
                                 <span className="text-[9px] font-bold px-1.5 py-0.2 rounded bg-blue-100 dark:bg-blue-900/60 text-blue-800 dark:text-blue-200">
                                   Pack ({item.packQuantity})
                                 </span>
@@ -8592,7 +9554,32 @@ const StockManagerApp = ({
                             </div>
                           </td>
                           <td className="px-3 py-2.5 font-mono text-zinc-500 dark:text-zinc-400">
-                            {item.isUnique ? (
+                            {item.isPackBox ? (
+                              <div className="flex flex-col gap-1">
+                                <span className="inline-flex items-center gap-1 text-[11px] bg-purple-50 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 px-1.5 py-0.5 rounded w-fit">
+                                  {item.firstSerial}{item.quantity > 1 ? ` → ${item.lastSerial}` : ''}
+                                </span>
+                                <div className="flex items-center gap-2 font-sans">
+                                  <button
+                                    type="button"
+                                    onClick={() => setExpandedBatchPackIds(prev => ({ ...prev, [item.id]: !isBoxExpanded }))}
+                                    className="text-[10px] text-blue-600 dark:text-blue-400 hover:underline font-semibold"
+                                  >
+                                    {isBoxExpanded ? 'Hide serials' : `View ${resolvedBoxSerials.length} serials`}
+                                  </button>
+                                  {resolvedBoxSerials.length > 1 && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleKeepOnlyFirstInBatchBox(item.id)}
+                                      className="text-[10px] text-zinc-500 dark:text-zinc-400 hover:text-zinc-800 dark:hover:text-zinc-200 hover:underline"
+                                      title="Keep only the scanned first serial (1 single meter)"
+                                    >
+                                      1st only
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                            ) : item.isUnique ? (
                               <span className="inline-flex items-center gap-1 text-[11px] bg-purple-50 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 px-1.5 py-0.5 rounded">
                                 Serial: {item.serial}
                               </span>
@@ -8601,10 +9588,26 @@ const StockManagerApp = ({
                             )}
                           </td>
                           <td className="px-3 py-2.5 text-center">
-                            {item.isUnique ? (
-                              <span className="inline-flex items-center text-[10px] font-semibold text-green-700 dark:text-green-300 bg-green-50 dark:bg-green-950/40 px-2 py-0.5 rounded-full border border-green-200 dark:border-green-800">
-                                1 In Stock
-                              </span>
+                            {item.isPackBox ? (
+                              boxUnavailableCount === 0 ? (
+                                <span className="inline-flex items-center text-[10px] font-semibold text-green-700 dark:text-green-300 bg-green-50 dark:bg-green-950/40 px-2 py-0.5 rounded-full border border-green-200 dark:border-green-800">
+                                  {boxAvailableCount}/{resolvedBoxSerials.length} In Stock
+                                </span>
+                              ) : (
+                                <span className="inline-flex items-center text-[10px] font-semibold text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-950/40 px-2 py-0.5 rounded-full border border-red-300 dark:border-red-700">
+                                  {boxAvailableCount}/{resolvedBoxSerials.length} OK • {boxUnavailableCount} Issue{boxUnavailableCount === 1 ? '' : 's'}
+                                </span>
+                              )
+                            ) : item.isUnique ? (
+                              singleUniqueStatus?.status === 'available' ? (
+                                <span className="inline-flex items-center text-[10px] font-semibold text-green-700 dark:text-green-300 bg-green-50 dark:bg-green-950/40 px-2 py-0.5 rounded-full border border-green-200 dark:border-green-800">
+                                  1 In Stock
+                                </span>
+                              ) : (
+                                <span className="inline-flex items-center text-[10px] font-semibold text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40 px-2 py-0.5 rounded-full border border-amber-300 dark:border-amber-700">
+                                  {singleUniqueStatus?.reason || 'Not in Stock'}
+                                </span>
+                              )
                             ) : isExcess ? (
                               <span className="inline-flex items-center text-[10px] font-semibold text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40 px-2 py-0.5 rounded-full border border-amber-300 dark:border-amber-700">
                                 {item.availableCount} in stock (+{item.quantity - item.availableCount} excess)
@@ -8718,7 +9721,7 @@ const StockManagerApp = ({
                                 </div>
                               )
                             ) : (
-                              <span className="font-mono font-semibold text-zinc-700 dark:text-zinc-300">1</span>
+                              <span className="font-mono font-semibold text-zinc-700 dark:text-zinc-300">{item.quantity || 1}</span>
                             )}
                           </td>
                           <td className="px-2 py-2.5 text-right">
@@ -8732,6 +9735,54 @@ const StockManagerApp = ({
                             </button>
                           </td>
                         </tr>
+                        {item.isPackBox && isBoxExpanded && resolvedBoxSerials.length > 0 && (
+                          <tr className="bg-zinc-50/80 dark:bg-zinc-900/50">
+                            <td colSpan="5" className="px-3 py-2.5">
+                              <div className="text-[11px] font-semibold text-zinc-600 dark:text-zinc-300 mb-1.5">
+                                Serial Numbers Assigned in This Box ({resolvedBoxSerials.length}):
+                              </div>
+                              <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                                {resolvedBoxSerials.map((entrySerial, idx) => (
+                                  <div
+                                    key={entrySerial.serial}
+                                    className={`flex items-center justify-between gap-2 px-2 py-1 rounded border text-[11px] ${
+                                      entrySerial.status === 'available'
+                                        ? 'bg-white dark:bg-zinc-800 border-zinc-200 dark:border-zinc-700'
+                                        : 'bg-red-50/80 dark:bg-red-950/40 border-red-200 dark:border-red-800'
+                                    }`}
+                                  >
+                                    <div className="flex items-center gap-1.5 min-w-0">
+                                      <span className="text-[10px] text-zinc-400 font-mono w-4 text-right shrink-0">{idx + 1}.</span>
+                                      <span className="font-mono font-semibold text-zinc-800 dark:text-zinc-100 truncate">
+                                        {entrySerial.serial}
+                                      </span>
+                                    </div>
+                                    <div className="flex items-center gap-1.5 shrink-0">
+                                      {entrySerial.status === 'available' ? (
+                                        <span className="text-[10px] font-medium text-emerald-700 dark:text-emerald-400">
+                                          In Stock
+                                        </span>
+                                      ) : (
+                                        <span className="text-[10px] font-semibold text-red-600 dark:text-red-400">
+                                          {entrySerial.reason || 'Unavailable'}
+                                        </span>
+                                      )}
+                                      <button
+                                        type="button"
+                                        onClick={() => handleRemoveSerialFromBatchBox(item.id, entrySerial.serial)}
+                                        className="p-0.5 text-zinc-400 hover:text-red-600 dark:hover:text-red-400 rounded"
+                                        title={`Remove ${entrySerial.serial}`}
+                                      >
+                                        <XIcon className="w-3 h-3" />
+                                      </button>
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                        </React.Fragment>
                       );
                     })}
                   </tbody>
@@ -8760,7 +9811,7 @@ const StockManagerApp = ({
               </button>
               <button
                 type="button"
-                disabled={isSubmittingBatchSignOut || stagedTotalCount === 0}
+                disabled={isSubmittingBatchSignOut || stagedTotalCount === 0 || batchConfirmationAnalysis.totalUnavailableBoxSerials > 0}
                 onClick={handleConfirmBatchSignOut}
                 className="px-5 py-2.5 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 dark:disabled:bg-blue-800 disabled:cursor-not-allowed text-white text-sm font-semibold rounded-md shadow-sm transition-colors flex items-center justify-center gap-2 min-w-[200px]"
               >
@@ -8996,6 +10047,359 @@ const StockManagerApp = ({
                     {isSubmitting ? 'Assigning...' : `Assign to ${assignmentContext.team}`}
                 </button>
             </div>
+        </form>
+      </Modal>
+
+      <Modal
+        isOpen={isReturnRangeModalOpen && !returnRangeScanTarget}
+        onClose={() => {
+          if (!isReturningRange) {
+            setIsReturnRangeModalOpen(false);
+            setRangeReturnError(null);
+            setReturnRangeScanTarget(null);
+          }
+        }}
+        title="Return Serial Range to Stock"
+      >
+        <form onSubmit={handleReturnRangeSubmit} className="space-y-4">
+          <div className="p-3 bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800 rounded-lg text-xs text-purple-900 dark:text-purple-200">
+            Enter or scan the first and last serial numbers (or box quantity) to return a box of unique serialized items back into inventory.
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label htmlFor="return-range-team" className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                Returning From Team
+              </label>
+              <select
+                id="return-range-team"
+                value={rangeReturnDetails.team}
+                onChange={(e) => {
+                  setRangeReturnError(null);
+                  setRangeReturnDetails(prev => ({ ...prev, team: e.target.value }));
+                }}
+                className={`${formInputStyle} text-sm`}
+              >
+                <option value="All">Any Assigned Team (Auto-detect)</option>
+                {teams.map(team => (
+                  <option key={team.id} value={team.name}>
+                    {team.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label htmlFor="return-range-location" className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                Return Into Storehouse / Location
+              </label>
+              <select
+                id="return-range-location"
+                value={rangeReturnDetails.location || (activeLocation !== 'All' ? activeLocation : (displayLocations[0] || Location.LEADING_STORES))}
+                onChange={(e) => {
+                  setRangeReturnError(null);
+                  setRangeReturnDetails(prev => ({ ...prev, location: e.target.value }));
+                }}
+                className={`${formInputStyle} text-sm`}
+              >
+                {displayLocations.map(loc => (
+                  <option key={loc} value={loc}>{loc}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div className="space-y-3 pt-2 border-t border-zinc-200 dark:border-zinc-700">
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-semibold text-zinc-800 dark:text-zinc-200">
+                Serial Number Range
+              </span>
+              <div className="flex items-center bg-zinc-100 dark:bg-zinc-800 p-0.5 rounded-lg border border-zinc-200 dark:border-zinc-700 text-xs">
+                <button
+                  type="button"
+                  onClick={() => setRangeReturnMode('endSerial')}
+                  className={`px-2.5 py-1 rounded font-semibold transition-colors ${
+                    rangeReturnMode === 'endSerial'
+                      ? 'bg-white dark:bg-zinc-700 text-purple-600 dark:text-purple-400 shadow-2xs'
+                      : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'
+                  }`}
+                >
+                  By End Serial
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRangeReturnMode('quantity')}
+                  className={`px-2.5 py-1 rounded font-semibold transition-colors ${
+                    rangeReturnMode === 'quantity'
+                      ? 'bg-white dark:bg-zinc-700 text-purple-600 dark:text-purple-400 shadow-2xs'
+                      : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'
+                  }`}
+                >
+                  By Box Quantity
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label htmlFor="return-range-first" className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                  First Serial Number
+                </label>
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="text"
+                    id="return-range-first"
+                    value={rangeReturnDetails.firstSerial}
+                    onChange={(e) => {
+                      const start = e.target.value;
+                      setRangeReturnError(null);
+                      setRangeReturnDetails(prev => {
+                        const updated = { ...prev, firstSerial: start };
+                        if (rangeReturnMode === 'quantity' && prev.quantityCount) {
+                          updated.lastSerial = calculateReturnEndSerial(start, prev.quantityCount);
+                        } else if (rangeReturnMode === 'endSerial' && prev.lastSerial) {
+                          updated.quantityCount = calculateReturnRangeQuantity(start, prev.lastSerial);
+                        }
+                        return updated;
+                      });
+                    }}
+                    placeholder="e.g. MTR-2024-001"
+                    className={`${formInputStyle} font-mono text-sm mt-0`}
+                    required
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setReturnRangeScanTarget('first')}
+                    className="p-2 bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-700 dark:hover:bg-zinc-600 text-zinc-700 dark:text-zinc-200 rounded-md border border-zinc-300 dark:border-zinc-600 transition-colors shrink-0"
+                    title="Scan First Serial Number"
+                  >
+                    <ScanIcon className="w-4 h-4 text-purple-600 dark:text-purple-400" />
+                  </button>
+                </div>
+              </div>
+
+              {rangeReturnMode === 'endSerial' ? (
+                <div>
+                  <label htmlFor="return-range-last" className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                    Last Serial Number
+                  </label>
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="text"
+                      id="return-range-last"
+                      value={rangeReturnDetails.lastSerial}
+                      onChange={(e) => {
+                        const end = e.target.value;
+                        setRangeReturnError(null);
+                        setRangeReturnDetails(prev => ({
+                          ...prev,
+                          lastSerial: end,
+                          quantityCount: calculateReturnRangeQuantity(prev.firstSerial, end)
+                        }));
+                      }}
+                      placeholder="e.g. MTR-2024-050"
+                      className={`${formInputStyle} font-mono text-sm mt-0`}
+                      required
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setReturnRangeScanTarget('last')}
+                      className="p-2 bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-700 dark:hover:bg-zinc-600 text-zinc-700 dark:text-zinc-200 rounded-md border border-zinc-300 dark:border-zinc-600 transition-colors shrink-0"
+                      title="Scan Last Serial Number"
+                    >
+                      <ScanIcon className="w-4 h-4 text-purple-600 dark:text-purple-400" />
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div>
+                  <label htmlFor="return-range-quantity" className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                    Box Quantity (Units)
+                  </label>
+                  <input
+                    type="number"
+                    id="return-range-quantity"
+                    min="1"
+                    max="1000"
+                    value={rangeReturnDetails.quantityCount}
+                    onChange={(e) => {
+                      const qty = e.target.value;
+                      setRangeReturnError(null);
+                      setRangeReturnDetails(prev => ({
+                        ...prev,
+                        quantityCount: qty,
+                        lastSerial: calculateReturnEndSerial(prev.firstSerial, qty)
+                      }));
+                    }}
+                    placeholder="e.g. 50"
+                    className={`${formInputStyle} font-mono text-sm mt-0`}
+                    required
+                  />
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <span className="text-[11px] text-zinc-500 dark:text-zinc-400 font-medium">Quick Box Size:</span>
+              {[10, 20, 25, 50, 100].map(qty => (
+                <button
+                  key={qty}
+                  type="button"
+                  onClick={() => {
+                    setRangeReturnMode('quantity');
+                    setRangeReturnError(null);
+                    setRangeReturnDetails(prev => ({
+                      ...prev,
+                      quantityCount: String(qty),
+                      lastSerial: calculateReturnEndSerial(prev.firstSerial, qty)
+                    }));
+                  }}
+                  className="px-2 py-0.5 text-xs font-semibold rounded bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-700 dark:hover:bg-zinc-600 text-zinc-700 dark:text-zinc-200 transition-colors"
+                >
+                  +{qty}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {rangeReturnError ? (
+            <div className="p-3 bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300 rounded-lg text-xs border border-red-200 dark:border-red-800">
+              {rangeReturnError}
+            </div>
+          ) : rangeReturnProcessingResult.error ? (
+            <div className="p-3 bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300 rounded-lg text-xs border border-red-200 dark:border-red-800">
+              {rangeReturnProcessingResult.error}
+            </div>
+          ) : rangeReturnProcessingResult.serials.length > 0 && (
+            <div className="p-3 bg-zinc-50 dark:bg-zinc-800/70 rounded-lg border border-zinc-200 dark:border-zinc-700 space-y-2.5 text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <span className="font-semibold text-zinc-800 dark:text-zinc-100">
+                    Range: {rangeReturnProcessingResult.serials[0]} &rarr; {rangeReturnProcessingResult.serials[rangeReturnProcessingResult.serials.length - 1]}
+                  </span>
+                  <span className="ml-2 text-zinc-500 dark:text-zinc-400">
+                    ({rangeReturnProcessingResult.serials.length} serial{rangeReturnProcessingResult.serials.length !== 1 ? 's' : ''})
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setIsReturnRangePreviewExpanded(prev => !prev)}
+                  className="text-purple-600 dark:text-purple-400 hover:underline font-medium"
+                >
+                  {isReturnRangePreviewExpanded ? 'Hide serials' : 'Preview serials'}
+                </button>
+              </div>
+
+              {rangeReturnProcessingResult.itemNames.length > 0 && (
+                <div className="text-zinc-600 dark:text-zinc-300">
+                  <span className="font-medium">Detected item{rangeReturnProcessingResult.itemNames.length > 1 ? 's' : ''}:</span>{' '}
+                  {rangeReturnProcessingResult.itemNames.join(', ')}
+                </div>
+              )}
+
+              <div className="flex flex-wrap gap-2">
+                <span className={`px-2 py-1 rounded font-semibold ${
+                  rangeReturnProcessingResult.readyToReturn.length > 0
+                    ? 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-800 dark:text-emerald-300'
+                    : 'bg-zinc-200 dark:bg-zinc-700 text-zinc-600 dark:text-zinc-300'
+                }`}>
+                  {rangeReturnProcessingResult.readyToReturn.length} Ready to Return
+                </span>
+                {rangeReturnProcessingResult.otherTeamItems.length > 0 && (
+                  <span className="px-2 py-1 rounded font-semibold bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-300">
+                    {rangeReturnProcessingResult.otherTeamItems.length} On Other Team(s)
+                  </span>
+                )}
+                {rangeReturnProcessingResult.alreadyUnassigned.length > 0 && (
+                  <span className="px-2 py-1 rounded font-semibold bg-zinc-200 dark:bg-zinc-700 text-zinc-700 dark:text-zinc-300">
+                    {rangeReturnProcessingResult.alreadyUnassigned.length} Already in Stock
+                  </span>
+                )}
+                {rangeReturnProcessingResult.notFoundSerials.length > 0 && (
+                  <span className="px-2 py-1 rounded font-semibold bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300">
+                    {rangeReturnProcessingResult.notFoundSerials.length} Not Found
+                  </span>
+                )}
+              </div>
+
+              {Object.keys(rangeReturnProcessingResult.teamBreakdown).length > 0 && (
+                <div className="text-zinc-600 dark:text-zinc-300">
+                  <span className="font-medium">Returning from:</span>{' '}
+                  {Object.entries(rangeReturnProcessingResult.teamBreakdown).map(([t, count]) => `${t} (${count})`).join(', ')}
+                </div>
+              )}
+
+              {rangeReturnDetails.team !== 'All' && (rangeReturnProcessingResult.otherTeamItems.length > 0 || rangeReturnDetails.includeOtherTeams) && (
+                <label className="flex items-center gap-2 pt-1 cursor-pointer text-zinc-700 dark:text-zinc-300">
+                  <input
+                    type="checkbox"
+                    checked={rangeReturnDetails.includeOtherTeams}
+                    onChange={(e) => setRangeReturnDetails(prev => ({ ...prev, includeOtherTeams: e.target.checked }))}
+                    className="rounded border-zinc-300 dark:border-zinc-600 text-purple-600 focus:ring-purple-500"
+                  />
+                  <span>Also return items in this range currently assigned to other teams</span>
+                </label>
+              )}
+
+              {isReturnRangePreviewExpanded && (
+                <div className="max-h-36 overflow-y-auto divide-y divide-zinc-200 dark:divide-zinc-700 border border-zinc-200 dark:border-zinc-700 rounded bg-white dark:bg-zinc-900/60 px-2.5 py-1">
+                  {rangeReturnProcessingResult.entries.slice(0, 100).map((entry) => (
+                    <div key={entry.serial} className="py-1 flex items-center justify-between gap-2">
+                      <span className="font-mono text-zinc-800 dark:text-zinc-200 truncate">{entry.serial}</span>
+                      {entry.status === 'ready' && (
+                        <span className="text-emerald-700 dark:text-emerald-400 font-medium shrink-0">
+                          Return ({entry.item?.assigned_to})
+                        </span>
+                      )}
+                      {entry.status === 'other_team' && (
+                        <span className="text-amber-700 dark:text-amber-400 font-medium shrink-0">
+                          Held by {entry.item?.assigned_to}
+                        </span>
+                      )}
+                      {entry.status === 'already_in_stock' && (
+                        <span className="text-zinc-500 dark:text-zinc-400 shrink-0">Already in stock</span>
+                      )}
+                      {entry.status === 'not_found' && (
+                        <span className="text-red-600 dark:text-red-400 shrink-0">Not found</span>
+                      )}
+                    </div>
+                  ))}
+                  {rangeReturnProcessingResult.entries.length > 100 && (
+                    <div className="py-1 text-center text-zinc-400">
+                      Showing first 100 of {rangeReturnProcessingResult.entries.length} serials...
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          <div className="flex justify-end space-x-3 pt-4 border-t border-zinc-200 dark:border-zinc-700">
+            <button
+              type="button"
+              disabled={isReturningRange}
+              onClick={() => {
+                setIsReturnRangeModalOpen(false);
+                setRangeReturnError(null);
+              }}
+              className="px-4 py-2 bg-white dark:bg-zinc-700 border border-zinc-300 dark:border-zinc-600 text-zinc-800 dark:text-zinc-200 rounded-md hover:bg-zinc-50 dark:hover:bg-zinc-600 transition-colors text-sm font-medium disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={
+                isReturningRange ||
+                !!rangeReturnProcessingResult.error ||
+                rangeReturnProcessingResult.readyToReturn.length === 0
+              }
+              className="px-4 py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700 transition-colors disabled:bg-purple-400 dark:disabled:bg-purple-800 disabled:cursor-not-allowed flex items-center justify-center min-w-[180px] text-sm font-semibold focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-purple-500 dark:focus:ring-offset-zinc-800"
+            >
+              {isReturningRange && <Spinner className="-ml-1 mr-2 h-4 w-4" />}
+              {isReturningRange
+                ? 'Returning...'
+                : `Return ${rangeReturnProcessingResult.readyToReturn.length || 0} Item${rangeReturnProcessingResult.readyToReturn.length === 1 ? '' : 's'} to Stock`}
+            </button>
+          </div>
         </form>
       </Modal>
 
@@ -12498,6 +13902,67 @@ const StockManagerApp = ({
               setIsTransferTeamScanning(false);
             }}
             onCancel={() => setIsTransferTeamScanning(false)}
+          />
+        )
+      )}
+
+      {/* --- In-Return-Range Scanner Overlay --- */}
+      {returnRangeScanTarget && (
+        scannerPreference === 'camera' ? (
+          <Scanner
+            onScanSuccess={(code) => {
+              const cleaned = String(code || '').trim();
+              setRangeReturnError(null);
+              setRangeReturnDetails(prev => {
+                if (returnRangeScanTarget === 'first') {
+                  const updated = { ...prev, firstSerial: cleaned };
+                  if (rangeReturnMode === 'quantity' && prev.quantityCount) {
+                    updated.lastSerial = calculateReturnEndSerial(cleaned, prev.quantityCount);
+                  } else if (prev.lastSerial) {
+                    updated.quantityCount = calculateReturnRangeQuantity(cleaned, prev.lastSerial);
+                  }
+                  return updated;
+                }
+                return {
+                  ...prev,
+                  lastSerial: cleaned,
+                  quantityCount: calculateReturnRangeQuantity(prev.firstSerial, cleaned)
+                };
+              });
+              playBeep('success');
+              setReturnRangeScanTarget(null);
+            }}
+            onScanError={(err) => {
+              setRangeReturnError(err);
+              setReturnRangeScanTarget(null);
+            }}
+            onCancel={() => setReturnRangeScanTarget(null)}
+          />
+        ) : (
+          <ExternalScannerPage
+            onScanSuccess={(code) => {
+              const cleaned = String(code || '').trim();
+              setRangeReturnError(null);
+              setRangeReturnDetails(prev => {
+                if (returnRangeScanTarget === 'first') {
+                  const updated = { ...prev, firstSerial: cleaned };
+                  if (rangeReturnMode === 'quantity' && prev.quantityCount) {
+                    updated.lastSerial = calculateReturnEndSerial(cleaned, prev.quantityCount);
+                  } else if (prev.lastSerial) {
+                    updated.quantityCount = calculateReturnRangeQuantity(cleaned, prev.lastSerial);
+                  }
+                  return updated;
+                }
+                return {
+                  ...prev,
+                  lastSerial: cleaned,
+                  quantityCount: calculateReturnRangeQuantity(prev.firstSerial, cleaned)
+                };
+              });
+              playBeep('success');
+              setReturnRangeScanTarget(null);
+            }}
+            onCancel={() => setReturnRangeScanTarget(null)}
           />
         )
       )}

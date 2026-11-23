@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { supabase } from '../lib/supabaseClient';
 import { Page, Spinner, EmptyState, formInputStyle } from './StockManagerApp';
 import Modal from './Modal';
-import { PlusCircleIcon, ClipboardCheckIcon, ArchiveIcon, ChartBarIcon, TrashIcon, BuildingStoreIcon, ChevronDownIcon, TagIcon, BarcodeIcon, SearchIcon, CheckCircleIcon, BoxIcon } from './Icons';
+import { PlusCircleIcon, ClipboardCheckIcon, ArchiveIcon, ChartBarIcon, TrashIcon, BuildingStoreIcon, ChevronDownIcon, TagIcon, BarcodeIcon, SearchIcon, CheckCircleIcon, BoxIcon, AlertTriangleIcon } from './Icons';
 import { trainingManager } from '../lib/trainingEnvironment';
 import { Team, Location } from '../types';
 
@@ -109,7 +109,7 @@ const StockTakePage = ({
         return list.filter(l => l && l !== 'All' && l !== 'Unassigned');
     }, [dbLocations]);
 
-    const [stockTakeLocation, setStockTakeLocation] = useState(() => (activeLocation && activeLocation !== 'All') ? activeLocation : (locationsList[0] || 'Flamstead'));
+    const [stockTakeLocation, setStockTakeLocation] = useState('');
     const [historyLocationFilter, setHistoryLocationFilter] = useState('All');
     const [loading, setLoading] = useState(false);
     const [activeTab, setActiveTab] = useState('active');
@@ -211,15 +211,10 @@ const StockTakePage = ({
         rangeInputModeRef.current = rangeInputMode;
     }, [stockTakeItems, activeStockTake, scanMode, isRangeCountModalOpen, isQuantityModalOpen, rangeCountDetails, rangeInputMode]);
 
-    useEffect(() => {
-        if (!activeStockTake) {
-            setStockTakeLocation(prev => {
-                if (activeLocation && activeLocation !== 'All') return activeLocation;
-                if (prev && prev !== 'All' && locationsList.includes(prev)) return prev;
-                return locationsList[0] || 'Flamstead';
-            });
-        }
-    }, [activeLocation, activeStockTake, locationsList]);
+    const openInitiateStockTakeModal = useCallback(() => {
+        setStockTakeLocation('');
+        setIsInitiateModalOpen(true);
+    }, []);
 
     const stockMap = useMemo(() => {
         const map = new Map();
@@ -507,13 +502,37 @@ const StockTakePage = ({
         return Object.values(groups).map(g => {
             const uniqueBarcodes = Array.from(new Set(g.rawItems.map(i => i.stock_items?.barcode).filter(Boolean)));
             const fallbackBarcode = itemTypesMap[g.name]?.barcode || (Array.isArray(itemTypes) ? itemTypes.find(it => it.name === g.name)?.barcode : '') || '—';
+            const bulkMap = new Map();
+            for (const raw of g.rawItems) {
+                const bc = String(raw.stock_items?.barcode || (fallbackBarcode !== '—' ? fallbackBarcode : '') || 'No Barcode').trim() || 'No Barcode';
+                const bcKey = bc.toLowerCase();
+                if (!bulkMap.has(bcKey)) {
+                    bulkMap.set(bcKey, {
+                        barcode: bc,
+                        expected_quantity: 0,
+                        counted_quantity: 0,
+                        returnedCount: 0,
+                        returnedTeams: []
+                    });
+                }
+                const entry = bulkMap.get(bcKey);
+                entry.expected_quantity += (typeof raw.expected_quantity === 'number' ? raw.expected_quantity : 1);
+                entry.counted_quantity += (typeof raw.counted_quantity === 'number' ? raw.counted_quantity : 0);
+                if (raw.returnedFromTeam) {
+                    entry.returnedCount += 1;
+                    if (!entry.returnedTeams.includes(raw.returnedFromTeam)) {
+                        entry.returnedTeams.push(raw.returnedFromTeam);
+                    }
+                }
+            }
             return {
                 ...g,
                 uniqueBarcodes,
+                bulkSummaries: Array.from(bulkMap.values()),
                 barcodeDisplay: uniqueBarcodes.length === 1 
                     ? uniqueBarcodes[0] 
                     : uniqueBarcodes.length > 1 
-                        ? `${uniqueBarcodes.length} serials` 
+                        ? `${uniqueBarcodes.length} ${g.is_unique ? 'serials' : 'barcodes'}` 
                         : fallbackBarcode,
                 variance: g.counted_quantity - g.expected_quantity,
                 value_variance: (g.counted_quantity - g.expected_quantity) * g.price
@@ -704,18 +723,15 @@ const StockTakePage = ({
     }, [fetchActiveStockTake]);
 
     const handleInitiateStockTake = async () => {
+        if (!stockTakeLocation || stockTakeLocation === 'All') {
+            setError("Please select a specific storehouse / location before starting a stock take.");
+            return;
+        }
+        const targetLocation = stockTakeLocation;
         setIsInitiateModalOpen(false);
         setLoading(true);
         if (isTrainingMode) {
             try {
-                const targetLocation = (stockTakeLocation && stockTakeLocation !== 'All') 
-                    ? stockTakeLocation 
-                    : ((activeLocation && activeLocation !== 'All' && locationsList.includes(activeLocation)) ? activeLocation : (locationsList[0] || 'Flamstead'));
-
-                if (!targetLocation || targetLocation === 'All') {
-                    throw new Error("Please select a specific storehouse location. Company-wide stock take is not permitted.");
-                }
-
                 const { stockTake, items } = trainingManager.startStockTake({
                     type: stockTakeType,
                     location: targetLocation,
@@ -735,15 +751,6 @@ const StockTakePage = ({
         try {
             const { data: { session } } = await supabase.auth.getSession();
             const user = session?.user;
-
-            // 1. Determine Storehouse Location (company-wide is not permitted for stock take)
-            const targetLocation = (stockTakeLocation && stockTakeLocation !== 'All') 
-                ? stockTakeLocation 
-                : ((activeLocation && activeLocation !== 'All' && locationsList.includes(activeLocation)) ? activeLocation : (locationsList[0] || 'Flamstead'));
-
-            if (!targetLocation || targetLocation === 'All') {
-                throw new Error("Please select a specific storehouse location. Company-wide stock take is not permitted.");
-            }
 
             const payload = {
                 type: stockTakeType,
@@ -1637,19 +1644,47 @@ const StockTakePage = ({
         const addedQty = parseInt(quantityInput, 10);
         if (isNaN(addedQty) || addedQty < 1 || !quantityItem) return;
 
+        const getTakeItemName = (sti) => sti?.stock_items?.name || stockMap.get(sti?.item_id)?.name || '';
+        const itemName = getTakeItemName(quantityItem) || 'item';
+        const productTakeItems = getTakeItemName(quantityItem)
+            ? stockTakeItemsRef.current.filter(i => getTakeItemName(i) === itemName)
+            : [quantityItem];
+
+        // Distribute addedQty across uncounted rows first (1 each) so individual unit rows don't show 0/1 Missing,
+        // and place any excess onto quantityItem.
+        let remaining = addedQty;
+        const updatesById = new Map();
+        const uncountedRows = productTakeItems
+            .filter(i => (i.counted_quantity || 0) === 0)
+            .sort((a, b) => (a.id === quantityItem.id ? -1 : b.id === quantityItem.id ? 1 : 0));
+
+        for (const row of uncountedRows) {
+            if (remaining <= 0) break;
+            updatesById.set(row.id, 1);
+            remaining -= 1;
+        }
+        if (remaining > 0) {
+            const baseQty = updatesById.has(quantityItem.id)
+                ? updatesById.get(quantityItem.id)
+                : (quantityItem.counted_quantity || 0);
+            updatesById.set(quantityItem.id, baseQty + remaining);
+        }
+
         setLoading(true);
         if (isTrainingMode) {
-            const newQuantity = (quantityItem.counted_quantity || 0) + addedQty;
-            setStockTakeItems(prev => prev.map(i => 
-                i.id === quantityItem.id
-                    ? { ...i, counted_quantity: newQuantity, status: 'COUNTED' }
+            const applyLocalUpdates = (list) => list.map(i =>
+                updatesById.has(i.id)
+                    ? { ...i, counted_quantity: updatesById.get(i.id), status: 'COUNTED' }
                     : i
-            ));
-            const stockFallback = stockMap.get(quantityItem.item_id);
-            const itemName = quantityItem.stock_items?.name || stockFallback?.name || 'item';
-            setLastScanned({ 
-                success: true, 
-                message: `Added +${addedQty} to ${itemName}` 
+            );
+            setStockTakeItems(prev => applyLocalUpdates(prev));
+            if (Array.isArray(trainingManager.stockTakeItems)) {
+                trainingManager.stockTakeItems = applyLocalUpdates(trainingManager.stockTakeItems);
+                trainingManager.notify();
+            }
+            setLastScanned({
+                success: true,
+                message: `Added +${addedQty} to ${itemName}`
             });
             setTimeout(() => {
                 setLastScanned(null);
@@ -1660,30 +1695,46 @@ const StockTakePage = ({
             return;
         }
         try {
-            const newQuantity = (quantityItem.counted_quantity || 0) + addedQty;
-            
-            const { error: updateError } = await supabase
-                .from('stock_take_items')
-                .update({ counted_quantity: newQuantity, status: 'COUNTED' })
-                .eq('id', quantityItem.id);
-                
-            if (updateError) throw updateError;
-            
+            const idsToSetOne = [];
+            const customQtyUpdates = [];
+            updatesById.forEach((qty, id) => {
+                if (qty === 1) {
+                    idsToSetOne.push(id);
+                } else {
+                    customQtyUpdates.push({ id, qty });
+                }
+            });
+
+            const CHUNK_SIZE = 150;
+            for (let idx = 0; idx < idsToSetOne.length; idx += CHUNK_SIZE) {
+                const chunk = idsToSetOne.slice(idx, idx + CHUNK_SIZE);
+                const { error: batchUpdateError } = await supabase
+                    .from('stock_take_items')
+                    .update({ counted_quantity: 1, status: 'COUNTED' })
+                    .in('id', chunk);
+                if (batchUpdateError) throw batchUpdateError;
+            }
+
+            for (const entry of customQtyUpdates) {
+                const { error: updateError } = await supabase
+                    .from('stock_take_items')
+                    .update({ counted_quantity: entry.qty, status: 'COUNTED' })
+                    .eq('id', entry.id);
+                if (updateError) throw updateError;
+            }
+
             // Update local state using functional updater
-            setStockTakeItems(prev => prev.map(i => 
-                i.id === quantityItem.id
-                    ? { ...i, counted_quantity: newQuantity, status: 'COUNTED' }
+            setStockTakeItems(prev => prev.map(i =>
+                updatesById.has(i.id)
+                    ? { ...i, counted_quantity: updatesById.get(i.id), status: 'COUNTED' }
                     : i
             ));
-            
-            const stockFallback = stockMap.get(quantityItem.item_id);
-            const itemName = quantityItem.stock_items?.name || stockFallback?.name || 'item';
-            
-            setLastScanned({ 
-                success: true, 
-                message: `Added +${addedQty} to ${itemName}` 
+
+            setLastScanned({
+                success: true,
+                message: `Added +${addedQty} to ${itemName}`
             });
-            
+
             setTimeout(() => {
                 setLastScanned(null);
             }, 3000);
@@ -2364,7 +2415,7 @@ const StockTakePage = ({
     return (
         <Page title="Stock Takes" actions={
             !activeStockTake && (
-                <button onClick={() => setIsInitiateModalOpen(true)} className="flex items-center px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 text-sm font-medium">
+                <button onClick={openInitiateStockTakeModal} className="flex items-center px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 text-sm font-medium">
                     <PlusCircleIcon className="w-5 h-5 mr-2" />
                     New Stock Take
                 </button>
@@ -2387,7 +2438,7 @@ const StockTakePage = ({
                             title="No Active Stock Take"
                             message="Start a new Full or Rolling stock take to begin counting inventory."
                             action={
-                                <button onClick={() => setIsInitiateModalOpen(true)} className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 text-sm font-medium">
+                                <button onClick={openInitiateStockTakeModal} className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 text-sm font-medium">
                                     Start Stock Take
                                 </button>
                             }
@@ -2806,7 +2857,11 @@ const StockTakePage = ({
                                                                         className="text-xs font-semibold text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200 flex items-center gap-1.5 py-1 px-1.5 rounded transition-colors touch-manipulation"
                                                                     >
                                                                         <ChevronDownIcon className={`w-3.5 h-3.5 transition-transform duration-200 ${isExpanded ? 'rotate-180' : '-rotate-90'}`} />
-                                                                        <span>{group.rawItems.length} Scans / Serials</span>
+                                                                        <span>
+                                                                            {group.is_unique
+                                                                                ? `${group.rawItems.length} Scans / Serials`
+                                                                                : `Bulk Qty Summary (${group.counted_quantity}/${group.expected_quantity})`}
+                                                                        </span>
                                                                     </button>
 
                                                                     <div className="flex items-center gap-1.5">
@@ -2856,45 +2911,79 @@ const StockTakePage = ({
                                                                 </div>
                                                             </div>
 
-                                                            {/* Expanded Recorded Scans List */}
+                                                            {/* Expanded Recorded Scans / Bulk Breakdown List */}
                                                             {isExpanded && (
                                                                 <div className="border-t border-zinc-200 dark:border-zinc-700 bg-zinc-50/80 dark:bg-zinc-900/50 p-3">
                                                                     <div className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider mb-2 flex justify-between">
-                                                                        <span>Recorded Scans / Serials</span>
+                                                                        <span>{group.is_unique ? 'Recorded Scans / Serials' : 'Bulk Barcode Breakdown'}</span>
                                                                         <span>Status</span>
                                                                     </div>
                                                                     <div className="max-h-56 overflow-y-auto space-y-1.5 pr-1 divide-y divide-zinc-200/50 dark:divide-zinc-700/50">
-                                                                        {group.rawItems.map((raw, idx) => {
-                                                                            const isCounted = (raw.counted_quantity || 0) > 0;
-                                                                            return (
-                                                                                <div key={raw.id || idx} className="pt-1.5 first:pt-0 flex items-center justify-between text-xs font-mono">
-                                                                                    <div className="flex items-center gap-2 min-w-0">
-                                                                                        <span className="text-zinc-400 font-sans text-[10px]">#{idx + 1}</span>
-                                                                                        <span className="text-zinc-800 dark:text-zinc-200 font-medium truncate">
-                                                                                            {raw.stock_items?.barcode || 'No Barcode'}
-                                                                                        </span>
-                                                                                    </div>
-                                                                                    <div className="flex items-center gap-2 shrink-0">
-                                                                                        <span className="text-zinc-500 font-sans text-[11px]">
-                                                                                            {raw.counted_quantity || 0} / {raw.expected_quantity ?? 1}
-                                                                                        </span>
-                                                                                        {raw.returnedFromTeam ? (
-                                                                                            <span className="px-2 py-0.5 rounded text-[10px] font-sans font-bold bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-300 dark:border-amber-700">
-                                                                                                ↩️ Due to Return ({raw.returnedFromTeam})
+                                                                        {group.is_unique ? (
+                                                                            group.rawItems.map((raw, idx) => {
+                                                                                const isCounted = (raw.counted_quantity || 0) > 0;
+                                                                                return (
+                                                                                    <div key={raw.id || idx} className="pt-1.5 first:pt-0 flex items-center justify-between text-xs font-mono">
+                                                                                        <div className="flex items-center gap-2 min-w-0">
+                                                                                            <span className="text-zinc-400 font-sans text-[10px]">#{idx + 1}</span>
+                                                                                            <span className="text-zinc-800 dark:text-zinc-200 font-medium truncate">
+                                                                                                {raw.stock_items?.barcode || 'No Barcode'}
                                                                                             </span>
-                                                                                        ) : (
-                                                                                            <span className={`px-2 py-0.5 rounded text-[10px] font-sans font-bold ${
-                                                                                                isCounted
-                                                                                                    ? 'bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300'
-                                                                                                    : 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300'
-                                                                                            }`}>
-                                                                                                {isCounted ? 'Counted' : 'Missing'}
+                                                                                        </div>
+                                                                                        <div className="flex items-center gap-2 shrink-0">
+                                                                                            <span className="text-zinc-500 font-sans text-[11px]">
+                                                                                                {raw.counted_quantity || 0} / {raw.expected_quantity ?? 1}
                                                                                             </span>
-                                                                                        )}
+                                                                                            {raw.returnedFromTeam ? (
+                                                                                                <span className="px-2 py-0.5 rounded text-[10px] font-sans font-bold bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-300 dark:border-amber-700">
+                                                                                                    ↩️ Due to Return ({raw.returnedFromTeam})
+                                                                                                </span>
+                                                                                            ) : (
+                                                                                                <span className={`px-2 py-0.5 rounded text-[10px] font-sans font-bold ${
+                                                                                                    isCounted
+                                                                                                        ? 'bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300'
+                                                                                                        : 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300'
+                                                                                                }`}>
+                                                                                                    {isCounted ? 'Counted' : 'Missing'}
+                                                                                                </span>
+                                                                                            )}
+                                                                                        </div>
                                                                                     </div>
-                                                                                </div>
-                                                                            );
-                                                                        })}
+                                                                                );
+                                                                            })
+                                                                        ) : (
+                                                                            group.bulkSummaries.map((bulk, idx) => {
+                                                                                const exp = bulk.expected_quantity;
+                                                                                const cnt = bulk.counted_quantity;
+                                                                                const badge = bulk.returnedCount > 0 && bulk.returnedCount === cnt
+                                                                                    ? { text: `↩️ Due to Return (${bulk.returnedTeams.join(', ')})`, cls: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-300 dark:border-amber-700' }
+                                                                                    : cnt === 0 && exp > 0
+                                                                                        ? { text: 'Missing', cls: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300' }
+                                                                                        : cnt > 0 && cnt < exp
+                                                                                            ? { text: `Partial (${exp - cnt} short)`, cls: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300' }
+                                                                                            : cnt > exp
+                                                                                                ? { text: `Counted (+${cnt - exp} surplus)`, cls: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300' }
+                                                                                                : { text: 'Counted', cls: 'bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300' };
+                                                                                return (
+                                                                                    <div key={bulk.barcode || idx} className="pt-1.5 first:pt-0 flex items-center justify-between text-xs font-mono">
+                                                                                        <div className="flex items-center gap-2 min-w-0">
+                                                                                            <span className="text-zinc-800 dark:text-zinc-200 font-medium truncate">
+                                                                                                {bulk.barcode}
+                                                                                            </span>
+                                                                                            <span className="font-sans text-[10px] text-zinc-400 shrink-0">(Bulk)</span>
+                                                                                        </div>
+                                                                                        <div className="flex items-center gap-2 shrink-0">
+                                                                                            <span className="text-zinc-500 font-sans text-[11px]">
+                                                                                                <strong>{cnt}</strong> / {exp}
+                                                                                            </span>
+                                                                                            <span className={`px-2 py-0.5 rounded text-[10px] font-sans font-bold ${badge.cls}`}>
+                                                                                                {badge.text}
+                                                                                            </span>
+                                                                                        </div>
+                                                                                    </div>
+                                                                                );
+                                                                            })
+                                                                        )}
                                                                     </div>
                                                                 </div>
                                                             )}
@@ -3027,41 +3116,79 @@ const StockTakePage = ({
                                                                             <td colSpan="9" className="px-6 py-3">
                                                                                 <div className="border border-zinc-200 dark:border-zinc-700 rounded-lg overflow-hidden bg-white dark:bg-zinc-800/80 shadow-xs">
                                                                                     <div className="px-3.5 py-2 bg-zinc-100/80 dark:bg-zinc-700/60 text-xs font-semibold text-zinc-600 dark:text-zinc-300 border-b border-zinc-200 dark:border-zinc-700 flex justify-between items-center">
-                                                                                        <span>Recorded Scans / Serial Numbers ({group.rawItems.length})</span>
+                                                                                        <span>
+                                                                                            {group.is_unique
+                                                                                                ? `Recorded Scans / Serial Numbers (${group.rawItems.length})`
+                                                                                                : `Bulk Count Summary (${group.bulkSummaries.length} ${group.bulkSummaries.length === 1 ? 'Barcode' : 'Barcodes'})`}
+                                                                                        </span>
                                                                                         <span>Expected vs Counted</span>
                                                                                     </div>
                                                                                     <div className="max-h-56 overflow-y-auto divide-y divide-zinc-100 dark:divide-zinc-700 text-xs">
-                                                                                        {group.rawItems.map((raw, idx) => {
-                                                                                            const isCounted = (raw.counted_quantity || 0) > 0;
-                                                                                            return (
-                                                                                                <div key={raw.id || idx} className="px-3.5 py-2 flex items-center justify-between font-mono">
-                                                                                                    <div className="flex items-center gap-2">
-                                                                                                        <span className="text-zinc-400 text-[11px] font-sans">#{idx + 1}</span>
-                                                                                                        <span className="text-zinc-800 dark:text-zinc-200 font-medium">
-                                                                                                            {raw.stock_items?.barcode || 'No Barcode'}
-                                                                                                        </span>
-                                                                                                    </div>
-                                                                                                    <div className="flex items-center gap-2.5">
-                                                                                                        <span className="text-zinc-500 font-sans text-xs">
+                                                                                        {group.is_unique ? (
+                                                                                            group.rawItems.map((raw, idx) => {
+                                                                                                const isCounted = (raw.counted_quantity || 0) > 0;
+                                                                                                return (
+                                                                                                    <div key={raw.id || idx} className="px-3.5 py-2 flex items-center justify-between font-mono">
+                                                                                                        <div className="flex items-center gap-2">
+                                                                                                            <span className="text-zinc-400 text-[11px] font-sans">#{idx + 1}</span>
+                                                                                                            <span className="text-zinc-800 dark:text-zinc-200 font-medium">
+                                                                                                                {raw.stock_items?.barcode || 'No Barcode'}
+                                                                                                            </span>
+                                                                                                        </div>
+                                                                                                        <div className="flex items-center gap-2.5">
+                                                                                                            <span className="text-zinc-500 font-sans text-xs">
+                                                                                                                {raw.returnedFromTeam ? (
+                                                                                                                    <>Due Return: <strong>{raw.counted_quantity || 0}</strong> / Expected: {raw.expected_quantity ?? 1}</>
+                                                                                                                ) : (
+                                                                                                                    <>Counted: <strong>{raw.counted_quantity || 0}</strong> / Expected: {raw.expected_quantity ?? 1}</>
+                                                                                                                )}
+                                                                                                            </span>
                                                                                                             {raw.returnedFromTeam ? (
-                                                                                                                <>Due Return: <strong>{raw.counted_quantity || 0}</strong> / Expected: {raw.expected_quantity ?? 1}</>
+                                                                                                                <span className="px-2 py-0.5 rounded text-[11px] font-sans font-semibold bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-300 dark:border-amber-700">
+                                                                                                                    ↩️ Due to Return to System (from {raw.returnedFromTeam})
+                                                                                                                </span>
                                                                                                             ) : (
-                                                                                                                <>Counted: <strong>{raw.counted_quantity || 0}</strong> / Expected: {raw.expected_quantity ?? 1}</>
+                                                                                                                <span className={`px-2 py-0.5 rounded text-[11px] font-sans font-medium ${isCounted ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300' : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'}`}>
+                                                                                                                    {isCounted ? 'Counted' : 'Missing'}
+                                                                                                                </span>
                                                                                                             )}
-                                                                                                        </span>
-                                                                                                        {raw.returnedFromTeam ? (
-                                                                                                            <span className="px-2 py-0.5 rounded text-[11px] font-sans font-semibold bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-300 dark:border-amber-700">
-                                                                                                                ↩️ Due to Return to System (from {raw.returnedFromTeam})
-                                                                                                            </span>
-                                                                                                        ) : (
-                                                                                                            <span className={`px-2 py-0.5 rounded text-[11px] font-sans font-medium ${isCounted ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300' : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'}`}>
-                                                                                                                {isCounted ? 'Counted' : 'Missing'}
-                                                                                                            </span>
-                                                                                                        )}
+                                                                                                        </div>
                                                                                                     </div>
-                                                                                                </div>
-                                                                                            );
-                                                                                        })}
+                                                                                                );
+                                                                                            })
+                                                                                        ) : (
+                                                                                            group.bulkSummaries.map((bulk, idx) => {
+                                                                                                const exp = bulk.expected_quantity;
+                                                                                                const cnt = bulk.counted_quantity;
+                                                                                                const badge = bulk.returnedCount > 0 && bulk.returnedCount === cnt
+                                                                                                    ? { text: `↩️ Due to Return to System (from ${bulk.returnedTeams.join(', ')})`, cls: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-300 dark:border-amber-700' }
+                                                                                                    : cnt === 0 && exp > 0
+                                                                                                        ? { text: 'Missing', cls: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300' }
+                                                                                                        : cnt > 0 && cnt < exp
+                                                                                                            ? { text: `Partial (${exp - cnt} short)`, cls: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300' }
+                                                                                                            : cnt > exp
+                                                                                                                ? { text: `Counted (+${cnt - exp} surplus)`, cls: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300' }
+                                                                                                                : { text: 'Counted', cls: 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300' };
+                                                                                                return (
+                                                                                                    <div key={bulk.barcode || idx} className="px-3.5 py-2 flex items-center justify-between font-mono">
+                                                                                                        <div className="flex items-center gap-2">
+                                                                                                            <span className="text-zinc-800 dark:text-zinc-200 font-medium">
+                                                                                                                {bulk.barcode}
+                                                                                                            </span>
+                                                                                                            <span className="font-sans text-[11px] text-zinc-400">(Non-Unique / Bulk)</span>
+                                                                                                        </div>
+                                                                                                        <div className="flex items-center gap-2.5">
+                                                                                                            <span className="text-zinc-500 font-sans text-xs">
+                                                                                                                Counted: <strong>{cnt}</strong> / Expected: {exp}
+                                                                                                            </span>
+                                                                                                            <span className={`px-2 py-0.5 rounded text-[11px] font-sans font-medium ${badge.cls}`}>
+                                                                                                                {badge.text}
+                                                                                                            </span>
+                                                                                                        </div>
+                                                                                                    </div>
+                                                                                                );
+                                                                                            })
+                                                                                        )}
                                                                                     </div>
                                                                                 </div>
                                                                             </td>
@@ -3356,7 +3483,11 @@ const StockTakePage = ({
                                                             >
                                                                 <span className="flex items-center gap-1.5">
                                                                     <ChevronDownIcon className={`w-3.5 h-3.5 transition-transform duration-200 ${isExpanded ? 'rotate-180' : '-rotate-90'}`} />
-                                                                    <span>{item.rawItems.length} Scans / Serials Recorded</span>
+                                                                    <span>
+                                                                        {item.is_unique
+                                                                            ? `${item.rawItems.length} Scans / Serials Recorded`
+                                                                            : `Bulk Qty Summary (${item.counted_quantity}/${item.expected_quantity})`}
+                                                                    </span>
                                                                 </span>
                                                                 <span className="text-[11px] text-zinc-400 font-normal">
                                                                     {isExpanded ? 'Hide' : 'View breakdown'}
@@ -3365,39 +3496,71 @@ const StockTakePage = ({
                                                         </div>
                                                     </div>
 
-                                                    {/* Expandable Scans List */}
+                                                    {/* Expandable Scans / Bulk Summary List */}
                                                     {isExpanded && (
                                                         <div className="border-t border-zinc-200 dark:border-zinc-700/80 bg-zinc-50/80 dark:bg-zinc-900/60 p-3">
                                                             <div className="text-[11px] font-bold text-zinc-500 uppercase tracking-wider mb-2 flex justify-between">
-                                                                <span>Serial / Barcode</span>
+                                                                <span>{item.is_unique ? 'Serial / Barcode' : 'Bulk Barcode'}</span>
                                                                 <span>Status</span>
                                                             </div>
                                                             <div className="space-y-1.5 max-h-56 overflow-y-auto pr-1">
-                                                                {item.rawItems.map((raw, idx) => {
-                                                                    const isCounted = (raw.counted_quantity || 0) > 0;
-                                                                    return (
-                                                                        <div key={raw.id || idx} className="p-2 rounded-lg bg-white dark:bg-zinc-800 border border-zinc-200/70 dark:border-zinc-700/60 flex items-center justify-between text-xs">
-                                                                            <div className="flex items-center gap-2 min-w-0">
-                                                                                <span className="text-zinc-400 text-[10px]">#{idx + 1}</span>
-                                                                                <span className="font-mono font-medium text-zinc-800 dark:text-zinc-200 truncate">
-                                                                                    {raw.stock_items?.barcode || 'No Barcode'}
-                                                                                </span>
+                                                                {item.is_unique ? (
+                                                                    item.rawItems.map((raw, idx) => {
+                                                                        const isCounted = (raw.counted_quantity || 0) > 0;
+                                                                        return (
+                                                                            <div key={raw.id || idx} className="p-2 rounded-lg bg-white dark:bg-zinc-800 border border-zinc-200/70 dark:border-zinc-700/60 flex items-center justify-between text-xs">
+                                                                                <div className="flex items-center gap-2 min-w-0">
+                                                                                    <span className="text-zinc-400 text-[10px]">#{idx + 1}</span>
+                                                                                    <span className="font-mono font-medium text-zinc-800 dark:text-zinc-200 truncate">
+                                                                                        {raw.stock_items?.barcode || 'No Barcode'}
+                                                                                    </span>
+                                                                                </div>
+                                                                                <div className="flex items-center gap-2 shrink-0">
+                                                                                    <span className="text-[11px] text-zinc-500 font-mono">
+                                                                                        {raw.counted_quantity || 0}/{raw.expected_quantity ?? 1}
+                                                                                    </span>
+                                                                                    <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
+                                                                                        isCounted 
+                                                                                            ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300' 
+                                                                                            : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'
+                                                                                    }`}>
+                                                                                        {isCounted ? 'Counted' : 'Missing'}
+                                                                                    </span>
+                                                                                </div>
                                                                             </div>
-                                                                            <div className="flex items-center gap-2 shrink-0">
-                                                                                <span className="text-[11px] text-zinc-500 font-mono">
-                                                                                    {raw.counted_quantity || 0}/{raw.expected_quantity ?? 1}
-                                                                                </span>
-                                                                                <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
-                                                                                    isCounted 
-                                                                                        ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300' 
-                                                                                        : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'
-                                                                                }`}>
-                                                                                    {isCounted ? 'Counted' : 'Missing'}
-                                                                                </span>
+                                                                        );
+                                                                    })
+                                                                ) : (
+                                                                    item.bulkSummaries.map((bulk, idx) => {
+                                                                        const exp = bulk.expected_quantity;
+                                                                        const cnt = bulk.counted_quantity;
+                                                                        const badge = cnt === 0 && exp > 0
+                                                                            ? { text: 'Missing', cls: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300' }
+                                                                            : cnt > 0 && cnt < exp
+                                                                                ? { text: `Partial (${exp - cnt} short)`, cls: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300' }
+                                                                                : cnt > exp
+                                                                                    ? { text: `Counted (+${cnt - exp} surplus)`, cls: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300' }
+                                                                                    : { text: 'Counted', cls: 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300' };
+                                                                        return (
+                                                                            <div key={bulk.barcode || idx} className="p-2 rounded-lg bg-white dark:bg-zinc-800 border border-zinc-200/70 dark:border-zinc-700/60 flex items-center justify-between text-xs">
+                                                                                <div className="flex items-center gap-2 min-w-0">
+                                                                                    <span className="font-mono font-medium text-zinc-800 dark:text-zinc-200 truncate">
+                                                                                        {bulk.barcode}
+                                                                                    </span>
+                                                                                    <span className="text-[10px] text-zinc-400 shrink-0">(Bulk)</span>
+                                                                                </div>
+                                                                                <div className="flex items-center gap-2 shrink-0">
+                                                                                    <span className="text-[11px] text-zinc-500 font-mono">
+                                                                                        {cnt}/{exp}
+                                                                                    </span>
+                                                                                    <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${badge.cls}`}>
+                                                                                        {badge.text}
+                                                                                    </span>
+                                                                                </div>
                                                                             </div>
-                                                                        </div>
-                                                                    );
-                                                                })}
+                                                                        );
+                                                                    })
+                                                                )}
                                                             </div>
                                                         </div>
                                                     )}
@@ -3468,31 +3631,67 @@ const StockTakePage = ({
                                                                     <td colSpan="8" className="px-6 py-3">
                                                                         <div className="border border-zinc-200 dark:border-zinc-700 rounded-lg overflow-hidden bg-white dark:bg-zinc-800/80 shadow-xs">
                                                                             <div className="px-3.5 py-2 bg-zinc-100/80 dark:bg-zinc-700/60 text-xs font-semibold text-zinc-600 dark:text-zinc-300 border-b border-zinc-200 dark:border-zinc-700 flex justify-between items-center">
-                                                                                <span>Recorded Scans / Serial Numbers ({item.rawItems.length})</span>
+                                                                                <span>
+                                                                                    {item.is_unique
+                                                                                        ? `Recorded Scans / Serial Numbers (${item.rawItems.length})`
+                                                                                        : `Bulk Count Summary (${item.bulkSummaries.length} ${item.bulkSummaries.length === 1 ? 'Barcode' : 'Barcodes'})`}
+                                                                                </span>
                                                                                 <span>Expected vs Counted</span>
                                                                             </div>
                                                                             <div className="max-h-56 overflow-y-auto divide-y divide-zinc-100 dark:divide-zinc-700 text-xs">
-                                                                                {item.rawItems.map((raw, idx) => {
-                                                                                    const isCounted = (raw.counted_quantity || 0) > 0;
-                                                                                    return (
-                                                                                        <div key={raw.id || idx} className="px-3.5 py-2 flex items-center justify-between font-mono">
-                                                                                            <div className="flex items-center gap-2">
-                                                                                                <span className="text-zinc-400 text-[11px] font-sans">#{idx + 1}</span>
-                                                                                                <span className="text-zinc-800 dark:text-zinc-200 font-medium">
-                                                                                                    {raw.stock_items?.barcode || 'No Barcode'}
-                                                                                                </span>
+                                                                                {item.is_unique ? (
+                                                                                    item.rawItems.map((raw, idx) => {
+                                                                                        const isCounted = (raw.counted_quantity || 0) > 0;
+                                                                                        return (
+                                                                                            <div key={raw.id || idx} className="px-3.5 py-2 flex items-center justify-between font-mono">
+                                                                                                <div className="flex items-center gap-2">
+                                                                                                    <span className="text-zinc-400 text-[11px] font-sans">#{idx + 1}</span>
+                                                                                                    <span className="text-zinc-800 dark:text-zinc-200 font-medium">
+                                                                                                        {raw.stock_items?.barcode || 'No Barcode'}
+                                                                                                    </span>
+                                                                                                </div>
+                                                                                                <div className="flex items-center gap-3">
+                                                                                                    <span className="text-zinc-500 font-sans text-xs">
+                                                                                                        Counted: <strong>{raw.counted_quantity || 0}</strong> / Expected: {raw.expected_quantity ?? 1}
+                                                                                                    </span>
+                                                                                                    <span className={`px-2 py-0.5 rounded text-[11px] font-sans font-medium ${isCounted ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300' : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'}`}>
+                                                                                                        {isCounted ? 'Counted' : 'Missing'}
+                                                                                                    </span>
+                                                                                                </div>
                                                                                             </div>
-                                                                                            <div className="flex items-center gap-3">
-                                                                                                <span className="text-zinc-500 font-sans text-xs">
-                                                                                                    Counted: <strong>{raw.counted_quantity || 0}</strong> / Expected: {raw.expected_quantity ?? 1}
-                                                                                                </span>
-                                                                                                <span className={`px-2 py-0.5 rounded text-[11px] font-sans font-medium ${isCounted ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300' : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'}`}>
-                                                                                                    {isCounted ? 'Counted' : 'Missing'}
-                                                                                                </span>
+                                                                                        );
+                                                                                    })
+                                                                                ) : (
+                                                                                    item.bulkSummaries.map((bulk, idx) => {
+                                                                                        const exp = bulk.expected_quantity;
+                                                                                        const cnt = bulk.counted_quantity;
+                                                                                        const badge = cnt === 0 && exp > 0
+                                                                                            ? { text: 'Missing', cls: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300' }
+                                                                                            : cnt > 0 && cnt < exp
+                                                                                                ? { text: `Partial (${exp - cnt} short)`, cls: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300' }
+                                                                                                : cnt > exp
+                                                                                                    ? { text: `Counted (+${cnt - exp} surplus)`, cls: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300' }
+                                                                                                    : { text: 'Counted', cls: 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300' };
+                                                                                        return (
+                                                                                            <div key={bulk.barcode || idx} className="px-3.5 py-2 flex items-center justify-between font-mono">
+                                                                                                <div className="flex items-center gap-2">
+                                                                                                    <span className="text-zinc-800 dark:text-zinc-200 font-medium">
+                                                                                                        {bulk.barcode}
+                                                                                                    </span>
+                                                                                                    <span className="font-sans text-[11px] text-zinc-400">(Non-Unique / Bulk)</span>
+                                                                                                </div>
+                                                                                                <div className="flex items-center gap-3">
+                                                                                                    <span className="text-zinc-500 font-sans text-xs">
+                                                                                                        Counted: <strong>{cnt}</strong> / Expected: {exp}
+                                                                                                    </span>
+                                                                                                    <span className={`px-2 py-0.5 rounded text-[11px] font-sans font-medium ${badge.cls}`}>
+                                                                                                        {badge.text}
+                                                                                                    </span>
+                                                                                                </div>
                                                                                             </div>
-                                                                                        </div>
-                                                                                    );
-                                                                                })}
+                                                                                        );
+                                                                                    })
+                                                                                )}
                                                                             </div>
                                                                         </div>
                                                                     </td>
@@ -3580,52 +3779,75 @@ const StockTakePage = ({
             )}
 
             <Modal isOpen={isInitiateModalOpen} onClose={() => setIsInitiateModalOpen(false)} title="Initiate Stock Take">
-                <div className="space-y-4 py-4">
-                    <div>
-                        <label htmlFor="st-location-scope" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-                            Storehouse / Location Scope
-                        </label>
-                        <select
-                            id="st-location-scope"
-                            value={stockTakeLocation}
-                            onChange={(e) => setStockTakeLocation(e.target.value)}
-                            className={formInputStyle + " py-2.5"}
-                            required
-                        >
-                            {locationsList.map(loc => (
-                                <option key={loc} value={loc}>{loc}</option>
-                            ))}
-                        </select>
-                        <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-                            Audits only inventory physically stored in {stockTakeLocation || locationsList[0] || 'the selected storehouse'}.
-                        </p>
-                    </div>
+                {(() => {
+                    const isStockTakeLocationSelected = Boolean(stockTakeLocation && stockTakeLocation !== 'All');
+                    return (
+                        <div className="space-y-4 py-4">
+                            <div>
+                                <label htmlFor="st-location-scope" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                                    Storehouse / Location Scope <span className="text-red-500 font-bold">*</span>
+                                </label>
+                                <select
+                                    id="st-location-scope"
+                                    value={stockTakeLocation}
+                                    onChange={(e) => setStockTakeLocation(e.target.value)}
+                                    className={`py-2.5 w-full px-3 rounded-md shadow-xs text-sm focus:outline-none transition-all ${
+                                        !isStockTakeLocationSelected
+                                            ? 'border-2 border-amber-500 dark:border-amber-400 bg-amber-50/70 dark:bg-amber-950/30 text-amber-900 dark:text-amber-100 font-semibold ring-2 ring-amber-400/30 focus:ring-amber-500 focus:border-amber-500'
+                                            : `${formInputStyle} border-emerald-500/70 dark:border-emerald-600/70`
+                                    }`}
+                                    required
+                                >
+                                    <option value="" disabled>-- Please select storehouse / location --</option>
+                                    {locationsList.map(loc => (
+                                        <option key={loc} value={loc}>{loc}</option>
+                                    ))}
+                                </select>
+                                {!isStockTakeLocationSelected ? (
+                                    <div className="mt-1.5 flex items-center gap-1.5 text-xs font-semibold text-amber-700 dark:text-amber-400">
+                                        <AlertTriangleIcon className="w-3.5 h-3.5 shrink-0" />
+                                        <span>Required: Please choose which storehouse is being audited.</span>
+                                    </div>
+                                ) : (
+                                    <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                                        Audits only inventory physically stored in <strong>{stockTakeLocation}</strong>.
+                                    </p>
+                                )}
+                            </div>
 
-                    <p className="text-sm font-medium text-zinc-700 dark:text-zinc-300 pt-2 border-t border-zinc-200 dark:border-zinc-700">
-                        Stock Take Type
-                    </p>
-                    <div>
-                        <label className="flex items-start space-x-3 p-4 border border-zinc-200 dark:border-zinc-700 rounded-lg cursor-pointer hover:bg-zinc-50 dark:hover:bg-zinc-700/50">
-                            <input type="radio" name="st_type" value="FULL" checked={stockTakeType === 'FULL'} onChange={(e) => setStockTakeType(e.target.value)} className="mt-1" />
+                            <p className="text-sm font-medium text-zinc-700 dark:text-zinc-300 pt-2 border-t border-zinc-200 dark:border-zinc-700">
+                                Stock Take Type
+                            </p>
                             <div>
-                                <span className="block font-medium text-zinc-900 dark:text-white">Full Stock Take</span>
-                                <span className="block text-sm text-zinc-500 dark:text-zinc-400">Counts all items in the database. Intended to be used when the whole store is being audited.</span>
+                                <label className="flex items-start space-x-3 p-4 border border-zinc-200 dark:border-zinc-700 rounded-lg cursor-pointer hover:bg-zinc-50 dark:hover:bg-zinc-700/50">
+                                    <input type="radio" name="st_type" value="FULL" checked={stockTakeType === 'FULL'} onChange={(e) => setStockTakeType(e.target.value)} className="mt-1" />
+                                    <div>
+                                        <span className="block font-medium text-zinc-900 dark:text-white">Full Stock Take</span>
+                                        <span className="block text-sm text-zinc-500 dark:text-zinc-400">Counts all items in the database. Intended to be used when the whole store is being audited.</span>
+                                    </div>
+                                </label>
                             </div>
-                        </label>
-                    </div>
-                    <div>
-                        <label className="flex items-start space-x-3 p-4 border border-zinc-200 dark:border-zinc-700 rounded-lg cursor-pointer hover:bg-zinc-50 dark:hover:bg-zinc-700/50">
-                            <input type="radio" name="st_type" value="ROLLING" checked={stockTakeType === 'ROLLING'} onChange={(e) => setStockTakeType(e.target.value)} className="mt-1" />
                             <div>
-                                <span className="block font-medium text-zinc-900 dark:text-white">Rolling Stock Take</span>
-                                <span className="block text-sm text-zinc-500 dark:text-zinc-400">Allows you to count specific item types or locations progressively. Does not imply a full store audit.</span>
+                                <label className="flex items-start space-x-3 p-4 border border-zinc-200 dark:border-zinc-700 rounded-lg cursor-pointer hover:bg-zinc-50 dark:hover:bg-zinc-700/50">
+                                    <input type="radio" name="st_type" value="ROLLING" checked={stockTakeType === 'ROLLING'} onChange={(e) => setStockTakeType(e.target.value)} className="mt-1" />
+                                    <div>
+                                        <span className="block font-medium text-zinc-900 dark:text-white">Rolling Stock Take</span>
+                                        <span className="block text-sm text-zinc-500 dark:text-zinc-400">Allows you to count specific item types or locations progressively. Does not imply a full store audit.</span>
+                                    </div>
+                                </label>
                             </div>
-                        </label>
-                    </div>
-                    <button onClick={handleInitiateStockTake} className="w-full mt-4 flex items-center justify-center px-4 py-3 bg-blue-600 text-white rounded-md font-medium hover:bg-blue-700">
-                        Start Count
-                    </button>
-                </div>
+                            <button
+                                type="button"
+                                disabled={!isStockTakeLocationSelected}
+                                title={!isStockTakeLocationSelected ? 'Select a storehouse / location first' : undefined}
+                                onClick={handleInitiateStockTake}
+                                className="w-full mt-4 flex items-center justify-center px-4 py-3 bg-blue-600 text-white rounded-md font-medium hover:bg-blue-700 transition-colors disabled:bg-blue-400 dark:disabled:bg-blue-800 disabled:cursor-not-allowed"
+                            >
+                                Start Count
+                            </button>
+                        </div>
+                    );
+                })()}
             </Modal>
 
             <Modal isOpen={isCancelModalOpen} onClose={() => setIsCancelModalOpen(false)} title="Cancel Stock Take">
@@ -3705,22 +3927,26 @@ const StockTakePage = ({
                             <p className="font-medium text-zinc-900 dark:text-zinc-100">{quantityItem.stock_items?.name}</p>
                             <p className="text-xs text-zinc-500 mt-1">Barcode: {quantityItem.stock_items?.barcode}</p>
                             <div className="flex items-center gap-4 mt-2 pt-2 border-t border-zinc-200 dark:border-zinc-700 text-xs">
-                                <div>
-                                    <span className="text-zinc-500 dark:text-zinc-400">Expected: </span>
-                                    <span className="font-semibold text-zinc-800 dark:text-zinc-200">
-                                        {stockTakeItems
-                                            .filter(i => (i.stock_items?.barcode || '') === (quantityItem.stock_items?.barcode || ''))
-                                            .reduce((acc, i) => acc + (i.expected_quantity ?? 1), 0)}
-                                    </span>
-                                </div>
-                                <div>
-                                    <span className="text-zinc-500 dark:text-zinc-400">Current Total Count: </span>
-                                    <span className="font-bold text-blue-600 dark:text-blue-400">
-                                        {stockTakeItems
-                                            .filter(i => (i.stock_items?.barcode || '') === (quantityItem.stock_items?.barcode || ''))
-                                            .reduce((acc, i) => acc + (i.counted_quantity || 0), 0)}
-                                    </span>
-                                </div>
+                                {(() => {
+                                    const targetName = quantityItem.stock_items?.name || stockMap.get(quantityItem.item_id)?.name || '';
+                                    const matchingRows = targetName
+                                        ? stockTakeItems.filter(i => (i.stock_items?.name || stockMap.get(i.item_id)?.name || '') === targetName)
+                                        : stockTakeItems.filter(i => (i.stock_items?.barcode || '') === (quantityItem.stock_items?.barcode || ''));
+                                    const expTotal = matchingRows.reduce((acc, i) => acc + (i.expected_quantity ?? 1), 0);
+                                    const cntTotal = matchingRows.reduce((acc, i) => acc + (i.counted_quantity || 0), 0);
+                                    return (
+                                        <>
+                                            <div>
+                                                <span className="text-zinc-500 dark:text-zinc-400">Expected: </span>
+                                                <span className="font-semibold text-zinc-800 dark:text-zinc-200">{expTotal}</span>
+                                            </div>
+                                            <div>
+                                                <span className="text-zinc-500 dark:text-zinc-400">Current Total Count: </span>
+                                                <span className="font-bold text-blue-600 dark:text-blue-400">{cntTotal}</span>
+                                            </div>
+                                        </>
+                                    );
+                                })()}
                             </div>
                         </div>
                         <div>
