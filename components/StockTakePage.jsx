@@ -429,13 +429,16 @@ const StockTakePage = ({
             const itemTypeName = rawName || matchedType?.name || item.name || 'Uncategorised Item';
             const meta = matchedType || itemTypesMap[itemTypeName] || {};
             const itemCategory = meta.category || item.category || item.stock_items?.category || 'General';
+            const snapshotPrice = parseFloat(item.purchase_price) || 0;
             const spPart = Array.isArray(supplierPartNumbers)
                 ? supplierPartNumbers.find(sp => (meta.id && sp.item_type_id === meta.id) || sp.item_name === itemTypeName || sp.item_types?.name === itemTypeName)
                 : null;
             const supplierPurchasePrice = parseFloat(spPart?.purchase_price) || 0;
-            const price = supplierPurchasePrice > 0 
-                ? supplierPurchasePrice 
-                : (parseFloat(item.stock_items?.purchase_price ?? stockItemFallback?.purchase_price ?? 0) || 0);
+            const price = snapshotPrice > 0 
+                ? snapshotPrice 
+                : (supplierPurchasePrice > 0 
+                    ? supplierPurchasePrice 
+                    : (parseFloat(item.stock_items?.purchase_price ?? stockItemFallback?.purchase_price ?? 0) || 0));
             const defaultBarcode = item.stock_items?.barcode || stockItemFallback?.barcode || meta.barcode || '';
             const isItemUnique = !!(
                 meta.is_unique ||
@@ -853,6 +856,25 @@ const StockTakePage = ({
                 .select('*, stock_items(id, name, barcode, purchase_price, description, location, assigned_to, created_at)')
                 .eq('stock_take_id', activeStockTake.id);
             if (itemsFetchError) throw itemsFetchError;
+
+            // Snapshot current prices into stock_take_items for historical preservation
+            for (const item of (takeItems || [])) {
+                const stockItemFallback = stockMap.get(item.item_id);
+                const rawName = item.stock_items?.name || stockItemFallback?.name;
+                const meta = itemTypesMap[rawName] || (Array.isArray(itemTypes) ? itemTypes.find(it => it.name === rawName || it.id === item.item_id) : null) || {};
+                const sp = Array.isArray(supplierPartNumbers) ? supplierPartNumbers.find(p => (meta.id && p.item_type_id === meta.id) || p.item_name === rawName || p.item_types?.name === rawName) : null;
+                const spPrice = parseFloat(sp?.purchase_price) || 0;
+                const currentPrice = spPrice > 0 ? spPrice : (parseFloat(item.stock_items?.purchase_price ?? stockItemFallback?.purchase_price ?? 0) || 0);
+
+                try {
+                    await supabase
+                        .from('stock_take_items')
+                        .update({ purchase_price: currentPrice })
+                        .eq('id', item.id);
+                } catch (snapErr) {
+                    // Ignore if purchase_price column doesn't exist
+                }
+            }
 
             // 3. Group by product/item type to determine target counts
             const groupedTakeItems = groupStockTakeByItemType(takeItems || []);

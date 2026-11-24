@@ -179,6 +179,7 @@ export const ReportingPage = ({
   const [showAllStockThresholds, setShowAllStockThresholds] = useState(false);
   const [thresholdStatusFilter, setThresholdStatusFilter] = useState('ALL'); // 'ALL', 'CRITICAL', 'WARNING', 'HEALTHY'
   const [thresholdSearchTerm, setThresholdSearchTerm] = useState('');
+  const [thresholdSortBy, setThresholdSortBy] = useState('status'); // 'status', 'supplier', 'name', 'stock', 'suggestedOrder', 'leadTime'
   // 30-day company-wide sign-outs map { [itemName]: count } for weeks remaining calculation
   const [usageStatsByItem, setUsageStatsByItem] = useState({});
 
@@ -980,7 +981,7 @@ export const ReportingPage = ({
   }, [allThresholdItems]);
 
   const thresholdData = useMemo(() => {
-    return allThresholdItems.filter(item => {
+    const filtered = allThresholdItems.filter(item => {
       // 1. Text search
       if (thresholdSearchTerm.trim()) {
         const q = thresholdSearchTerm.toLowerCase();
@@ -1004,7 +1005,40 @@ export const ReportingPage = ({
 
       return true;
     });
-  }, [allThresholdItems, thresholdSearchTerm, thresholdStatusFilter, showAllStockThresholds]);
+
+    return filtered.sort((a, b) => {
+      if (thresholdSortBy === 'supplier') {
+        const suppA = (a.supplierName || 'ZZZ').toLowerCase();
+        const suppB = (b.supplierName || 'ZZZ').toLowerCase();
+        if (suppA !== suppB) return suppA.localeCompare(suppB);
+        return a.name.localeCompare(b.name);
+      }
+      if (thresholdSortBy === 'name') {
+        return a.name.localeCompare(b.name);
+      }
+      if (thresholdSortBy === 'stock') {
+        if (a.currentStock !== b.currentStock) return a.currentStock - b.currentStock;
+        return a.name.localeCompare(b.name);
+      }
+      if (thresholdSortBy === 'suggestedOrder') {
+        if (b.suggestedOrder !== a.suggestedOrder) return b.suggestedOrder - a.suggestedOrder;
+        return a.name.localeCompare(b.name);
+      }
+      if (thresholdSortBy === 'leadTime') {
+        if (b.leadTimeDays !== a.leadTimeDays) return b.leadTimeDays - a.leadTimeDays;
+        return a.name.localeCompare(b.name);
+      }
+      // Default: 'status'
+      const rank = { CRITICAL: 1, WARNING: 2, HEALTHY: 3 };
+      if (rank[a.status] !== rank[b.status]) {
+        return rank[a.status] - rank[b.status];
+      }
+      if (a.status === 'CRITICAL' || a.status === 'WARNING') {
+        if (a.currentStock !== b.currentStock) return a.currentStock - b.currentStock;
+      }
+      return a.name.localeCompare(b.name);
+    });
+  }, [allThresholdItems, thresholdSearchTerm, thresholdStatusFilter, showAllStockThresholds, thresholdSortBy]);
 
   // --- Unique Item Serial Audit Trail Handler ---
   const handlePerformSerialAudit = useCallback(async (serialToLookup) => {
@@ -2889,25 +2923,43 @@ export const ReportingPage = ({
                 </button>
               </div>
 
-              {/* Text Search filter */}
-              <div className="relative w-full sm:w-64">
-                <SearchIcon className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400" />
-                <input
-                  type="text"
-                  placeholder="Search item, part # or category..."
-                  value={thresholdSearchTerm}
-                  onChange={e => setThresholdSearchTerm(e.target.value)}
-                  className="w-full pl-9 pr-3 py-1.5 bg-zinc-50 dark:bg-zinc-800/80 border border-zinc-200 dark:border-zinc-700 rounded-lg text-xs text-zinc-900 dark:text-zinc-100 placeholder-zinc-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
-                {thresholdSearchTerm && (
-                  <button
-                    type="button"
-                    onClick={() => setThresholdSearchTerm('')}
-                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-xs text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 font-bold"
+              {/* Sort Dropdown & Text Search */}
+              <div className="flex flex-wrap items-center gap-2.5 w-full sm:w-auto">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs text-zinc-500 dark:text-zinc-400 font-medium">Sort:</span>
+                  <select
+                    value={thresholdSortBy}
+                    onChange={e => setThresholdSortBy(e.target.value)}
+                    className="px-3 py-1.5 bg-zinc-50 dark:bg-zinc-800/80 border border-zinc-200 dark:border-zinc-700 rounded-lg text-xs font-semibold text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
                   >
-                    ×
-                  </button>
-                )}
+                    <option value="status">Priority (RAG)</option>
+                    <option value="supplier">Supplier (A-Z)</option>
+                    <option value="name">Item Name (A-Z)</option>
+                    <option value="stock">Current Stock (Low)</option>
+                    <option value="suggestedOrder">Suggested Order (High)</option>
+                    <option value="leadTime">Lead Time (Longest)</option>
+                  </select>
+                </div>
+
+                <div className="relative w-full sm:w-64">
+                  <SearchIcon className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400" />
+                  <input
+                    type="text"
+                    placeholder="Search item, part # or category..."
+                    value={thresholdSearchTerm}
+                    onChange={e => setThresholdSearchTerm(e.target.value)}
+                    className="w-full pl-9 pr-3 py-1.5 bg-zinc-50 dark:bg-zinc-800/80 border border-zinc-200 dark:border-zinc-700 rounded-lg text-xs text-zinc-900 dark:text-zinc-100 placeholder-zinc-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                  {thresholdSearchTerm && (
+                    <button
+                      type="button"
+                      onClick={() => setThresholdSearchTerm('')}
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-xs text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 font-bold"
+                    >
+                      ×
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
           </div>
@@ -2995,8 +3047,27 @@ export const ReportingPage = ({
                     </tr>
                   </thead>
                   <tbody className="bg-white dark:bg-zinc-800/40 divide-y divide-zinc-200 dark:divide-zinc-700">
-                    {thresholdData.map((item, idx) => (
-                      <tr key={item.id || idx} className="hover:bg-zinc-50 dark:hover:bg-zinc-700/30 transition-colors">
+                    {thresholdData.map((item, idx) => {
+                      const currentSupp = item.supplierName || 'Unassigned / No Supplier';
+                      const prevItem = idx > 0 ? thresholdData[idx - 1] : null;
+                      const prevSupp = prevItem ? (prevItem.supplierName || 'Unassigned / No Supplier') : null;
+                      const showSupplierHeader = thresholdSortBy === 'supplier' && currentSupp !== prevSupp;
+
+                      return (
+                        <React.Fragment key={item.id || idx}>
+                          {showSupplierHeader && (
+                            <tr className="bg-zinc-100 dark:bg-zinc-800/90 border-t-2 border-zinc-200 dark:border-zinc-700">
+                              <td colSpan="9" className="px-5 py-2.5 text-xs font-bold text-zinc-900 dark:text-zinc-100 uppercase tracking-wider">
+                                <div className="flex items-center gap-2">
+                                  <span>🏢 Supplier: {currentSupp}</span>
+                                  <span className="text-[10px] font-normal text-zinc-500 dark:text-zinc-400 font-mono lowercase">
+                                    ({thresholdData.filter(i => (i.supplierName || 'Unassigned / No Supplier') === currentSupp).length} items)
+                                  </span>
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                          <tr className="hover:bg-zinc-50 dark:hover:bg-zinc-700/30 transition-colors">
                         <td className="px-5 py-3.5 whitespace-nowrap">
                           {item.status === 'CRITICAL' ? (
                             <span className="px-2.5 py-1 inline-flex items-center gap-1.5 text-xs font-bold rounded-full bg-red-100 text-red-800 dark:bg-red-900/60 dark:text-red-300 border border-red-200 dark:border-red-800">
@@ -3122,7 +3193,9 @@ export const ReportingPage = ({
                           )}
                         </td>
                       </tr>
-                    ))}
+                        </React.Fragment>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
